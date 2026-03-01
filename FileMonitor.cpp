@@ -1,6 +1,89 @@
 #include "framework.h"
+#include "framework.h"
 #include "FileMonitor.h"
 #include <shlobj.h>
+#include <algorithm>
+
+// ---------- Path exclusion filter ----------
+// Returns true if the path should be excluded from activity recording.
+static bool ShouldExclude(const std::wstring& path)
+{
+    if (path.empty())
+        return true;
+
+    // Work with a lowercase copy for case-insensitive matching
+    std::wstring lp = path;
+    std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
+
+    // --- Excluded directory prefixes (system, cache, temp, build artifacts) ---
+    static const wchar_t* const excludedDirs[] = {
+        L"\\windows\\",
+        L"\\$recycle.bin\\",
+        L"\\system volume information\\",
+        L"\\programdata\\microsoft\\",
+        L"\\programdata\\package cache\\",
+        L"\\appdata\\",
+        L"\\.vs\\",
+        L"\\.git\\",
+        L"\\node_modules\\",
+        L"\\__pycache__\\",
+        L"\\.nuget\\",
+        L"\\recovery\\",
+        L"\\msocache\\",
+        L"\\config.msi\\",
+    };
+
+    for (const auto* dir : excludedDirs)
+    {
+        if (lp.find(dir) != std::wstring::npos)
+            return true;
+    }
+
+    // --- Excluded file extensions ---
+    static const wchar_t* const excludedExts[] = {
+        L".exe", L".dll", L".sys", L".drv", L".ocx",
+        L".tmp", L".temp", L".etl", L".evtx",
+        L".pf", L".cache", L".diagsession",
+        L".obj", L".pch", L".ipch", L".ilk", L".pdb",
+        L".tlog", L".idb", L".res", L".aps",
+        L".suo", L".sdf", L".opensdf",
+        L".log", L".bak",
+        L".lock", L".lck",
+        L".db", L".db-wal", L".db-shm", L".sqlite",
+        L"thumbs.db", L"desktop.ini",
+    };
+
+    // Find the last dot for extension check
+    size_t dotPos = lp.rfind(L'.');
+    if (dotPos != std::wstring::npos)
+    {
+        std::wstring ext = lp.substr(dotPos);
+        for (const auto* e : excludedExts)
+        {
+            if (ext == e)
+                return true;
+        }
+    }
+
+    // Also check full filename for known system files without extensions containing a dot
+    size_t slashPos = lp.rfind(L'\\');
+    if (slashPos != std::wstring::npos)
+    {
+        std::wstring filename = lp.substr(slashPos + 1);
+        if (filename == L"thumbs.db" ||
+            filename == L"desktop.ini" ||
+            filename == L"ntuser.dat" ||
+            filename == L"usrclass.dat" ||
+            filename == L"pagefile.sys" ||
+            filename == L"swapfile.sys" ||
+            filename == L"hiberfil.sys")
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 FileMonitor::FileMonitor()
 {
@@ -182,7 +265,8 @@ void FileMonitor::MonitorDrive(const std::wstring& root)
                 break;
             }
 
-            if (!action.empty() && m_callback)
+            if (!action.empty() && m_callback &&
+                !ShouldExclude(fullPath) && !ShouldExclude(oldPath))
             {
                 m_callback(action, fullPath, oldPath);
             }
@@ -312,7 +396,8 @@ void FileMonitor::MonitorShellNotifications()
                         break;
                     }
 
-                    if (!action.empty() && !path.empty() && m_callback)
+                    if (!action.empty() && !path.empty() && m_callback &&
+                        !ShouldExclude(path) && !ShouldExclude(oldPath))
                     {
                         m_callback(action, path, oldPath);
                     }

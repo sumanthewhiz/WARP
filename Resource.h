@@ -36,6 +36,10 @@
 #define IDB_QUERY_CUSTOM		411
 // Response display
 #define IDC_RESPONSE			412
+// Theme toggle
+#define IDB_TOGGLE_THEME		413
+// Clear history
+#define IDB_CLEAR_HISTORY		414
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1

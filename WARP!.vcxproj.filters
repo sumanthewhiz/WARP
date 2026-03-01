@@ -77,8 +77,7 @@
     </Image>
   </ItemGroup>
   <ItemGroup>
-    <Manifest Include="WARP!.manifest">
-      <Filter>Resource Files</Filter>
-    </Manifest>
+    <None Include=".gitignore" />
+    <None Include="README.md" />
   </ItemGroup>
 </Project>

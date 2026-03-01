@@ -45,6 +45,7 @@ public:
     std::vector<FileActivity> QueryCustomSeconds(int64_t seconds);
 
     void EvictOlderThan30Days();
+    void ClearAll();
 
 private:
     struct sqlite3* m_db = nullptr;

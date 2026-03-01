@@ -172,6 +172,13 @@ void ActivityDatabase::EvictOlderThan30Days()
     }
 }
 
+void ActivityDatabase::ClearAll()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_db) return;
+    Execute("DELETE FROM file_activity;");
+}
+
 bool ActivityDatabase::Execute(const char* sql)
 {
     if (!m_db) return false;

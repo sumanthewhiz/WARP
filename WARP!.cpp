@@ -16,22 +16,74 @@
 
 #define MAX_LOADSTRING 100
 
-// ---------- Theme colours ----------
-static const COLORREF CLR_BG        = RGB(30, 30, 30);
-static const COLORREF CLR_PANEL     = RGB(45, 45, 48);
-static const COLORREF CLR_TEXT      = RGB(220, 220, 220);
-static const COLORREF CLR_ACCENT    = RGB(0, 122, 204);
-static const COLORREF CLR_BTN_BG    = RGB(62, 62, 66);
-static const COLORREF CLR_BTN_HOT   = RGB(80, 80, 85);
-static const COLORREF CLR_RESPONSE  = RGB(38, 38, 42);
+// ---------- Theme system ----------
+struct Theme
+{
+    COLORREF bg;
+    COLORREF panel;
+    COLORREF text;
+    COLORREF accent;
+    COLORREF btnBg;
+    COLORREF btnHot;
+    COLORREF btnBorder;
+    COLORREF btnBorderHot;
+    COLORREF btnFocusBg;
+    COLORREF response;
+    COLORREF responseText;
+    COLORREF separator;
+};
 
-// ---------- GDI objects (created once, destroyed on exit) ----------
+static const Theme THEME_LIGHT = {
+    RGB(243, 243, 243),     // bg
+    RGB(255, 255, 255),     // panel
+    RGB(30, 30, 30),        // text
+    RGB(0, 122, 204),       // accent
+    RGB(225, 225, 228),     // btnBg
+    RGB(200, 200, 205),     // btnHot
+    RGB(190, 190, 195),     // btnBorder
+    RGB(0, 122, 204),       // btnBorderHot
+    RGB(210, 210, 215),     // btnFocusBg
+    RGB(255, 255, 255),     // response
+    RGB(20, 20, 20),        // responseText
+    RGB(0, 122, 204),       // separator
+};
+
+static const Theme THEME_DARK = {
+    RGB(30, 30, 30),        // bg
+    RGB(45, 45, 48),        // panel
+    RGB(220, 220, 220),     // text
+    RGB(0, 122, 204),       // accent
+    RGB(62, 62, 66),        // btnBg
+    RGB(80, 80, 85),        // btnHot
+    RGB(70, 70, 74),        // btnBorder
+    RGB(0, 122, 204),       // btnBorderHot
+    RGB(55, 55, 60),        // btnFocusBg
+    RGB(38, 38, 42),        // response
+    RGB(180, 220, 255),     // responseText
+    RGB(0, 122, 204),       // separator
+};
+
+static bool   g_isDarkMode = false;   // default: light
+static Theme  g_theme      = THEME_LIGHT;
+
+// ---------- GDI objects (recreated on theme switch) ----------
 static HBRUSH g_hBrBg       = nullptr;
 static HBRUSH g_hBrPanel    = nullptr;
 static HBRUSH g_hBrResponse = nullptr;
 static HFONT  g_hFontUI     = nullptr;
 static HFONT  g_hFontTitle  = nullptr;
 static HFONT  g_hFontMono   = nullptr;
+
+static void RecreateThemeBrushes()
+{
+    if (g_hBrBg)       { DeleteObject(g_hBrBg);       g_hBrBg = nullptr; }
+    if (g_hBrPanel)    { DeleteObject(g_hBrPanel);     g_hBrPanel = nullptr; }
+    if (g_hBrResponse) { DeleteObject(g_hBrResponse);  g_hBrResponse = nullptr; }
+
+    g_hBrBg       = CreateSolidBrush(g_theme.bg);
+    g_hBrPanel    = CreateSolidBrush(g_theme.panel);
+    g_hBrResponse = CreateSolidBrush(g_theme.response);
+}
 
 // ---------- Global Variables ----------
 HINSTANCE hInst;
@@ -56,6 +108,8 @@ static HWND g_hDefaultLabel = nullptr;
 static HWND g_hBtnDefault   = nullptr;
 static HWND g_hResponseLabel= nullptr;
 static HWND g_hResponse     = nullptr;
+static HWND g_hBtnTheme    = nullptr;
+static HWND g_hBtnClear    = nullptr;
 static std::vector<HWND> g_hWindowBtns;
 
 // Forward declarations
@@ -74,6 +128,8 @@ void                CreateUIControls(HWND hWnd, HINSTANCE hInstance);
 void                LayoutControls(HWND hWnd);
 void                SendApiQuery(HWND hWnd, const std::string& jsonRequest);
 void                OnQueryButton(HWND hWnd, int id);
+void                ToggleTheme(HWND hWnd);
+void                ClearHistory(HWND hWnd);
 
 // ---------- Owner-draw button helper ----------
 static void DrawModernButton(LPDRAWITEMSTRUCT dis)
@@ -81,15 +137,15 @@ static void DrawModernButton(LPDRAWITEMSTRUCT dis)
     BOOL isHot = (dis->itemState & ODS_SELECTED) || (dis->itemState & ODS_HOTLIGHT);
     BOOL isFocused = (dis->itemState & ODS_FOCUS);
 
-    COLORREF bg = isHot ? CLR_BTN_HOT : CLR_BTN_BG;
-    if (isFocused && !isHot) bg = RGB(55, 55, 60);
+    COLORREF bg = isHot ? g_theme.btnHot : g_theme.btnBg;
+    if (isFocused && !isHot) bg = g_theme.btnFocusBg;
 
     HBRUSH hBr = CreateSolidBrush(bg);
     FillRect(dis->hDC, &dis->rcItem, hBr);
     DeleteObject(hBr);
 
     // Accent border
-    HPEN hPen = CreatePen(PS_SOLID, 1, isHot ? CLR_ACCENT : RGB(70, 70, 74));
+    HPEN hPen = CreatePen(PS_SOLID, 1, isHot ? g_theme.btnBorderHot : g_theme.btnBorder);
     HPEN hOldPen = (HPEN)SelectObject(dis->hDC, hPen);
     HBRUSH hOldBr = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
     RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
@@ -102,7 +158,7 @@ static void DrawModernButton(LPDRAWITEMSTRUCT dis)
     wchar_t text[128] = {};
     GetWindowTextW(dis->hwndItem, text, 128);
     SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, CLR_TEXT);
+    SetTextColor(dis->hDC, g_theme.text);
     SelectObject(dis->hDC, g_hFontUI);
     DrawTextW(dis->hDC, text, -1, &dis->rcItem,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -177,9 +233,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     hInst = hInstance;
 
     // Create GDI objects
-    g_hBrBg       = CreateSolidBrush(CLR_BG);
-    g_hBrPanel    = CreateSolidBrush(CLR_PANEL);
-    g_hBrResponse = CreateSolidBrush(CLR_RESPONSE);
+    RecreateThemeBrushes();
 
     g_hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -292,6 +346,18 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDC_RESPONSE, hInstance, nullptr);
     SendMessageW(g_hResponse, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
 
+    // Clear History button (top-right, left of theme toggle)
+    g_hBtnClear = CreateWindowW(L"BUTTON", L"Clear History",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDB_CLEAR_HISTORY, hInstance, nullptr);
+    SendMessageW(g_hBtnClear, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    // Theme toggle button (top-right corner)
+    g_hBtnTheme = CreateWindowW(L"BUTTON", L"Dark Mode",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDB_TOGGLE_THEME, hInstance, nullptr);
+    SendMessageW(g_hBtnTheme, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
     LayoutControls(hWnd);
 }
 
@@ -305,8 +371,19 @@ void LayoutControls(HWND hWnd)
     int pad = 16;
     int y = pad;
 
-    // Status text
-    MoveWindow(g_hStatusLabel, pad, y, W - 2 * pad, 30, TRUE);
+    // Theme toggle button in top-right corner
+    int themeBtnW = 110;
+    int themeBtnH = 30;
+    int clearBtnW = 120;
+    int btnGap = 8;
+    MoveWindow(g_hBtnTheme, W - pad - themeBtnW, y, themeBtnW, themeBtnH, TRUE);
+
+    // Clear History button to the left of theme toggle
+    MoveWindow(g_hBtnClear, W - pad - themeBtnW - btnGap - clearBtnW, y, clearBtnW, themeBtnH, TRUE);
+
+    // Status text (leave room for both buttons)
+    int headerBtnsW = themeBtnW + btnGap + clearBtnW + 8;
+    MoveWindow(g_hStatusLabel, pad, y, W - 2 * pad - headerBtnsW, 30, TRUE);
     y += 40;
 
     // Separator (we'll paint it; just track y)
@@ -387,11 +464,28 @@ void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
             DWORD written = 0;
             WriteFile(hPipe, req->c_str(), (DWORD)req->size(), &written, nullptr);
 
-            char buf[65536] = {};
+            // Read the full message (loop on ERROR_MORE_DATA)
+            char buf[4096];
             DWORD bytesRead = 0;
-            if (ReadFile(hPipe, buf, sizeof(buf) - 1, &bytesRead, nullptr))
+            BOOL readOk;
+            for (;;)
             {
-                response.assign(buf, bytesRead);
+                readOk = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr);
+                if (readOk)
+                {
+                    response.append(buf, bytesRead);
+                    break;
+                }
+                if (GetLastError() == ERROR_MORE_DATA)
+                {
+                    response.append(buf, bytesRead);
+                    continue;
+                }
+                break; // real error
+            }
+
+            if (!response.empty())
+            {
 
                 // Pretty-print the JSON (simple indentation)
                 std::string pretty;
@@ -513,6 +607,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         else if (wmId >= IDB_QUERY_15M && wmId <= IDB_QUERY_CUSTOM)
             OnQueryButton(hWnd, wmId);
+        else if (wmId == IDB_TOGGLE_THEME)
+            ToggleTheme(hWnd);
+        else if (wmId == IDB_CLEAR_HISTORY)
+            ClearHistory(hWnd);
         else
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
@@ -543,8 +641,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_CTLCOLORSTATIC:
     {
         HDC hdc = (HDC)wParam;
-        SetTextColor(hdc, CLR_TEXT);
-        SetBkColor(hdc, CLR_BG);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.bg);
         return (LRESULT)g_hBrBg;
     }
 
@@ -554,13 +652,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         HWND hCtl = (HWND)lParam;
         if (hCtl == g_hResponse)
         {
-            SetTextColor(hdc, RGB(180, 220, 255));
-            SetBkColor(hdc, CLR_RESPONSE);
+            SetTextColor(hdc, g_theme.responseText);
+            SetBkColor(hdc, g_theme.response);
             return (LRESULT)g_hBrResponse;
         }
         // Custom seconds edit
-        SetTextColor(hdc, CLR_TEXT);
-        SetBkColor(hdc, CLR_PANEL);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.panel);
         return (LRESULT)g_hBrPanel;
     }
 
@@ -572,7 +670,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         FillRect(hdc, &rc, g_hBrBg);
 
         // Draw accent separator line below status text
-        HPEN hPen = CreatePen(PS_SOLID, 2, CLR_ACCENT);
+        HPEN hPen = CreatePen(PS_SOLID, 2, g_theme.separator);
         HPEN hOld = (HPEN)SelectObject(hdc, hPen);
         int y = 52;
         MoveToEx(hdc, 16, y, nullptr);
@@ -670,6 +768,36 @@ void ShowTrayMenu(HWND hWnd)
 void MinimizeToTray(HWND hWnd)
 {
     ShowWindow(hWnd, SW_HIDE);
+}
+
+void ToggleTheme(HWND hWnd)
+{
+    g_isDarkMode = !g_isDarkMode;
+    g_theme = g_isDarkMode ? THEME_DARK : THEME_LIGHT;
+    RecreateThemeBrushes();
+
+    // Update toggle button label
+    SetWindowTextW(g_hBtnTheme, g_isDarkMode ? L"Light Mode" : L"Dark Mode");
+
+    // Force full repaint of main window and all children
+    RedrawWindow(hWnd, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+void ClearHistory(HWND hWnd)
+{
+    int result = MessageBoxW(hWnd,
+        L"Are you sure you want to clear all activity history?\n\n"
+        L"This will permanently delete all recorded file activity.\n"
+        L"Only new events after clearing will be stored.",
+        L"WARP - Clear History",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+
+    if (result == IDYES)
+    {
+        g_db.ClearAll();
+        SetWindowTextW(g_hResponse, L"Activity history cleared.");
+    }
 }
 
 void RestoreFromTray(HWND hWnd)
