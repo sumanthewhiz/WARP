@@ -20,6 +20,23 @@
 #define IDC_STATUS_TEXT			202
 #define IDT_EVICTION_TIMER		301
 
+// API test buttons (predefined windows)
+#define IDB_QUERY_15M			400
+#define IDB_QUERY_30M			401
+#define IDB_QUERY_1H			402
+#define IDB_QUERY_2H			403
+#define IDB_QUERY_6H			404
+#define IDB_QUERY_24H			405
+#define IDB_QUERY_7D			406
+#define IDB_QUERY_15D			407
+#define IDB_QUERY_30D			408
+#define IDB_QUERY_DEFAULT		409
+// Custom seconds input
+#define IDC_EDIT_SECONDS		410
+#define IDB_QUERY_CUSTOM		411
+// Response display
+#define IDC_RESPONSE			412
+
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif
