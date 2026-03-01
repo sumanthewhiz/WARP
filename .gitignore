@@ -1,0 +1,25 @@
+# Build output
+Debug/
+Release/
+x64/
+ARM64/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.log
+*.tlog
+*.idb
+*.ipch
+*.pch
+*.res
+*.aps
+
+# Visual Studio user/cache files
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.cachefile
+ipch/
