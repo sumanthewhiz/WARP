@@ -3,10 +3,56 @@
 #include "FileMonitor.h"
 #include <shlobj.h>
 #include <algorithm>
+#include <evntrace.h>
+#include <evntcons.h>
+#include <unordered_map>
+#include <mutex>
+
+#pragma comment(lib, "advapi32.lib")
+
+// Static instance pointer for the ETW callback
+static FileMonitor* g_pFileMonitor = nullptr;
+
+static const wchar_t* WARP_ETW_SESSION_NAME = L"NT Kernel Logger";
+
+// SystemTraceControlGuid — required as Wnode.Guid for NT Kernel Logger
+// {9E814AAD-3204-11D2-9A82-006008A86939}
+static const GUID SystemTraceControlGuid =
+    { 0x9E814AAD, 0x3204, 0x11D2, { 0x9A, 0x82, 0x00, 0x60, 0x08, 0xA8, 0x69, 0x39 } };
+
+// Classic FileIo GUID — events in the NT Kernel Logger use this provider GUID
+// {90CBDC39-4A3E-11D1-84F4-0000F80464E3}
+static const GUID FileIoGuid =
+    { 0x90CBDC39, 0x4A3E, 0x11D1, { 0x84, 0xF4, 0x00, 0x00, 0xF8, 0x04, 0x64, 0xE3 } };
+
+// Cached device-path-to-drive-letter map (built once, used in callback)
+static std::unordered_map<std::wstring, std::wstring> g_deviceToDrive;
+static std::once_flag g_deviceMapOnce;
+
+// Our own PID — used to skip self-generated file-open events
+static DWORD g_ownPid = 0;
+
+static void BuildDeviceMap()
+{
+    wchar_t drives[512] = {};
+    if (GetLogicalDriveStringsW(511, drives) == 0) return;
+    for (const wchar_t* drv = drives; *drv; drv += wcslen(drv) + 1)
+    {
+        wchar_t letter[3] = { drv[0], drv[1], L'\0' };
+        wchar_t target[MAX_PATH] = {};
+        if (QueryDosDeviceW(letter, target, MAX_PATH) > 0)
+        {
+            std::wstring key(target);
+            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            g_deviceToDrive[key] = letter;
+        }
+    }
+}
+
 
 // ---------- Path exclusion filter ----------
 // Returns true if the path should be excluded from activity recording.
-static bool ShouldExclude(const std::wstring& path)
+bool ShouldExclude(const std::wstring& path)
 {
     if (path.empty())
         return true;
@@ -16,18 +62,18 @@ static bool ShouldExclude(const std::wstring& path)
     std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
 
     // --- Excluded directory prefixes (system, cache, temp, build artifacts) ---
+    // Patterns with trailing backslash match files/folders INSIDE these directories.
+    // Patterns without trailing backslash match the directory itself (for folder-open events).
     static const wchar_t* const excludedDirs[] = {
         L"\\windows\\",
         L"\\$recycle.bin\\",
         L"\\system volume information\\",
-        L"\\programdata\\microsoft\\",
-        L"\\programdata\\package cache\\",
+        L"\\programdata\\",
+        L"\\program files\\",
+        L"\\program files (x86)\\",
         L"\\appdata\\",
-        L"\\.vs\\",
-        L"\\.git\\",
         L"\\node_modules\\",
         L"\\__pycache__\\",
-        L"\\.nuget\\",
         L"\\recovery\\",
         L"\\msocache\\",
         L"\\config.msi\\",
@@ -39,6 +85,42 @@ static bool ShouldExclude(const std::wstring& path)
             return true;
     }
 
+    // Also exclude the system folders themselves (path ends with the folder name,
+    // no trailing backslash — happens when the folder is opened directly via ETW).
+    static const wchar_t* const excludedDirNames[] = {
+        L"\\windows",
+        L"\\$recycle.bin",
+        L"\\system volume information",
+        L"\\programdata",
+        L"\\program files",
+        L"\\program files (x86)",
+        L"\\appdata",
+        L"\\node_modules",
+        L"\\__pycache__",
+        L"\\recovery",
+        L"\\msocache",
+        L"\\config.msi",
+    };
+
+    for (const auto* dn : excludedDirNames)
+    {
+        size_t dnLen = wcslen(dn);
+        if (lp.size() >= dnLen && lp.compare(lp.size() - dnLen, dnLen, dn) == 0)
+            return true;
+    }
+
+    // Exclude any folder whose name starts with a dot (e.g. \.git\, \.vs\, \.ssh\, \.vscode\)
+    {
+        size_t pos = 0;
+        while ((pos = lp.find(L"\\.", pos)) != std::wstring::npos)
+        {
+            // Make sure there is at least one more char after the dot that isn't a backslash
+            if (pos + 2 < lp.size() && lp[pos + 2] != L'\\')
+                return true;
+            pos += 2;
+        }
+    }
+
     // --- Excluded file extensions ---
     static const wchar_t* const excludedExts[] = {
         L".exe", L".dll", L".sys", L".drv", L".ocx",
@@ -47,9 +129,10 @@ static bool ShouldExclude(const std::wstring& path)
         L".obj", L".pch", L".ipch", L".ilk", L".pdb",
         L".tlog", L".idb", L".res", L".aps",
         L".suo", L".sdf", L".opensdf",
-        L".log", L".bak",
+        L".log", L".log1", L".bak",
         L".lock", L".lck",
         L".db", L".db-wal", L".db-shm", L".sqlite",
+        L".dat", L".metadata",
         L"thumbs.db", L"desktop.ini",
     };
 
@@ -134,6 +217,9 @@ void FileMonitor::Start()
 
     // Also start a shell notification watcher thread
     m_threads.emplace_back(&FileMonitor::MonitorShellNotifications, this);
+
+    // Start ETW trace for file-open events
+    m_threads.emplace_back(&FileMonitor::StartEtwTrace, this);
 }
 
 void FileMonitor::Stop()
@@ -141,6 +227,9 @@ void FileMonitor::Stop()
     if (!m_running) return;
     m_running = false;
     SetEvent(m_stopEvent);
+
+    // Stop ETW trace so ProcessTrace unblocks
+    StopEtwTrace();
 
     for (auto& t : m_threads)
     {
@@ -266,7 +355,8 @@ void FileMonitor::MonitorDrive(const std::wstring& root)
             }
 
             if (!action.empty() && m_callback &&
-                !ShouldExclude(fullPath) && !ShouldExclude(oldPath))
+                !ShouldExclude(fullPath) &&
+                (oldPath.empty() || !ShouldExclude(oldPath)))
             {
                 m_callback(action, fullPath, oldPath);
             }
@@ -397,7 +487,8 @@ void FileMonitor::MonitorShellNotifications()
                     }
 
                     if (!action.empty() && !path.empty() && m_callback &&
-                        !ShouldExclude(path) && !ShouldExclude(oldPath))
+                        !ShouldExclude(path) &&
+                        (oldPath.empty() || !ShouldExclude(oldPath)))
                     {
                         m_callback(action, path, oldPath);
                     }
@@ -421,4 +512,218 @@ void FileMonitor::MonitorShellNotifications()
 
     DestroyWindow(hWnd);
     UnregisterClassW(className, wc.hInstance);
+}
+
+// ---------- ETW: Capture file-open events via Microsoft-Windows-Kernel-File ----------
+
+void FileMonitor::StartEtwTrace()
+{
+    g_pFileMonitor = this;
+    g_ownPid = GetCurrentProcessId();
+
+    // Stop any stale NT Kernel Logger session
+    StopEtwTrace();
+
+    // NT Kernel Logger requires a larger properties buffer for the session name
+    const size_t sessionNameLen = (wcslen(WARP_ETW_SESSION_NAME) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameLen + 1024;
+    std::vector<BYTE> propsBuf(bufSize, 0);
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
+
+    props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
+    props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 1; // QPC clock
+    props->Wnode.Guid = SystemTraceControlGuid;
+    props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    // Enable file I/O init events — this captures every NtCreateFile / NtOpenFile call
+    props->EnableFlags = EVENT_TRACE_FLAG_FILE_IO_INIT;
+
+    ULONG status = StartTraceW(&m_etwSessionHandle, WARP_ETW_SESSION_NAME, props);
+    if (status == ERROR_ALREADY_EXISTS)
+    {
+        // Session already running (possibly from a previous crash) — stop and retry
+        StopEtwTrace();
+        memset(propsBuf.data(), 0, bufSize);
+        props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
+        props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        props->Wnode.ClientContext = 1;
+        props->Wnode.Guid = SystemTraceControlGuid;
+        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        props->EnableFlags = EVENT_TRACE_FLAG_FILE_IO_INIT;
+        status = StartTraceW(&m_etwSessionHandle, WARP_ETW_SESSION_NAME, props);
+    }
+    if (status != ERROR_SUCCESS)
+    {
+        m_etwSessionHandle = 0;
+        return;
+    }
+
+    // Open the trace for real-time consuming
+    EVENT_TRACE_LOGFILEW logFile = {};
+    logFile.LoggerName = const_cast<LPWSTR>(WARP_ETW_SESSION_NAME);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = &FileMonitor::EtwEventCallback;
+
+    m_etwTraceHandle = OpenTraceW(&logFile);
+    if (m_etwTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+    {
+        StopEtwTrace();
+        return;
+    }
+
+    // ProcessTrace blocks until the session is stopped
+    ProcessTrace(&m_etwTraceHandle, 1, nullptr, nullptr);
+
+    if (m_etwTraceHandle != INVALID_PROCESSTRACE_HANDLE)
+    {
+        CloseTrace(m_etwTraceHandle);
+        m_etwTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+}
+
+void FileMonitor::StopEtwTrace()
+{
+    if (m_etwTraceHandle != INVALID_PROCESSTRACE_HANDLE)
+    {
+        CloseTrace(m_etwTraceHandle);
+        m_etwTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+
+    const size_t sessionNameLen = (wcslen(WARP_ETW_SESSION_NAME) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameLen + 1024;
+    std::vector<BYTE> propsBuf(bufSize, 0);
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
+    props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
+    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+    ControlTraceW(0, WARP_ETW_SESSION_NAME, props, EVENT_TRACE_CONTROL_STOP);
+    m_etwSessionHandle = 0;
+}
+
+void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
+{
+    FileMonitor* self = g_pFileMonitor;
+    if (!self || !self->m_running || self->m_paused || !self->m_callback)
+        return;
+
+    // NT Kernel Logger FileIo events use the classic FileIo GUID
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, FileIoGuid))
+        return;
+
+    // Opcode 64 = FileIoCreate (fires on every NtCreateFile / NtOpenFile)
+    if (pEvent->EventHeader.EventDescriptor.Opcode != 64)
+        return;
+
+    // Skip events from our own process
+    if (pEvent->EventHeader.ProcessId == g_ownPid)
+        return;
+
+    // FileIoCreate UserData layout (64-bit):
+    //   UINT_PTR IrpPtr;          // 8 bytes
+    //   UINT_PTR FileObject;      // 8 bytes
+    //   UINT32   TTID;            // 4 bytes
+    //   UINT32   CreateOptions;   // 4 bytes
+    //   UINT32   FileAttributes;  // 4 bytes
+    //   UINT32   ShareAccess;     // 4 bytes
+    //   WCHAR    OpenPath[];      // null-terminated
+    //
+    // On 32-bit, IrpPtr and FileObject are 4 bytes each.
+    DWORD ptrSize = (pEvent->EventHeader.Flags & EVENT_HEADER_FLAG_64_BIT_HEADER) ? 8 : 4;
+    DWORD headerSize = ptrSize + ptrSize + 4 + 4 + 4 + 4; // IrpPtr + FileObject + TTID + CreateOptions + FileAttributes + ShareAccess
+
+    if (!pEvent->UserData || pEvent->UserDataLength <= headerSize + sizeof(wchar_t))
+        return;
+
+    const wchar_t* namePtr = reinterpret_cast<const wchar_t*>(
+        static_cast<BYTE*>(pEvent->UserData) + headerSize);
+    size_t maxChars = (pEvent->UserDataLength - headerSize) / sizeof(wchar_t);
+
+    size_t nameLen = 0;
+    while (nameLen < maxChars && namePtr[nameLen] != L'\0')
+        ++nameLen;
+
+    if (nameLen == 0)
+        return;
+
+    std::wstring filePath(namePtr, nameLen);
+
+    // Convert kernel device paths (\Device\HarddiskVolumeN\...) to DOS paths (C:\...)
+    if (filePath.size() > 8 && filePath[0] == L'\\')
+    {
+        size_t thirdSlash = filePath.find(L'\\', 8);
+        if (thirdSlash == std::wstring::npos)
+            return;
+
+        std::wstring devicePart = filePath.substr(0, thirdSlash);
+        std::transform(devicePart.begin(), devicePart.end(), devicePart.begin(), ::towlower);
+
+        std::call_once(g_deviceMapOnce, BuildDeviceMap);
+
+        auto it = g_deviceToDrive.find(devicePart);
+        if (it == g_deviceToDrive.end())
+            return;
+
+        filePath = it->second + filePath.substr(thirdSlash);
+    }
+    else if (filePath.size() > 2 && filePath[1] == L':')
+    {
+        // Already a DOS path
+    }
+    else
+    {
+        return;
+    }
+
+    // Skip bare drive roots (e.g. "C:\") — not meaningful user activity
+    if (filePath.size() <= 3)
+        return;
+
+    // Normalize: strip trailing backslash for consistent dedup and exclusion checks
+    if (filePath.size() > 3 && filePath.back() == L'\\')
+        filePath.pop_back();
+
+    // Apply exclusion filter
+    extern bool ShouldExclude(const std::wstring& path);
+    if (ShouldExclude(filePath))
+        return;
+
+    // Deduplicate: suppress repeated OPEN events for the same path within 2 seconds
+    {
+        static std::mutex dedup_mtx;
+        static std::unordered_map<std::wstring, ULONGLONG> dedup_map;
+        static ULONGLONG dedup_lastCleanup = 0;
+
+        ULONGLONG now = GetTickCount64();
+        std::lock_guard<std::mutex> lock(dedup_mtx);
+
+        // Periodic cleanup every 30 seconds to prevent unbounded growth
+        if (now - dedup_lastCleanup > 30000)
+        {
+            for (auto it = dedup_map.begin(); it != dedup_map.end(); )
+            {
+                if (now - it->second > 5000)
+                    it = dedup_map.erase(it);
+                else
+                    ++it;
+            }
+            dedup_lastCleanup = now;
+        }
+
+        // Case-insensitive key for dedup
+        std::wstring key = filePath;
+        std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+
+        auto it = dedup_map.find(key);
+        if (it != dedup_map.end() && (now - it->second) < 2000)
+        {
+            // Duplicate within 2 seconds — skip
+            it->second = now;
+            return;
+        }
+        dedup_map[key] = now;
+    }
+
+    self->m_callback(L"OPEN", filePath, L"");
 }
