@@ -6,7 +6,9 @@
 #include <evntrace.h>
 #include <evntcons.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
+#include <psapi.h>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -31,6 +33,126 @@ static std::once_flag g_deviceMapOnce;
 
 // Our own PID — used to skip self-generated file-open events
 static DWORD g_ownPid = 0;
+
+// Cache of PIDs already classified as user (true) or system (false)
+static std::unordered_map<DWORD, bool> g_pidCache;
+static std::mutex g_pidCacheMtx;
+static ULONGLONG g_pidCacheLastCleanup = 0;
+
+// Returns true if the PID belongs to an interactive user session and is not
+// a known noisy system process. Caches results to avoid repeated lookups.
+static bool IsUserProcess(DWORD pid)
+{
+    if (pid == 0 || pid == 4) // System Idle / System
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_pidCacheMtx);
+
+        // Periodic cleanup every 60 seconds
+        ULONGLONG now = GetTickCount64();
+        if (now - g_pidCacheLastCleanup > 60000)
+        {
+            g_pidCache.clear();
+            g_pidCacheLastCleanup = now;
+        }
+
+        auto it = g_pidCache.find(pid);
+        if (it != g_pidCache.end())
+            return it->second;
+    }
+
+    bool isUser = false;
+
+    // Check session ID — session 0 is services, session >= 1 is interactive
+    DWORD sessionId = 0;
+    if (ProcessIdToSessionId(pid, &sessionId) && sessionId >= 1)
+    {
+        isUser = true;
+
+        // Further filter: block known noisy system processes that run in user session
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc)
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD exeLen = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, exePath, &exeLen) && exeLen > 0)
+            {
+                // Extract just the filename
+                std::wstring exe(exePath, exeLen);
+                size_t slash = exe.rfind(L'\\');
+                if (slash != std::wstring::npos)
+                    exe = exe.substr(slash + 1);
+                std::transform(exe.begin(), exe.end(), exe.begin(), ::towlower);
+
+                static const wchar_t* const noisyProcesses[] = {
+                    L"searchprotocolhost.exe",
+                    L"searchindexer.exe",
+                    L"searchfilterhost.exe",
+                    L"msmpeng.exe",          // Windows Defender
+                    L"mpcmdrun.exe",
+                    L"nissrv.exe",
+                    L"securityhealthservice.exe",
+                    L"svchost.exe",
+                    L"csrss.exe",
+                    L"smss.exe",
+                    L"lsass.exe",
+                    L"services.exe",
+                    L"wininit.exe",
+                    L"spoolsv.exe",
+                    L"wmiprvse.exe",
+                    L"taskhostw.exe",
+                    L"runtimebroker.exe",
+                    L"backgroundtaskhost.exe",
+                    L"audiodg.exe",
+                    L"fontdrvhost.exe",
+                    L"dwm.exe",
+                    L"msiexec.exe",
+                    L"trustedinstaller.exe",
+                    L"tiworker.exe",
+                    L"compattelrunner.exe",
+                    L"devicecensus.exe",
+                    L"musnotification.exe",
+                    L"windowsupdatebox.exe",
+                    L"onedrive.exe",
+                    L"msedgewebview2.exe",
+                    L"crashpad_handler.exe",
+                    L"conhost.exe",
+                    L"dllhost.exe",
+                    L"sihost.exe",
+                    L"ctfmon.exe",
+                    L"settingsynchost.exe",
+                    L"phoneexperiencehost.exe",
+                    L"widgetservice.exe",
+                    L"gamebarpresencewriter.exe",
+                    L"securityhealthsystray.exe",
+                    L"systemsettings.exe",
+                };
+
+                for (const auto* noisy : noisyProcesses)
+                {
+                    if (exe == noisy)
+                    {
+                        isUser = false;
+                        break;
+                    }
+                }
+            }
+            CloseHandle(hProc);
+        }
+        else
+        {
+            // Can't open the process — likely a system process, skip it
+            isUser = false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_pidCacheMtx);
+        g_pidCache[pid] = isUser;
+    }
+    return isUser;
+}
 
 static void BuildDeviceMap()
 {
@@ -77,6 +199,13 @@ bool ShouldExclude(const std::wstring& path)
         L"\\recovery\\",
         L"\\msocache\\",
         L"\\config.msi\\",
+        L"\\$windows.~bt\\",
+        L"\\$windows.~ws\\",
+        L"\\windowsapps\\",
+        L"\\packages\\",
+        L"\\microsoft\\windows\\",
+        L"\\temp\\",
+        L"\\tmp\\",
     };
 
     for (const auto* dir : excludedDirs)
@@ -100,6 +229,11 @@ bool ShouldExclude(const std::wstring& path)
         L"\\recovery",
         L"\\msocache",
         L"\\config.msi",
+        L"\\$windows.~bt",
+        L"\\$windows.~ws",
+        L"\\windowsapps",
+        L"\\temp",
+        L"\\tmp",
     };
 
     for (const auto* dn : excludedDirNames)
@@ -133,6 +267,11 @@ bool ShouldExclude(const std::wstring& path)
         L".lock", L".lck",
         L".db", L".db-wal", L".db-shm", L".sqlite",
         L".dat", L".metadata",
+        L".blf", L".regtrans-ms",
+        L".mui", L".cat", L".man", L".mof",
+        L".nls", L".ttf", L".ttc", L".otf",
+        L".efi", L".wim",
+        L".jar",
         L"thumbs.db", L"desktop.ini",
     };
 
@@ -275,14 +414,14 @@ void FileMonitor::MonitorDrive(const std::wstring& root)
 
     HANDLE waitHandles[2] = { overlapped.hEvent, m_stopEvent };
 
+    // Only watch for user-visible file operations.
+    // Excluded: ATTRIBUTES, SIZE, SECURITY — these fire constantly from
+    // search indexing, antivirus scans, system metadata updates, etc.
     const DWORD filter =
         FILE_NOTIFY_CHANGE_FILE_NAME |
         FILE_NOTIFY_CHANGE_DIR_NAME |
-        FILE_NOTIFY_CHANGE_ATTRIBUTES |
-        FILE_NOTIFY_CHANGE_SIZE |
         FILE_NOTIFY_CHANGE_LAST_WRITE |
-        FILE_NOTIFY_CHANGE_CREATION |
-        FILE_NOTIFY_CHANGE_SECURITY;
+        FILE_NOTIFY_CHANGE_CREATION;
 
     while (m_running)
     {
@@ -618,6 +757,12 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
 
     // Skip events from our own process
     if (pEvent->EventHeader.ProcessId == g_ownPid)
+        return;
+
+    // Only record file-open events from interactive user processes.
+    // This filters out session-0 services (SearchIndexer, Defender, svchost, etc.)
+    // and known noisy user-session system processes.
+    if (!IsUserProcess(pEvent->EventHeader.ProcessId))
         return;
 
     // FileIoCreate UserData layout (64-bit):
