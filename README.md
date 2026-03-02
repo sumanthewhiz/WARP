@@ -1,4 +1,4 @@
-# WARP - Windows Activity Recording & Playback
+# WARP - Windows Activity Reasoning Platform
 
 WARP is a lightweight Windows desktop application that silently monitors all file and folder
 activity on the local PC, stores it in a rolling 30-day on-disk database, and exposes a
