@@ -677,3 +677,8 @@ WARP!\
 ## License
 
 SQLite is in the [public domain](https://www.sqlite.org/copyright.html).
+
+
+## Author
+
+Suman Ghosh — [@sumanthewhiz](https://github.com/sumanthewhiz)
