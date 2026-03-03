@@ -92,6 +92,11 @@ public:
     std::vector<FileActivity> Query(TimeWindow window) { return QueryFiles(window); }
     std::vector<FileActivity> QueryCustomSeconds(int64_t seconds) { return QueryFilesCustomSeconds(seconds); }
 
+    // Expose internals for InferenceEngine (it needs direct sqlite3 access
+    // with its own lock ordering to avoid deadlocks).
+    struct sqlite3** DbHandle() { return &m_db; }
+    std::mutex*      DbMutex()  { return &m_mutex; }
+
 private:
     struct sqlite3* m_db = nullptr;
     std::mutex      m_mutex;

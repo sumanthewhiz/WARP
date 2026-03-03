@@ -29,6 +29,7 @@ long as the PC is actively being used.
 | **SQLite storage** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across three tables. |
 | **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. |
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
+| **Inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps, access counts, and an exponential-decay recency score. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 
 ---
 
@@ -60,19 +61,24 @@ WARP captures three categories of events:
 |        +------------>+---------->+------------>| resume      |<------>|
 |        |             |           |             +------------>|        |
 |        |             |           |             |             |        |
-+--------+-------------+-----------+-------------+-------------+--------+
-         |             |           |             |             |
++--------+-----+-------+-----+-----+-------------+------+------+-------+
+         |     |       |     |     |                     |
    ReadDirectory   Toolhelp32   GetForeground  GetLastInput  Named Pipe
    ChangesW /      Snapshot     Window +       Info / WM_    \\.\pipe\
    SHChangeNotify               GetWindowText  POWERBROADCAST WarpFileActivityAPI
    / ETW
-                          +-------------+
-                          |ActivityDB   |
-                          | .h/.cpp     |
-                          +------+------+
-                                 |
-                               SQLite
-                            activity.db
+                   +------------------+
+                   | InferenceEngine  |  <-- updated per event
+                   | .h/.cpp          |      (recency scores,
+                   +--------+---------+       access counts)
+                            |
+                   +--------+---------+
+                   |  ActivityDB      |
+                   |  .h/.cpp         |
+                   +--------+---------+
+                            |
+                          SQLite
+                       activity.db
 ```
 
 ### Component overview
@@ -202,12 +208,59 @@ CREATE INDEX idx_activity_ts   ON file_activity(timestamp);
 CREATE INDEX idx_activity_action ON file_activity(action, timestamp);
 CREATE INDEX idx_app_ts        ON app_launch_activity(timestamp);
 CREATE INDEX idx_browse_ts     ON browsing_activity(timestamp);
+
+-- Inference table (precomputed per-entity analytics)
+CREATE TABLE inference (
+    entity_key        TEXT PRIMARY KEY,
+    entity_type       TEXT,         -- 'file', 'app', or 'url'
+    last_event_ts     INTEGER,
+    last_open_ts      INTEGER,
+    last_edit_ts      INTEGER,
+    open_count_7d     INTEGER,
+    open_count_30d    INTEGER,
+    open_count_total  INTEGER,
+    recency_score     REAL,         -- 0-255 composite score
+    version           INTEGER,      -- monotonic per-entity version
+    updated_at        INTEGER
+);
+
+CREATE INDEX idx_inference_updated_at ON inference(updated_at);
+CREATE INDEX idx_inference_version    ON inference(version);
 ```
 
 **Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`.
 
-**Eviction:** Records older than 30 days are deleted from all three tables on
+**Eviction:** Records older than 30 days are deleted from all three event tables on
 startup and every 6 hours via a `WM_TIMER`.
+
+#### `InferenceEngine` (`InferenceEngine.h` / `InferenceEngine.cpp`)
+
+A real-time analytics layer that maintains per-entity inference records across
+three entity types: **files**, **apps**, and **URLs**.
+
+Every time a raw event is written to the database, the corresponding monitor
+callback also calls `OnFileEvent`, `OnAppLaunchEvent`, or `OnBrowsingEvent` on the
+inference engine. The engine:
+
+1. Normalizes the entity key to lowercase UTF-8.
+2. Loads or creates an `InferenceRecord` (in-memory cache backed by the `inference`
+   SQLite table).
+3. Increments counters (`open_count_7d`, `open_count_30d`, `open_count_total`) and
+   updates timestamps (`last_event_ts`, `last_open_ts`, `last_edit_ts`).
+4. Recomputes a **recency score** using exponential decay:
+   `score = 200 × e^(−Δt / 172800) + 5 × ln(1 + open_count_7d)`, capped at 255.
+5. Bumps the record `version` and persists via `INSERT OR REPLACE`.
+
+Two query operations are exposed through the named pipe (see the
+[Inference API](#5-inference-api) section below):
+
+| Operation | Purpose |
+|---|---|
+| `QueryInferences` | Batch lookup of inference records by entity key, with optional field projection. |
+| `GetInferenceDeltas` | Retrieve all records whose `version` exceeds a given watermark (up to 5 000 per call). |
+
+Clearing the activity history (`ClearAll`) also clears the inference in-memory
+cache via `ClearCache()`.
 
 #### `QueryApi` (`QueryApi.h` / `QueryApi.cpp`)
 
@@ -220,9 +273,17 @@ A named-pipe server listening on:
 The pipe is created with `PIPE_UNLIMITED_INSTANCES` so multiple clients can connect
 concurrently. Each client connection is served on a detached thread.
 
-The API accepts an optional `"types"` array in the request to filter which event
-categories are returned. The response JSON is segregated by event type at the root
-level.
+The API accepts three kinds of requests:
+
+1. **Event queries** — retrieve raw activity events for a time window, optionally
+   filtered by event type via the `"types"` array. The response JSON is segregated
+   by event type at the root level.
+2. **`QueryInferences`** — batch lookup of precomputed inference records.
+3. **`GetInferenceDeltas`** — incremental sync of inference records since a version
+   watermark.
+
+Inference operations are routed to the `InferenceEngine` instance; event queries
+are handled by `BuildJsonResponse` which reads directly from `ActivityDatabase`.
 
 ---
 
@@ -302,12 +363,14 @@ automatically via the linker's UAC manifest setting.
 5. The app launch monitor begins polling the process table.
 6. The browsing monitor begins polling the foreground window.
 7. The idle detector begins polling for user inactivity and power events.
-8. The named-pipe server starts accepting connections.
-9. Every detected event (file, app launch, or browsing) is inserted into the appropriate database table in real time.
-10. Every 6 hours, records older than 30 days are purged from all tables.
-11. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
-12. Right-clicking the tray icon shows **Open** / **Exit**. *Open* shows the window maximized; *Exit* tears everything down cleanly.
-13. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
+8. The inference engine is initialized with direct access to the SQLite database.
+9. The named-pipe server starts accepting connections.
+10. Every detected event (file, app launch, or browsing) is inserted into the appropriate database table **and** fed to the inference engine, which incrementally updates per-entity scores in real time.
+11. Every 6 hours, records older than 30 days are purged from all event tables.
+12. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
+13. Right-clicking the tray icon shows **Open** / **Exit**. *Open* shows the window maximized; *Exit* tears everything down cleanly.
+14. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
+15. Clearing activity history also clears the inference engine's in-memory cache.
 
 ---
 
@@ -387,6 +450,101 @@ If `"types"` is omitted, all three event types are returned (backward compatible
 {"window":"1h","types":["file","app_launch","browsing"]}
 {}
 ```
+
+#### 5. Inference API
+
+The named pipe also supports two inference operations that return precomputed
+per-entity analytics instead of raw event lists. These are identified by the
+`"op"` field in the request.
+
+##### QueryInferences
+
+Batch-lookup inference records for a list of entity keys (file paths, app paths,
+or URLs). An optional `"fields"` array limits which fields are returned.
+
+```json
+{
+  "op": "QueryInferences",
+  "paths": [
+    "c:\\users\\alice\\documents\\report.docx",
+    "c:\\windows\\system32\\notepad.exe"
+  ],
+  "fields": ["recency_score", "last_open_ts", "open_count_7d"]
+}
+```
+
+If `"fields"` is omitted, all fields are returned.
+
+**Response:**
+
+```json
+{
+  "now": 1750012345,
+  "results": {
+    "c:\\users\\alice\\documents\\report.docx": {
+      "recency_score": 187.3,
+      "last_open_ts": 1750012000,
+      "open_count_7d": 12
+    },
+    "c:\\windows\\system32\\notepad.exe": {
+      "recency_score": 42.1,
+      "last_open_ts": 1749998000,
+      "open_count_7d": 3
+    }
+  }
+}
+```
+
+##### GetInferenceDeltas
+
+Retrieve all inference records that have changed since a given version watermark.
+Returns up to 5 000 records per call, ordered by ascending `version`.
+
+```json
+{
+  "op": "GetInferenceDeltas",
+  "since_version": 0
+}
+```
+
+**Response:**
+
+```json
+{
+  "now": 1750012345,
+  "deltas": [
+    {
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "entity_type": "file",
+      "last_event_ts": 1750012000,
+      "last_open_ts": 1750012000,
+      "last_edit_ts": 1750011500,
+      "open_count_7d": 12,
+      "open_count_30d": 45,
+      "open_count_total": 45,
+      "recency_score": 187.3,
+      "version": 1,
+      "updated_at": 1750012000
+    }
+  ]
+}
+```
+
+##### Inference record fields
+
+| Field | Type | Description |
+|---|---|---|
+| `entity_key` | `string` | Lowercase entity identifier (file path, app path, or URL). |
+| `entity_type` | `string` | `"file"`, `"app"`, or `"url"`. |
+| `last_event_ts` | `integer` | Timestamp of the most recent event of any kind. |
+| `last_open_ts` | `integer` | Timestamp of the most recent OPEN (files) or launch (apps/URLs). |
+| `last_edit_ts` | `integer` | Timestamp of the most recent MODIFY/CREATE (files only). |
+| `open_count_7d` | `integer` | Number of OPEN events in the rolling 7-day window. |
+| `open_count_30d` | `integer` | Number of OPEN events in the rolling 30-day window. |
+| `open_count_total` | `integer` | Lifetime OPEN count since WARP started tracking this entity. |
+| `recency_score` | `number` | Composite score (0–255) combining exponential time-decay and frequency. Higher = more recently/frequently used. |
+| `version` | `integer` | Monotonically increasing per-entity version; use as watermark for delta sync. |
+| `updated_at` | `integer` | Timestamp of the last inference update. |
 
 ### Response format
 
@@ -667,6 +825,8 @@ WARP!\
 |-- IdleDetector.cpp            GetLastInputInfo + WM_POWERBROADCAST impl
 |-- QueryApi.h                  Named-pipe API interface
 |-- QueryApi.cpp                Pipe server and JSON serialization impl
+|-- InferenceEngine.h           Inference engine interface (per-entity analytics)
+|-- InferenceEngine.cpp         Real-time scoring, QueryInferences & GetInferenceDeltas impl
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)
 +-- sqlite3.h                   SQLite public header

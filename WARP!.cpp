@@ -10,11 +10,14 @@
 #include "BrowsingMonitor.h"
 #include "IdleDetector.h"
 #include "QueryApi.h"
+#include "InferenceEngine.h"
 
 #include <string>
 #include <shlobj.h>
 #include <thread>
 #include <vector>
+#include <ctime>
+#include <algorithm>
 
 #define MAX_LOADSTRING 100
 
@@ -101,6 +104,7 @@ AppLaunchMonitor    g_appLaunchMonitor;
 BrowsingMonitor     g_browsingMonitor;
 IdleDetector        g_idleDetector;
 QueryApi            g_queryApi;
+InferenceEngine     g_inference;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -120,6 +124,18 @@ static HWND g_hChkBrowsing = nullptr;
 static HWND g_hFilterLabel = nullptr;
 static std::vector<HWND> g_hWindowBtns;
 
+// Inference exploration controls
+static HWND g_hInferLabel     = nullptr;
+static HWND g_hChkInferFile   = nullptr;
+static HWND g_hChkInferApp    = nullptr;
+static HWND g_hChkInferUrl    = nullptr;
+static HWND g_hInferFilterLbl = nullptr;
+static HWND g_hBtnInferTop    = nullptr;
+static HWND g_hEditInferPath  = nullptr;
+static HWND g_hBtnInferLookup = nullptr;
+static HWND g_hEditInferTopN  = nullptr;
+static HWND g_hInferTopNLabel = nullptr;
+
 // Forward declarations
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
@@ -138,6 +154,7 @@ void                SendApiQuery(HWND hWnd, const std::string& jsonRequest);
 void                OnQueryButton(HWND hWnd, int id);
 void                ToggleTheme(HWND hWnd);
 void                ClearHistory(HWND hWnd);
+void                OnInferenceButton(HWND hWnd, int id);
 
 // ---------- Owner-draw button helper ----------
 static void DrawModernButton(LPDRAWITEMSTRUCT dis)
@@ -391,6 +408,64 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDB_TOGGLE_THEME, hInstance, nullptr);
     SendMessageW(g_hBtnTheme, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
+    // --- Inference exploration section ---
+    g_hInferLabel = CreateWindowW(L"STATIC",
+        L"Explore Precomputed Inferences",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_INFER_LABEL, hInstance, nullptr);
+    SendMessageW(g_hInferLabel, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hInferFilterLbl = CreateWindowW(L"STATIC",
+        L"Entity Types:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_INFER_FILTER_LABEL, hInstance, nullptr);
+    SendMessageW(g_hInferFilterLbl, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hChkInferFile = CreateWindowW(L"BUTTON", L"Files",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_INFER_FILE, hInstance, nullptr);
+    SendMessageW(g_hChkInferFile, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkInferFile, BM_SETCHECK, BST_CHECKED, 0);
+
+    g_hChkInferApp = CreateWindowW(L"BUTTON", L"Apps",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_INFER_APP, hInstance, nullptr);
+    SendMessageW(g_hChkInferApp, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkInferApp, BM_SETCHECK, BST_CHECKED, 0);
+
+    g_hChkInferUrl = CreateWindowW(L"BUTTON", L"URLs",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_INFER_URL, hInstance, nullptr);
+    SendMessageW(g_hChkInferUrl, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkInferUrl, BM_SETCHECK, BST_CHECKED, 0);
+
+    g_hInferTopNLabel = CreateWindowW(L"STATIC",
+        L"Top N:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_INFER_TOPN_LABEL, hInstance, nullptr);
+    SendMessageW(g_hInferTopNLabel, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hEditInferTopN = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"50",
+        WS_CHILD | WS_VISIBLE | ES_NUMBER | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_EDIT_INFER_TOPN, hInstance, nullptr);
+    SendMessageW(g_hEditInferTopN, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hBtnInferTop = CreateWindowW(L"BUTTON", L"Show Top Inferences",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDB_INFER_TOP, hInstance, nullptr);
+    SendMessageW(g_hBtnInferTop, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hEditInferPath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_EDIT_INFER_PATH, hInstance, nullptr);
+    SendMessageW(g_hEditInferPath, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hEditInferPath, EM_SETCUEBANNER, TRUE, (LPARAM)L"Enter path or URL to look up...");
+
+    g_hBtnInferLookup = CreateWindowW(L"BUTTON", L"Lookup",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDB_INFER_LOOKUP, hInstance, nullptr);
+    SendMessageW(g_hBtnInferLookup, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
     LayoutControls(hWnd);
 }
 
@@ -463,6 +538,31 @@ void LayoutControls(HWND hWnd)
     MoveWindow(g_hChkAppLaunch, chkX + chkW + gap, y, chkW, 20, TRUE);
     MoveWindow(g_hChkBrowsing,  chkX + 2 * (chkW + gap), y, 160, 20, TRUE);
     y += 28;
+
+    // --- Inference exploration section ---
+    MoveWindow(g_hInferLabel, pad, y, W - 2 * pad, 20, TRUE);
+    y += 24;
+
+    // Entity type filter + Top N + Show button (all on one row)
+    int infLblW = 100;
+    int infChkW = 70;
+    MoveWindow(g_hInferFilterLbl, pad, y, infLblW, 20, TRUE);
+    int ix = pad + infLblW;
+    MoveWindow(g_hChkInferFile, ix, y, infChkW, 20, TRUE);  ix += infChkW + gap;
+    MoveWindow(g_hChkInferApp,  ix, y, infChkW, 20, TRUE);  ix += infChkW + gap;
+    MoveWindow(g_hChkInferUrl,  ix, y, infChkW, 20, TRUE);  ix += infChkW + gap + 8;
+    MoveWindow(g_hInferTopNLabel, ix, y, 50, 20, TRUE);      ix += 50;
+    MoveWindow(g_hEditInferTopN,  ix, y, 60, 24, TRUE);      ix += 60 + gap;
+    MoveWindow(g_hBtnInferTop, ix, y, 180, 28, TRUE);
+    y += 32;
+
+    // Lookup row: path edit + Lookup button
+    int lookupBtnW = 100;
+    int editW = W - 2 * pad - lookupBtnW - gap;
+    if (editW < 200) editW = 200;
+    MoveWindow(g_hEditInferPath, pad, y, editW, 26, TRUE);
+    MoveWindow(g_hBtnInferLookup, pad + editW + gap, y, lookupBtnW, 26, TRUE);
+    y += 34;
 
     // Response label
     MoveWindow(g_hResponseLabel, pad, y, W - 2 * pad, 20, TRUE);
@@ -674,6 +774,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ToggleTheme(hWnd);
         else if (wmId == IDB_CLEAR_HISTORY)
             ClearHistory(hWnd);
+        else if (wmId == IDB_INFER_TOP || wmId == IDB_INFER_LOOKUP)
+            OnInferenceButton(hWnd, wmId);
         else
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
@@ -719,7 +821,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             SetBkColor(hdc, g_theme.response);
             return (LRESULT)g_hBrResponse;
         }
-        // Custom seconds edit
+        // Custom seconds edit and inference edits
         SetTextColor(hdc, g_theme.text);
         SetBkColor(hdc, g_theme.panel);
         return (LRESULT)g_hBrPanel;
@@ -859,6 +961,7 @@ void ClearHistory(HWND hWnd)
     if (result == IDYES)
     {
         g_db.ClearAll();
+        g_inference.ClearCache();
         SetWindowTextW(g_hResponse, L"Activity history cleared.");
     }
 }
@@ -885,10 +988,15 @@ void StartSubsystems()
     g_db.Open(dbPath);
     g_db.EvictOlderThan30Days();
 
+    // Initialize inference engine with direct DB access
+    g_inference.Init(g_db.DbHandle(), g_db.DbMutex());
+
     g_fileMonitor.SetCallback([](const std::wstring& action,
                                  const std::wstring& path,
                                  const std::wstring& oldPath) {
         g_db.InsertActivity(action, path, oldPath);
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        g_inference.OnFileEvent(action, path, now);
     });
     g_fileMonitor.Start();
 
@@ -896,6 +1004,8 @@ void StartSubsystems()
                                       const std::wstring& exePath,
                                       DWORD pid) {
         g_db.InsertAppLaunch(exeName, exePath, pid);
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        g_inference.OnAppLaunchEvent(exePath, now);
     });
     g_appLaunchMonitor.Start();
 
@@ -903,6 +1013,8 @@ void StartSubsystems()
                                      const std::wstring& title,
                                      const std::wstring& url) {
         g_db.InsertBrowsingActivity(browser, title, url);
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        g_inference.OnBrowsingEvent(url.empty() ? title : url, now);
     });
     g_browsingMonitor.Start();
 
@@ -920,7 +1032,261 @@ void StartSubsystems()
     );
     g_idleDetector.Start(120000);
 
-    g_queryApi.Start(&g_db);
+    g_queryApi.Start(&g_db, &g_inference);
+}
+
+void OnInferenceButton(HWND hWnd, int id)
+{
+    if (id == IDB_INFER_TOP)
+    {
+        // Read Top N value
+        wchar_t buf[32] = {};
+        GetWindowTextW(g_hEditInferTopN, buf, 32);
+        int topN = _wtoi(buf);
+        if (topN <= 0) topN = 50;
+        if (topN > 5000) topN = 5000;
+
+        // Build entity type filter from checkboxes
+        bool wantFile = (SendMessageW(g_hChkInferFile, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        bool wantApp  = (SendMessageW(g_hChkInferApp,  BM_GETCHECK, 0, 0) == BST_CHECKED);
+        bool wantUrl  = (SendMessageW(g_hChkInferUrl,  BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (!wantFile && !wantApp && !wantUrl)
+            wantFile = wantApp = wantUrl = true;
+
+        // Use GetInferenceDeltas with since_version=0 to get all records,
+        // then filter client-side and show top N by recency_score.
+        // We send through the pipe so it goes through the same path.
+        std::string request = "{\"op\":\"GetInferenceDeltas\",\"since_version\":0}";
+
+        SetWindowTextW(g_hResponse, L"Querying inferences...");
+
+        // Capture filter state for the thread
+        struct InferFilter { bool file; bool app; bool url; int topN; };
+        InferFilter* pf = new InferFilter{ wantFile, wantApp, wantUrl, topN };
+        std::string* req = new std::string(request);
+
+        std::thread([hWnd, req, pf]() {
+            std::string response;
+
+            HANDLE hPipe = CreateFileW(
+                L"\\\\.\\pipe\\WarpFileActivityAPI",
+                GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_EXISTING, 0, nullptr);
+
+            if (hPipe == INVALID_HANDLE_VALUE)
+            {
+                response = "Error: Could not connect to pipe (GetLastError=" +
+                           std::to_string(GetLastError()) + ")";
+            }
+            else
+            {
+                DWORD mode = PIPE_READMODE_MESSAGE;
+                SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+
+                DWORD written = 0;
+                WriteFile(hPipe, req->c_str(), (DWORD)req->size(), &written, nullptr);
+
+                char buf[65536];
+                DWORD bytesRead = 0;
+                BOOL readOk;
+                for (;;)
+                {
+                    readOk = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr);
+                    if (readOk)
+                    {
+                        response.append(buf, bytesRead);
+                        break;
+                    }
+                    if (GetLastError() == ERROR_MORE_DATA)
+                    {
+                        response.append(buf, bytesRead);
+                        continue;
+                    }
+                    break;
+                }
+
+                if (response.empty())
+                {
+                    response = "Error: ReadFile failed (GetLastError=" +
+                               std::to_string(GetLastError()) + ")";
+                }
+                CloseHandle(hPipe);
+            }
+
+            delete req;
+
+            // Parse the deltas JSON minimally: extract each record and sort
+            // We look for the deltas array and parse individual objects.
+            struct Rec {
+                std::string key;
+                std::string type;
+                double score;
+                int count7d;
+                int count30d;
+                int countTotal;
+                int64_t lastOpen;
+                int64_t lastEdit;
+            };
+            std::vector<Rec> records;
+
+            // Find "deltas":[
+            auto deltasPos = response.find("\"deltas\":[");
+            if (deltasPos != std::string::npos)
+            {
+                // Simple extraction: scan for each object { ... } inside the array
+                size_t pos = response.find('[', deltasPos) + 1;
+                while (pos < response.size())
+                {
+                    auto objStart = response.find('{', pos);
+                    if (objStart == std::string::npos) break;
+                    auto objEnd = response.find('}', objStart);
+                    if (objEnd == std::string::npos) break;
+
+                    std::string obj = response.substr(objStart, objEnd - objStart + 1);
+
+                    // Extract fields with a simple lambda
+                    auto getStr = [&](const std::string& o, const char* key) -> std::string {
+                        std::string k = std::string("\"" ) + key + "\":\"";
+                        auto p = o.find(k);
+                        if (p == std::string::npos) return "";
+                        p += k.size();
+                        auto e = o.find('"', p);
+                        return (e != std::string::npos) ? o.substr(p, e - p) : "";
+                    };
+                    auto getNum = [&](const std::string& o, const char* key) -> double {
+                        std::string k = std::string("\"" ) + key + "\":";
+                        auto p = o.find(k);
+                        if (p == std::string::npos) return 0.0;
+                        p += k.size();
+                        return strtod(o.c_str() + p, nullptr);
+                    };
+
+                    Rec r;
+                    r.key   = getStr(obj, "entity_key");
+                    r.type  = getStr(obj, "entity_type");
+                    r.score = getNum(obj, "recency_score");
+                    r.count7d    = static_cast<int>(getNum(obj, "open_count_7d"));
+                    r.count30d   = static_cast<int>(getNum(obj, "open_count_30d"));
+                    r.countTotal = static_cast<int>(getNum(obj, "open_count_total"));
+                    r.lastOpen   = static_cast<int64_t>(getNum(obj, "last_open_ts"));
+                    r.lastEdit   = static_cast<int64_t>(getNum(obj, "last_edit_ts"));
+
+                    // Apply entity type filter
+                    bool keep = false;
+                    if (r.type == "file" && pf->file) keep = true;
+                    if (r.type == "app"  && pf->app)  keep = true;
+                    if (r.type == "url"  && pf->url)  keep = true;
+                    if (keep)
+                        records.push_back(r);
+
+                    pos = objEnd + 1;
+                }
+            }
+
+            // Sort by recency_score descending
+            std::sort(records.begin(), records.end(),
+                      [](const Rec& a, const Rec& b) { return a.score > b.score; });
+
+            // Truncate to top N
+            if ((int)records.size() > pf->topN)
+                records.resize(pf->topN);
+
+            // Format as human-readable text
+            std::string output;
+            output += "Top " + std::to_string(records.size()) + " Inferences";
+            output += " (sorted by recency score)\r\n";
+            output += std::string(70, '-') + "\r\n";
+
+            char line[512];
+            for (size_t i = 0; i < records.size(); ++i)
+            {
+                const auto& r = records[i];
+                sprintf_s(line, sizeof(line),
+                    "%3d. [%s] score=%.1f  opens: 7d=%d 30d=%d total=%d\r\n",
+                    (int)(i + 1), r.type.c_str(), r.score,
+                    r.count7d, r.count30d, r.countTotal);
+                output += line;
+
+                // Unescape backslashes for display
+                std::string displayKey = r.key;
+                size_t p2 = 0;
+                while ((p2 = displayKey.find("\\\\", p2)) != std::string::npos)
+                {
+                    displayKey.replace(p2, 2, "\\");
+                    p2 += 1;
+                }
+                output += "     " + displayKey + "\r\n";
+
+                // Show timestamps if non-zero
+                if (r.lastOpen > 0 || r.lastEdit > 0)
+                {
+                    output += "     ";
+                    if (r.lastOpen > 0)
+                    {
+                        time_t t = static_cast<time_t>(r.lastOpen);
+                        struct tm tmBuf;
+                        localtime_s(&tmBuf, &t);
+                        char ts[64];
+                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
+                        output += std::string("last_open=") + ts + "  ";
+                    }
+                    if (r.lastEdit > 0)
+                    {
+                        time_t t = static_cast<time_t>(r.lastEdit);
+                        struct tm tmBuf;
+                        localtime_s(&tmBuf, &t);
+                        char ts[64];
+                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
+                        output += std::string("last_edit=") + ts;
+                    }
+                    output += "\r\n";
+                }
+                output += "\r\n";
+            }
+
+            if (records.empty() && deltasPos != std::string::npos)
+                output += "(No inference records match the selected entity types.)\r\n";
+            else if (deltasPos == std::string::npos)
+                output += response;
+
+            delete pf;
+
+            // Marshal result back to UI thread
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, output.c_str(), -1, nullptr, 0);
+            wchar_t* wResult = new wchar_t[wlen];
+            MultiByteToWideChar(CP_UTF8, 0, output.c_str(), -1, wResult, wlen);
+            PostMessageW(hWnd, WM_QUERY_RESULT, 0, (LPARAM)wResult);
+        }).detach();
+    }
+    else if (id == IDB_INFER_LOOKUP)
+    {
+        // Read the path from the edit control
+        wchar_t pathBuf[1024] = {};
+        GetWindowTextW(g_hEditInferPath, pathBuf, 1024);
+        if (pathBuf[0] == L'\0')
+        {
+            SetWindowTextW(g_hResponse, L"Enter a file path, exe path, or URL to look up.");
+            return;
+        }
+
+        // Convert to UTF-8 for JSON
+        int len = WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, nullptr, 0, nullptr, nullptr);
+        std::string pathUtf8(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, &pathUtf8[0], len, nullptr, nullptr);
+
+        // Escape for JSON
+        std::string escaped;
+        escaped.reserve(pathUtf8.size() + 32);
+        for (char c : pathUtf8)
+        {
+            if (c == '"')       escaped += "\\\"";
+            else if (c == '\\') escaped += "\\\\";
+            else                 escaped += c;
+        }
+
+        std::string request = "{\"op\":\"QueryInferences\",\"paths\":[\"" + escaped + "\"]}";
+        SendApiQuery(hWnd, request);
+    }
 }
 
 void StopSubsystems()

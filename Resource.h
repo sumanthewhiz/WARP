@@ -46,6 +46,18 @@
 #define IDC_CHK_BROWSING		422
 #define IDC_FILTER_LABEL        423
 
+// Inference exploration
+#define IDB_INFER_TOP			430
+#define IDC_INFER_LABEL			431
+#define IDC_CHK_INFER_FILE		432
+#define IDC_CHK_INFER_APP		433
+#define IDC_CHK_INFER_URL		434
+#define IDC_INFER_FILTER_LABEL	435
+#define IDC_EDIT_INFER_PATH		436
+#define IDB_INFER_LOOKUP		437
+#define IDC_EDIT_INFER_TOPN		438
+#define IDC_INFER_TOPN_LABEL	439
+
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif

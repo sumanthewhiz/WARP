@@ -1,14 +1,18 @@
 # WARP Activity API -- Integration Guide
 
-> **Version:** 2.0
+
+# WARP Activity API -- Integration Guide
+
+> **Version:** 3.0
 > **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`
 > **Transport:** Windows Named Pipe (message mode)
 > **Encoding:** UTF-8 JSON
 
 This document describes how third-party applications running on the same Windows
 machine can connect to the WARP service and query activity history -- including
-file/folder events, application launches, and browsing activity -- to make
-better-informed decisions in their own workflows.
+file/folder events, application launches, and browsing activity -- as well as
+precomputed per-entity inference data (recency scores, access counts, edit
+timestamps) to make better-informed decisions in their own workflows.
 
 ---
 
@@ -22,12 +26,19 @@ better-informed decisions in their own workflows.
   - [Custom Time Range](#2-custom-time-range-in-seconds)
   - [Default Query](#3-default-query)
   - [Event Type Filtering](#4-event-type-filtering)
+  - [Inference Operations](#5-inference-operations)
+    - [QueryInferences](#queryinferences)
+    - [GetInferenceDeltas](#getinferencedeltas)
 - [Response Format](#response-format)
   - [Top-Level Structure](#top-level-structure)
   - [File Activity Fields](#file-activity-fields)
   - [File Action Types](#file-action-types)
   - [App Launch Activity Fields](#app-launch-activity-fields)
   - [Browsing Activity Fields](#browsing-activity-fields)
+- [Inference Response Format](#inference-response-format)
+  - [QueryInferences Response](#queryinferences-response)
+  - [GetInferenceDeltas Response](#getinferencedeltas-response)
+  - [Inference Record Fields](#inference-record-fields)
 - [Error Handling](#error-handling)
 - [Data Retention & Limits](#data-retention--limits)
 - [Integration Patterns](#integration-patterns)
@@ -38,6 +49,8 @@ better-informed decisions in their own workflows.
   - [Smart Cleanup Utility](#5-smart-cleanup-utility)
   - [App Usage Analytics](#6-app-usage-analytics)
   - [Browsing History Dashboard](#7-browsing-history-dashboard)
+  - [Smart File Ranking](#8-smart-file-ranking)
+  - [Incremental Inference Sync](#9-incremental-inference-sync)
 - [Client Examples](#client-examples)
   - [C++ (Win32)](#c-win32)
   - [C# (.NET)](#c-net)
@@ -77,6 +90,8 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Smart cleanup | Query `file` type for 30 days, find untouched files |
 | App usage analytics | Query `app_launch` type to see which apps were used and when |
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
+| Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
+| Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
 
 ---
 
@@ -194,6 +209,67 @@ compatible with v1.0 clients that don't send `"types"`).
 {"window":"1h","types":["file","app_launch","browsing"]}
 {"types":["browsing"]}
 {}
+```
+
+### 5. Inference Operations
+
+In addition to raw event queries, the pipe supports two **inference operations**
+that return precomputed per-entity analytics. Inference requests are identified by
+the `"op"` field. These operations do **not** use `"window"`, `"seconds"`, or
+`"types"` -- they operate on the `inference` table directly.
+
+#### QueryInferences
+
+Batch-lookup inference records for a list of entity keys (file paths, exe paths,
+or URLs). Keys are matched case-insensitively (the engine normalizes to lowercase
+internally).
+
+```json
+{
+  "op": "QueryInferences",
+  "paths": [
+    "C:\\Users\\Alice\\Documents\\report.docx",
+    "C:\\Windows\\System32\\notepad.exe",
+    "https://github.com/pulls"
+  ]
+}
+```
+
+An optional `"fields"` array limits which fields are included in each result
+object. If omitted, all fields are returned.
+
+```json
+{
+  "op": "QueryInferences",
+  "paths": ["C:\\Users\\Alice\\Documents\\report.docx"],
+  "fields": ["recency_score", "last_open_ts", "open_count_7d"]
+}
+```
+
+**Available field names:** `entity_type`, `last_event_ts`, `last_open_ts`,
+`last_edit_ts`, `open_count_7d`, `open_count_30d`, `open_count_total`,
+`recency_score`, `version`, `updated_at`.
+
+#### GetInferenceDeltas
+
+Retrieve all inference records whose `version` is greater than a given watermark.
+Returns up to **5 000 records** per call, ordered by ascending `version`.
+
+```json
+{
+  "op": "GetInferenceDeltas",
+  "since_version": 0
+}
+```
+
+Pass `0` to get all records. On subsequent calls, pass the highest `version` value
+you received in the previous response to get only new/updated records.
+
+```json
+{
+  "op": "GetInferenceDeltas",
+  "since_version": 1042
+}
 ```
 
 ---
@@ -327,6 +403,109 @@ Each section has:
 
 ---
 
+## Inference Response Format
+
+### QueryInferences Response
+
+```json
+{
+  "now": 1750012345,
+  "results": {
+    "C:\\Users\\Alice\\Documents\\report.docx": {
+      "entity_type": "file",
+      "last_event_ts": 1750012000,
+      "last_open_ts": 1750012000,
+      "last_edit_ts": 1750011500,
+      "open_count_7d": 12,
+      "open_count_30d": 45,
+      "open_count_total": 45,
+      "recency_score": 187.3,
+      "version": 58,
+      "updated_at": 1750012000
+    },
+    "C:\\Windows\\System32\\notepad.exe": {
+      "entity_type": "app",
+      "last_event_ts": 1749998000,
+      "last_open_ts": 1749998000,
+      "last_edit_ts": 0,
+      "open_count_7d": 3,
+      "open_count_30d": 10,
+      "open_count_total": 10,
+      "recency_score": 42.1,
+      "version": 22,
+      "updated_at": 1749998000
+    },
+    "https://github.com/pulls": {}
+  }
+}
+```
+
+- The `"results"` object is keyed by the **exact strings you sent** in `"paths"`
+  (not the normalized form).
+- If an entity has never been seen by WARP, its value is an empty object `{}`.
+- If `"fields"` was specified, only those fields appear in each result object.
+- `"now"` is the server-side Unix epoch timestamp at query time.
+
+### GetInferenceDeltas Response
+
+```json
+{
+  "now": 1750012345,
+  "deltas": [
+    {
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "entity_type": "file",
+      "last_event_ts": 1750012000,
+      "last_open_ts": 1750012000,
+      "last_edit_ts": 1750011500,
+      "open_count_7d": 12,
+      "open_count_30d": 45,
+      "open_count_total": 45,
+      "recency_score": 187.3,
+      "version": 58,
+      "updated_at": 1750012000
+    },
+    {
+      "entity_key": "c:\\windows\\system32\\notepad.exe",
+      "entity_type": "app",
+      "last_event_ts": 1749998000,
+      "last_open_ts": 1749998000,
+      "last_edit_ts": 0,
+      "open_count_7d": 3,
+      "open_count_30d": 10,
+      "open_count_total": 10,
+      "recency_score": 42.1,
+      "version": 22,
+      "updated_at": 1749998000
+    }
+  ]
+}
+```
+
+- `"deltas"` is an array ordered by ascending `version`.
+- Entity keys are in **lowercase normalized form**.
+- At most 5 000 records are returned per call. If you receive exactly 5 000, call
+  again with `since_version` set to the highest `version` in the response.
+- All fields are always present in delta records (no field projection).
+
+### Inference Record Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `entity_key` | `string` | Lowercase entity identifier (file path, exe path, or URL). |
+| `entity_type` | `string` | One of `"file"`, `"app"`, or `"url"`. |
+| `last_event_ts` | `integer` | Unix epoch seconds of the most recent event of any kind for this entity. |
+| `last_open_ts` | `integer` | Unix epoch seconds of the most recent OPEN event (files) or launch/visit (apps/URLs). `0` if never opened. |
+| `last_edit_ts` | `integer` | Unix epoch seconds of the most recent MODIFY or CREATE event. Only meaningful for `"file"` entities. `0` if never edited. |
+| `open_count_7d` | `integer` | Rolling count of OPEN events in the last 7 days. |
+| `open_count_30d` | `integer` | Rolling count of OPEN events in the last 30 days. |
+| `open_count_total` | `integer` | Lifetime OPEN count since WARP started tracking this entity. |
+| `recency_score` | `number` | Composite score (0–255) combining exponential time-decay and 7-day frequency. Higher values indicate more recently and frequently accessed entities. Formula: `200 × e^(??t / 172800) + 5 × ln(1 + open_count_7d)`. |
+| `version` | `integer` | Monotonically increasing per-entity counter. Bumped on every event. Use as a watermark for `GetInferenceDeltas`. |
+| `updated_at` | `integer` | Unix epoch seconds of the last inference record update. |
+
+---
+
 ## Error Handling
 
 | Scenario | What Happens |
@@ -338,6 +517,9 @@ Each section has:
 | Negative or zero `seconds` | The query returns empty result sets (`"count": 0`). |
 | No activity in the time range | Returns sections with `"count": 0` and empty `"events": []`. |
 | Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
+| `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
+| `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
+| Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
 
 ### Checking if WARP is Available
 
@@ -454,6 +636,44 @@ Show pages visited in the last hour:
 
 Display `browsing_activities.events` with `browser`, `title`, and `url` fields.
 
+### 8. Smart File Ranking
+
+Rank a set of known files by how recently and frequently the user has interacted
+with them, without scanning raw events:
+
+```json
+{
+  "op": "QueryInferences",
+  "paths": [
+    "C:\\Users\\Alice\\Projects\\app\\main.cpp",
+    "C:\\Users\\Alice\\Projects\\app\\utils.h",
+    "C:\\Users\\Alice\\Projects\\app\\README.md"
+  ],
+  "fields": ["recency_score", "open_count_7d", "last_open_ts"]
+}
+```
+
+Sort the results by `recency_score` descending to surface the most relevant files.
+
+### 9. Incremental Inference Sync
+
+Keep a local cache of inference data in your app and periodically pull only
+what has changed:
+
+```json
+{"op": "GetInferenceDeltas", "since_version": 0}
+```
+
+Store the highest `version` from the response. On the next sync call:
+
+```json
+{"op": "GetInferenceDeltas", "since_version": 1042}
+```
+
+Only records updated after version 1042 are returned. Repeat until `"deltas"` is
+empty. This is ideal for dashboard widgets or IDE extensions that need near-real-time
+insight without re-querying the full dataset.
+
 ---
 
 ## Client Examples
@@ -490,6 +710,51 @@ int main()
     ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
 
     printf("Response (%lu bytes):\n%s\n", bytesRead, buffer);
+
+    CloseHandle(hPipe);
+    return 0;
+}
+```
+
+**Inference query example (C++):**
+
+```cpp
+#include <windows.h>
+#include <cstdio>
+#include <cstring>
+
+int main()
+{
+    HANDLE hPipe = CreateFileW(
+        L"\\\\.\\pipe\\WarpFileActivityAPI",
+        GENERIC_READ | GENERIC_WRITE,
+        0, nullptr, OPEN_EXISTING, 0, nullptr);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf("WARP is not running (error %lu)\n", GetLastError());
+        return 1;
+    }
+
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+
+    // QueryInferences: get recency scores for two files
+    const char* request = R"({
+        "op": "QueryInferences",
+        "paths": [
+            "C:\\Users\\Alice\\Documents\\report.docx",
+            "C:\\Windows\\System32\\notepad.exe"
+        ],
+        "fields": ["recency_score", "open_count_7d", "last_open_ts"]
+    })";
+    DWORD written = 0;
+    WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
+
+    char buffer[65536] = {};
+    DWORD bytesRead = 0;
+    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
+
+    printf("Inference results:\n%s\n", buffer);
 
     CloseHandle(hPipe);
     return 0;
@@ -544,6 +809,73 @@ if (doc.RootElement.TryGetProperty("browsing_activities", out var ba))
     Console.WriteLine($"Browsing events: {count}");
     foreach (var e in ba.GetProperty("events").EnumerateArray())
         Console.WriteLine($"  [{e.GetProperty("browser").GetString()}] {e.GetProperty("title").GetString()}");
+}
+```
+
+**Inference query example (C#):**
+
+```csharp
+using System;
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+
+// QueryInferences
+using var pipe = new NamedPipeClientStream(".", "WarpFileActivityAPI",
+    PipeDirection.InOut);
+pipe.Connect(5000);
+pipe.ReadMode = PipeTransmissionMode.Message;
+
+byte[] request = Encoding.UTF8.GetBytes("""
+{
+  "op": "QueryInferences",
+  "paths": ["C:\\Users\\Alice\\Documents\\report.docx"],
+  "fields": ["recency_score", "open_count_7d"]
+}
+""");
+pipe.Write(request, 0, request.Length);
+
+byte[] buffer = new byte[65536];
+int bytesRead = pipe.Read(buffer, 0, buffer.Length);
+string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+using var doc = JsonDocument.Parse(json);
+var results = doc.RootElement.GetProperty("results");
+foreach (var prop in results.EnumerateObject())
+{
+    Console.Write($"{prop.Name}: ");
+    if (prop.Value.TryGetProperty("recency_score", out var score))
+        Console.Write($"score={score.GetDouble():F1} ");
+    if (prop.Value.TryGetProperty("open_count_7d", out var cnt))
+        Console.Write($"opens_7d={cnt.GetInt32()}");
+    Console.WriteLine();
+}
+```
+
+**GetInferenceDeltas example (C#):**
+
+```csharp
+using var pipe2 = new NamedPipeClientStream(".", "WarpFileActivityAPI",
+    PipeDirection.InOut);
+pipe2.Connect(5000);
+pipe2.ReadMode = PipeTransmissionMode.Message;
+
+byte[] deltaReq = Encoding.UTF8.GetBytes("""
+{"op": "GetInferenceDeltas", "since_version": 0}
+""");
+pipe2.Write(deltaReq, 0, deltaReq.Length);
+
+byte[] buf2 = new byte[65536];
+int read2 = pipe2.Read(buf2, 0, buf2.Length);
+string deltaJson = Encoding.UTF8.GetString(buf2, 0, read2);
+
+using var deltaDoc = JsonDocument.Parse(deltaJson);
+foreach (var delta in deltaDoc.RootElement.GetProperty("deltas").EnumerateArray())
+{
+    Console.WriteLine($"  [{delta.GetProperty("entity_type").GetString()}] " +
+        $"{delta.GetProperty("entity_key").GetString()} " +
+        $"score={delta.GetProperty("recency_score").GetDouble():F1} " +
+        $"v{delta.GetProperty("version").GetInt32()}");
 }
 ```
 
@@ -604,6 +936,32 @@ if "browsing_activities" in data:
 data = query_warp({"window": "2h", "types": ["browsing"]})
 for e in data.get("browsing_activities", {}).get("events", []):
     print(f"  [{e['browser']}] {e['title']}")
+
+# --- Example: QueryInferences for specific files ---
+inference = query_warp({
+    "op": "QueryInferences",
+    "paths": [
+        "C:\\Users\\Alice\\Documents\\report.docx",
+        "C:\\Windows\\System32\\notepad.exe",
+    ],
+    "fields": ["recency_score", "open_count_7d", "entity_type"],
+})
+for path, info in inference.get("results", {}).items():
+    if info:  # empty dict means entity not tracked
+        print(f"{path}: score={info.get('recency_score', 0):.1f}, "
+              f"opens_7d={info.get('open_count_7d', 0)}, "
+              f"type={info.get('entity_type', '?')}")
+    else:
+        print(f"{path}: not tracked by WARP")
+
+# --- Example: GetInferenceDeltas (incremental sync) ---
+deltas = query_warp({"op": "GetInferenceDeltas", "since_version": 0})
+for d in deltas.get("deltas", []):
+    print(f"  [{d['entity_type']}] {d['entity_key']} "
+          f"score={d['recency_score']:.1f} v{d['version']}")
+# Store max version for next call:
+if deltas.get("deltas"):
+    watermark = max(d["version"] for d in deltas["deltas"])
 ```
 
 ### PowerShell
@@ -651,6 +1009,18 @@ $result.app_launch_activities.events |
 $browse = Query-Warp '{"window":"24h","types":["browsing"]}'
 $browse.browsing_activities.events |
     Select-Object timestamp, browser, title |
+    Format-Table -AutoSize
+
+# QueryInferences for specific files
+$inf = Query-Warp '{"op":"QueryInferences","paths":["C:\\Users\\Alice\\Documents\\report.docx"],"fields":["recency_score","open_count_7d"]}'
+$inf.results.PSObject.Properties | ForEach-Object {
+    Write-Host "$($_.Name): score=$($_.Value.recency_score), opens_7d=$($_.Value.open_count_7d)"
+}
+
+# GetInferenceDeltas (incremental sync)
+$deltas = Query-Warp '{"op":"GetInferenceDeltas","since_version":0}'
+Write-Host "Received $($deltas.deltas.Count) delta records"
+$deltas.deltas | Select-Object entity_key, entity_type, recency_score, version |
     Format-Table -AutoSize
 ```
 
@@ -732,6 +1102,31 @@ function queryWarp(request) {
                 console.log(`  [${e.browser}] ${e.title}`);
             }
         }
+
+        // QueryInferences -- get recency scores for specific files
+        const inference = await queryWarp({
+            op: 'QueryInferences',
+            paths: [
+                'C:\\Users\\Alice\\Documents\\report.docx',
+                'C:\\Windows\\System32\\notepad.exe',
+            ],
+            fields: ['recency_score', 'open_count_7d'],
+        });
+        console.log('\nInference results:');
+        for (const [path, info] of Object.entries(inference.results || {})) {
+            if (Object.keys(info).length > 0) {
+                console.log(`  ${path}: score=${info.recency_score}, opens_7d=${info.open_count_7d}`);
+            } else {
+                console.log(`  ${path}: not tracked`);
+            }
+        }
+
+        // GetInferenceDeltas -- incremental sync
+        const deltas = await queryWarp({ op: 'GetInferenceDeltas', since_version: 0 });
+        console.log(`\nInference deltas: ${deltas.deltas.length} records`);
+        for (const d of deltas.deltas.slice(0, 5)) {
+            console.log(`  [${d.entity_type}] ${d.entity_key} score=${d.recency_score} v${d.version}`);
+        }
     } catch (err) {
         console.error('WARP is not available:', err.message);
     }
@@ -787,6 +1182,23 @@ in your application if needed for display.
 
 Paths are returned with native Windows casing. When comparing paths from
 different queries or with your own file lists, use case-insensitive comparison.
+
+### 9. Use Inference for Ranking, Not Raw Events
+
+If you need to rank or sort entities by relevance (e.g., "most recently used
+files"), prefer `QueryInferences` over scanning raw events. The inference engine
+precomputes recency scores and access counts incrementally, making lookups
+instant regardless of how many raw events exist.
+
+### 10. Use `GetInferenceDeltas` for Incremental Sync
+
+Rather than re-querying all inference data on every poll, track the highest
+`version` you have seen and pass it as `since_version`. This minimizes data
+transfer and parsing overhead.
+
+```json
+{"op": "GetInferenceDeltas", "since_version": 1042}
+```
 
 ---
 
@@ -871,6 +1283,24 @@ CREATE TABLE browsing_activity (
 );
 
 CREATE INDEX idx_browse_ts ON browsing_activity(timestamp);
+
+-- Inference table (precomputed per-entity analytics)
+CREATE TABLE inference (
+    entity_key        TEXT PRIMARY KEY,   -- lowercase file path / exe path / URL
+    entity_type       TEXT,               -- 'file', 'app', or 'url'
+    last_event_ts     INTEGER,            -- last event of any kind
+    last_open_ts      INTEGER,            -- last OPEN / launch / visit
+    last_edit_ts      INTEGER,            -- last MODIFY/CREATE (files only)
+    open_count_7d     INTEGER,            -- rolling 7-day open count
+    open_count_30d    INTEGER,            -- rolling 30-day open count
+    open_count_total  INTEGER,            -- lifetime open count
+    recency_score     REAL,               -- 0-255 composite score
+    version           INTEGER,            -- monotonic per-entity version
+    updated_at        INTEGER             -- last inference update timestamp
+);
+
+CREATE INDEX idx_inference_updated_at ON inference(updated_at);
+CREATE INDEX idx_inference_version    ON inference(version);
 ```
 
 **Database location:** `%LOCALAPPDATA%\WARP\activity.db`
@@ -883,9 +1313,21 @@ CREATE INDEX idx_browse_ts ON browsing_activity(timestamp);
 
 ---
 
-*This documentation describes WARP API version 2.0. The response format changed
-from v1.0 -- event types are now segregated at the root level rather than in a
-single flat array. The `"types"` request field is new in v2.0. Requests without
-`"types"` return all event types (backward compatible). New fields may be added
-to response objects in future versions, but existing fields will not be removed
-or change meaning.*
+*This documentation describes WARP API version 3.0.*
+
+*Changes from v2.0:*
+- *New `"op": "QueryInferences"` request for batch lookup of precomputed per-entity
+  inference records (recency scores, access counts, timestamps).*
+- *New `"op": "GetInferenceDeltas"` request for incremental sync of inference
+  records using a version watermark.*
+- *New `inference` table in the SQLite schema.*
+- *Existing event query requests (`"window"`, `"seconds"`, `"types"`) are unchanged
+  and fully backward compatible.*
+
+*Changes from v1.0:*
+- *Event types are segregated at the root level rather than in a single flat array.*
+- *The `"types"` request field was introduced. Requests without `"types"` return
+  all event types (backward compatible).*
+
+*New fields may be added to response objects in future versions, but existing
+fields will not be removed or change meaning.*

@@ -80,6 +80,25 @@ bool ActivityDatabase::Open(const std::wstring& dbPath)
 
     Execute("CREATE INDEX IF NOT EXISTS idx_browse_ts ON browsing_activity(timestamp);");
 
+    // Inference table (precomputed scores, updated incrementally per event)
+    const char* createInferenceTable =
+        "CREATE TABLE IF NOT EXISTS inference ("
+        "  entity_key        TEXT PRIMARY KEY,"
+        "  entity_type       TEXT,"
+        "  last_event_ts     INTEGER,"
+        "  last_open_ts      INTEGER,"
+        "  last_edit_ts      INTEGER,"
+        "  open_count_7d     INTEGER,"
+        "  open_count_30d    INTEGER,"
+        "  open_count_total  INTEGER,"
+        "  recency_score     REAL,"
+        "  version           INTEGER,"
+        "  updated_at        INTEGER"
+        ");";
+    Execute(createInferenceTable);
+    Execute("CREATE INDEX IF NOT EXISTS idx_inference_updated_at ON inference(updated_at);");
+    Execute("CREATE INDEX IF NOT EXISTS idx_inference_version ON inference(version);");
+
     return true;
 }
 
@@ -341,6 +360,7 @@ void ActivityDatabase::ClearAll()
     Execute("DELETE FROM file_activity;");
     Execute("DELETE FROM app_launch_activity;");
     Execute("DELETE FROM browsing_activity;");
+    Execute("DELETE FROM inference;");
 }
 
 bool ActivityDatabase::Execute(const char* sql)

@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "QueryApi.h"
+#include "InferenceEngine.h"
 #include <sstream>
 #include <string>
 #include <vector>
@@ -16,10 +17,11 @@ QueryApi::~QueryApi()
     if (m_stopEvent) CloseHandle(m_stopEvent);
 }
 
-void QueryApi::Start(ActivityDatabase* db)
+void QueryApi::Start(ActivityDatabase* db, InferenceEngine* inference)
 {
     if (m_running) return;
     m_db = db;
+    m_inference = inference;
     m_running = true;
     ResetEvent(m_stopEvent);
     m_thread = std::thread(&QueryApi::Run, this);
@@ -134,6 +136,58 @@ void QueryApi::HandleClient(HANDLE hPipe)
             end++;
         return request.substr(pos, end - pos);
     };
+
+    // Extract strings from a JSON array value, e.g. ["a","b","c"]
+    auto extractStringArray = [&](const std::string& key) -> std::vector<std::string> {
+        std::vector<std::string> result;
+        auto keyPos = request.find("\"" + key + "\"");
+        if (keyPos == std::string::npos) return result;
+        auto arrStart = request.find('[', keyPos);
+        auto arrEnd = request.find(']', arrStart != std::string::npos ? arrStart : 0);
+        if (arrStart == std::string::npos || arrEnd == std::string::npos) return result;
+        std::string arr = request.substr(arrStart + 1, arrEnd - arrStart - 1);
+        // Parse quoted strings out of arr
+        size_t p = 0;
+        while (p < arr.size())
+        {
+            auto q1 = arr.find('"', p);
+            if (q1 == std::string::npos) break;
+            auto q2 = arr.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            result.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
+            p = q2 + 1;
+        }
+        return result;
+    };
+
+    // --- Check for inference operations ---
+    std::string opVal = findValue("op");
+
+    if (opVal == "QueryInferences" && m_inference)
+    {
+        auto paths  = extractStringArray("paths");
+        auto fields = extractStringArray("fields");
+        std::string json = m_inference->HandleQueryInferences(paths, fields);
+        DWORD written = 0;
+        WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
+        FlushFileBuffers(hPipe);
+        return;
+    }
+
+    if (opVal == "GetInferenceDeltas" && m_inference)
+    {
+        std::string sinceStr = findValue("since_version");
+        uint32_t sinceVer = 0;
+        if (!sinceStr.empty())
+            sinceVer = static_cast<uint32_t>(strtoul(sinceStr.c_str(), nullptr, 10));
+        std::string json = m_inference->HandleGetInferenceDeltas(sinceVer);
+        DWORD written = 0;
+        WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
+        FlushFileBuffers(hPipe);
+        return;
+    }
+
+    // --- Existing event-query logic ---
 
     // Parse event types from "types" array if present
     uint32_t eventTypes = 0;

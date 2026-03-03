@@ -6,6 +6,8 @@
 #include <functional>
 #include "ActivityDatabase.h"
 
+class InferenceEngine;
+
 // Named pipe server that exposes a JSON query API for other Windows apps.
 // Pipe name: \\.\pipe\WarpFileActivityAPI
 //
@@ -13,18 +15,21 @@
 //   Request:  { "window": "15m" }          -- valid: 15m,30m,1h,2h,6h,24h,7d,15d,30d
 //   Request:  { "seconds": 300 }           -- custom time range in seconds
 //   Request:  { "window": "1h", "types": ["file","app_launch","browsing"] }
-//   Response: JSON with segregated event types
+//   Request:  { "op": "QueryInferences", "paths": [...], "fields": [...] }
+//   Request:  { "op": "GetInferenceDeltas", "since_version": 100 }
+//   Response: JSON with segregated event types or inference results
 class QueryApi
 {
 public:
     QueryApi();
     ~QueryApi();
 
-    void Start(ActivityDatabase* db);
+    void Start(ActivityDatabase* db, InferenceEngine* inference);
     void Stop();
 
 private:
-    ActivityDatabase* m_db = nullptr;
+    ActivityDatabase*  m_db        = nullptr;
+    InferenceEngine*   m_inference = nullptr;
     std::thread m_thread;
     std::atomic<bool> m_running{ false };
     HANDLE m_stopEvent = nullptr;
