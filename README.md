@@ -30,6 +30,7 @@ long as the PC is actively being used.
 | **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. |
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps, access counts, and an exponential-decay recency score. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
+| **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
 
 ---
 
@@ -98,8 +99,20 @@ tray) with a modern themed layout:
 - **Event type filter** -- three checkboxes (**File Activity**, **App Launches**,
   **Browsing Activity**) that control which event types are queried. All checked by
   default. The selected types are sent as a `"types"` array in the JSON request.
+- **Inference exploration section** -- labelled "Explore Precomputed Inferences":
+  - *Entity type filter* -- three checkboxes (**Files**, **Apps**, **URLs**) to
+    select which entity types to include. All checked by default.
+  - *Top N* -- a numeric input (default 50) and a **Show Top Inferences** button
+    that fetches all inference records via `GetInferenceDeltas`, filters by the
+    selected entity types, sorts by `recency_score` descending, truncates to the
+    top N, and formats a human-readable report with rank, type, score, open counts
+    (7d / 30d / total), entity key, and local-time timestamps.
+  - *Lookup* -- a text field with cue banner "Enter path or URL to look up..." and
+    a **Lookup** button that sends a `QueryInferences` request for the entered
+    entity key and displays the pretty-printed JSON result.
 - **Response area** -- a read-only, scrollable, monospace (`Cascadia Mono`) edit
-  control that displays pretty-printed JSON responses.
+  control that displays pretty-printed JSON responses or the inference explorer
+  output.
 
 Each query button spawns a background thread that connects to
 `\\.\pipe\WarpFileActivityAPI`, sends the appropriate JSON request, reads and
@@ -322,6 +335,11 @@ immediately.
 | Event Types to Query:                                      |
 |   [x] File Activity  [x] App Launches  [x] Browsing Act.  |
 |                                                            |
+| Explore Precomputed Inferences                             |
+| Entity Types: [x] Files [x] Apps [x] URLs  Top N: [50]    |
+|                                  [Show Top Inferences]     |
+| [Enter path or URL to look up...                ] [Lookup] |
+|                                                            |
 | API Response                                               |
 | +--------------------------------------------------------+ |
 | | {                                                      | |
@@ -370,7 +388,8 @@ automatically via the linker's UAC manifest setting.
 12. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
 13. Right-clicking the tray icon shows **Open** / **Exit**. *Open* shows the window maximized; *Exit* tears everything down cleanly.
 14. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
-15. Clearing activity history also clears the inference engine's in-memory cache.
+15. The "Explore Precomputed Inferences" section can be used to browse the top entities by recency score (filtered by entity type) or look up the inference record for a specific file path, app path, or URL.
+16. Clearing activity history also clears the inference engine's in-memory cache.
 
 ---
 
