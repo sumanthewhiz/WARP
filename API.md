@@ -1,13 +1,14 @@
-# WARP File Activity API — Integration Guide
+# WARP Activity API -- Integration Guide
 
-> **Version:** 1.0  
-> **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`  
-> **Transport:** Windows Named Pipe (message mode)  
+> **Version:** 2.0
+> **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`
+> **Transport:** Windows Named Pipe (message mode)
 > **Encoding:** UTF-8 JSON
 
 This document describes how third-party applications running on the same Windows
-machine can connect to the WARP service and query file/folder activity history to
-make better-informed decisions in their own workflows.
+machine can connect to the WARP service and query activity history -- including
+file/folder events, application launches, and browsing activity -- to make
+better-informed decisions in their own workflows.
 
 ---
 
@@ -20,10 +21,13 @@ make better-informed decisions in their own workflows.
   - [Predefined Time Window](#1-predefined-time-window)
   - [Custom Time Range](#2-custom-time-range-in-seconds)
   - [Default Query](#3-default-query)
+  - [Event Type Filtering](#4-event-type-filtering)
 - [Response Format](#response-format)
-  - [Top-Level Fields](#top-level-fields)
-  - [Activity Object Fields](#activity-object-fields)
-  - [Action Types](#action-types)
+  - [Top-Level Structure](#top-level-structure)
+  - [File Activity Fields](#file-activity-fields)
+  - [File Action Types](#file-action-types)
+  - [App Launch Activity Fields](#app-launch-activity-fields)
+  - [Browsing Activity Fields](#browsing-activity-fields)
 - [Error Handling](#error-handling)
 - [Data Retention & Limits](#data-retention--limits)
 - [Integration Patterns](#integration-patterns)
@@ -32,6 +36,8 @@ make better-informed decisions in their own workflows.
   - [Security Auditing](#3-security-auditing)
   - [Developer Tooling](#4-developer-tooling)
   - [Smart Cleanup Utility](#5-smart-cleanup-utility)
+  - [App Usage Analytics](#6-app-usage-analytics)
+  - [Browsing History Dashboard](#7-browsing-history-dashboard)
 - [Client Examples](#client-examples)
   - [C++ (Win32)](#c-win32)
   - [C# (.NET)](#c-net)
@@ -42,26 +48,35 @@ make better-informed decisions in their own workflows.
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
+- [Schema Reference](#schema-reference)
 
 ---
 
 ## Overview
 
-WARP continuously records file and folder activity on the local PC — including
-creates, opens/reads, modifications, deletions, and renames — and stores events in
-a local SQLite database with a 30-day rolling window. Any Windows process running
-on the same machine can connect to the WARP named pipe and retrieve this history
-as structured JSON.
+WARP continuously records three categories of user activity on the local PC:
+
+| Event Type | What is Captured | Source |
+|---|---|---|
+| **File activity** | Creates, opens, modifications, deletions, renames of files and folders | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
+| **App launches** | Every user-initiated application start (exe name, path, PID) | Process table polling via `CreateToolhelp32Snapshot` (every 2 seconds) |
+| **Browsing activity** | Browser page title changes and URLs when a browser is in the foreground | Foreground window polling via `GetForegroundWindow` + `GetWindowText` (every 3 seconds) |
+
+All events are stored in a local SQLite database with a 30-day rolling window. Any
+Windows process running on the same machine can connect to the WARP named pipe and
+retrieve this history as structured JSON, optionally filtered by event type.
 
 **Typical use cases:**
 
 | Use Case | How WARP Helps |
 |---|---|
-| Show "recently opened" files | Query `OPEN` actions for the last 15 minutes |
-| Incremental backup | Query `CREATE` + `MODIFY` actions since last sync |
-| Audit trail | Query the full 30-day window for a compliance report |
-| Dev tooling | Detect which source files changed during a build |
-| Smart cleanup | Find files that haven't been opened in 30 days |
+| Show "recently opened" files | Query `file` type, filter for `OPEN` actions |
+| Incremental backup | Query `file` type, filter `CREATE` + `MODIFY` actions since last sync |
+| Audit trail | Query all types for the full 30-day window |
+| Dev tooling | Query `file` type for `MODIFY` actions matching your project directory |
+| Smart cleanup | Query `file` type for 30 days, find untouched files |
+| App usage analytics | Query `app_launch` type to see which apps were used and when |
+| Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 
 ---
 
@@ -85,26 +100,8 @@ as structured JSON.
 | **Pipe name** | `\\.\pipe\WarpFileActivityAPI` |
 | **Pipe mode** | `PIPE_TYPE_MESSAGE \| PIPE_READMODE_MESSAGE` |
 | **Access** | `GENERIC_READ \| GENERIC_WRITE` |
-| **Concurrency** | `PIPE_UNLIMITED_INSTANCES` — multiple clients can connect simultaneously |
+| **Concurrency** | `PIPE_UNLIMITED_INSTANCES` -- multiple clients can connect simultaneously |
 | **Max message size** | 64 KB (65,536 bytes) for both request and response buffers |
-
-### Connection Sequence
-
-```
-Client                              WARP Service
-  ?                                      ?
-  ????? CreateFile(pipe_name) ????????????  Connect
-  ?                                      ?
-  ????? SetNamedPipeHandleState ??????????  Set message-read mode
-  ?     (PIPE_READMODE_MESSAGE)          ?
-  ?                                      ?
-  ????? WriteFile(JSON request) ??????????  Send query
-  ?                                      ?
-  ?????? ReadFile(JSON response) ?????????  Receive results
-  ?                                      ?
-  ????? CloseHandle ??????????????????????  Disconnect
-  ?                                      ?
-```
 
 ### Connection Lifecycle
 
@@ -114,14 +111,14 @@ Client                              WARP Service
 4. **Read** a single UTF-8 JSON response message.
 5. **Close** the pipe handle.
 
-Each connection is one request ? one response ? close. To make multiple queries,
+Each connection is one request -> one response -> close. To make multiple queries,
 open a new connection for each.
 
 ---
 
 ## Request Format
 
-Send a single UTF-8 JSON object. Three request shapes are supported:
+Send a single UTF-8 JSON object. The following fields are supported:
 
 ### 1. Predefined Time Window
 
@@ -141,7 +138,7 @@ Send a single UTF-8 JSON object. Three request shapes are supported:
 | `15d` | Last 15 days | 1,296,000 |
 | `30d` | Last 30 days | 2,592,000 |
 
-**Example — get the last 6 hours of activity:**
+**Example -- get the last 6 hours of activity:**
 
 ```json
 {"window":"6h"}
@@ -156,16 +153,10 @@ Send a single UTF-8 JSON object. Three request shapes are supported:
 Any positive integer is accepted. The value represents the number of seconds to
 look back from the current time.
 
-**Example — get the last 5 minutes:**
+**Example -- get the last 5 minutes:**
 
 ```json
 {"seconds":300}
-```
-
-**Example — get the last 45 minutes:**
-
-```json
-{"seconds":2700}
 ```
 
 ### 3. Default Query
@@ -177,89 +168,162 @@ look back from the current time.
 An empty JSON object (or any request without a `window` or `seconds` field)
 defaults to the **last 1 hour**.
 
+### 4. Event Type Filtering
+
+Any request can include a `"types"` array to specify which event categories to
+include in the response:
+
+```json
+{ "window": "1h", "types": ["file", "app_launch", "browsing"] }
+```
+
+| Type value | Description |
+|---|---|
+| `file` | File/folder activity (creates, opens, modifications, deletes, renames) |
+| `app_launch` | Application launch events (exe name, path, PID) |
+| `browsing` | Browsing activity events (browser, page title, URL) |
+
+**If `"types"` is omitted**, all three event types are returned (backward
+compatible with v1.0 clients that don't send `"types"`).
+
+**Examples:**
+
+```json
+{"window":"15m","types":["file"]}
+{"seconds":300,"types":["app_launch","browsing"]}
+{"window":"1h","types":["file","app_launch","browsing"]}
+{"types":["browsing"]}
+{}
+```
+
 ---
 
 ## Response Format
 
-The response is a single UTF-8 JSON message with the following structure:
+The response is a single UTF-8 JSON message. Event types are **segregated at the
+root level** -- each requested type appears as a separate top-level object. Only
+the types that were requested (or all, if `"types"` was omitted) are included.
+
+### Top-Level Structure
 
 ```json
 {
-    "count": 5,
-    "activities": [
-        {
-            "id": 1042,
-            "timestamp": 1750012345,
-            "action": "OPEN",
-            "path": "C:\\Users\\Alice\\Documents\\report.docx"
-        },
-        {
-            "id": 1041,
-            "timestamp": 1750012300,
-            "action": "MODIFY",
-            "path": "C:\\Users\\Alice\\Documents\\report.docx"
-        },
-        {
-            "id": 1040,
-            "timestamp": 1750012290,
-            "action": "CREATE",
-            "path": "C:\\Users\\Alice\\Documents\\report.docx"
-        },
-        {
-            "id": 1039,
-            "timestamp": 1750012200,
-            "action": "RENAME",
-            "path": "C:\\Users\\Alice\\Documents\\draft-v2.docx",
-            "old_path": "C:\\Users\\Alice\\Documents\\draft.docx"
-        },
-        {
-            "id": 1038,
-            "timestamp": 1750012100,
-            "action": "DELETE",
-            "path": "C:\\Users\\Alice\\Downloads\\temp.zip"
-        }
-    ]
+    "file_activities": {
+        "count": <integer>,
+        "events": [ ... ]
+    },
+    "app_launch_activities": {
+        "count": <integer>,
+        "events": [ ... ]
+    },
+    "browsing_activities": {
+        "count": <integer>,
+        "events": [ ... ]
+    }
 }
 ```
 
-### Top-Level Fields
+Each section has:
+- `count` -- the number of events in that category.
+- `events` -- an array of event objects, ordered **most recent first** (descending
+  by `timestamp`).
 
-| Field | Type | Description |
-|---|---|---|
-| `count` | `integer` | Total number of activity records in this response. |
-| `activities` | `array` | Ordered list of activity objects, **most recent first** (descending by `timestamp`). |
-
-### Activity Object Fields
+### File Activity Fields
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `id` | `integer` | Always | Auto-increment database row ID. Unique and monotonically increasing. Useful for tracking "what's new since last query" by remembering the highest `id` seen. |
-| `timestamp` | `integer` | Always | Unix epoch seconds (UTC) when the event was recorded. |
-| `action` | `string` | Always | The type of file/folder activity. See [Action Types](#action-types) below. |
-| `path` | `string` | Always | Full absolute path of the affected file or folder. Backslashes are JSON-escaped as `\\`. |
-| `old_path` | `string` | **RENAME only** | The previous full path before the rename/move. Only present when `action` is `"RENAME"`. |
+| `id` | `integer` | Always | Auto-increment database row ID. |
+| `timestamp` | `integer` | Always | Unix epoch seconds (UTC). |
+| `action` | `string` | Always | The type of file/folder activity. See [File Action Types](#file-action-types). |
+| `path` | `string` | Always | Full absolute path. Backslashes are JSON-escaped as `\\`. |
+| `old_path` | `string` | **RENAME only** | The previous full path before the rename/move. |
 
-### Action Types
+**Example event:**
 
-| Action | Meaning | Source | `old_path` present? |
+```json
+{
+    "id": 1042,
+    "timestamp": 1750012345,
+    "action": "CREATE",
+    "path": "C:\\Users\\Alice\\Documents\\report.docx"
+}
+```
+
+### File Action Types
+
+| Action | Meaning | `old_path` present? |
+|---|---|---|
+| `CREATE` | A new file or folder was created. | No |
+| `OPEN` | A file or folder was opened / accessed. | No |
+| `MODIFY` | A file or folder was written to. | No |
+| `DELETE` | A file or folder was deleted. | No |
+| `RENAME` | A file or folder was renamed or moved. | **Yes** |
+
+### App Launch Activity Fields
+
+| Field | Type | Presence | Description |
 |---|---|---|---|
-| `CREATE` | A new file or folder was created. | ReadDirectoryChangesW, SHChangeNotify | No |
-| `OPEN` | A file or folder was opened / accessed (read). | NT Kernel Logger ETW (FileIoCreate) | No |
-| `MODIFY` | A file or folder was written to, or its attributes/metadata changed. | ReadDirectoryChangesW, SHChangeNotify | No |
-| `DELETE` | A file or folder was deleted. | ReadDirectoryChangesW, SHChangeNotify | No |
-| `RENAME` | A file or folder was renamed or moved to a new path. | ReadDirectoryChangesW, SHChangeNotify | **Yes** — `old_path` contains the path before the rename. |
+| `id` | `integer` | Always | Auto-increment database row ID. |
+| `timestamp` | `integer` | Always | Unix epoch seconds (UTC) when the process was first detected. |
+| `exe_name` | `string` | Always | Executable filename (e.g. `"notepad.exe"`). |
+| `exe_path` | `string` | Always | Full path to the executable. Backslashes are JSON-escaped. |
+| `pid` | `integer` | Always | Process ID at launch time. |
 
-**Notes on action semantics:**
+**Example event:**
 
-- A single user action (e.g., saving a document) may generate multiple events
-  (e.g., `CREATE` + `MODIFY`, or `DELETE` + `CREATE` for atomic saves).
-- `OPEN` events are deduplicated with a 2-second window — rapid repeated opens
-  of the same file are collapsed into one event.
-- `OPEN` events cover both files and folders. Opening a folder in Explorer will
-  generate an `OPEN` event for that folder path.
-- The `RENAME` action covers both in-place renames and cross-directory moves.
-  Check whether the parent directory of `path` differs from that of `old_path`
-  to distinguish a move from a rename.
+```json
+{
+    "id": 15,
+    "timestamp": 1750012400,
+    "exe_name": "notepad.exe",
+    "exe_path": "C:\\Windows\\System32\\notepad.exe",
+    "pid": 12340
+}
+```
+
+**Notes:**
+- Only interactive user-session processes are captured (session >= 1).
+- System processes (svchost, dwm, csrss, SearchIndexer, Defender, etc.) are excluded.
+- WARP's own process is excluded.
+
+### Browsing Activity Fields
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `id` | `integer` | Always | Auto-increment database row ID. |
+| `timestamp` | `integer` | Always | Unix epoch seconds (UTC). |
+| `browser` | `string` | Always | Browser identifier. See table below. |
+| `title` | `string` | Always | Page title (browser suffix stripped). |
+| `url` | `string` | **Optional** | URL if extractable from the title bar; absent otherwise. |
+
+**Browser identifiers:**
+
+| Value | Browser |
+|---|---|
+| `chrome` | Google Chrome |
+| `msedge` | Microsoft Edge |
+| `firefox` | Mozilla Firefox |
+| `brave` | Brave |
+| `opera` | Opera |
+| `vivaldi` | Vivaldi |
+| `ie` | Internet Explorer |
+
+**Example event:**
+
+```json
+{
+    "id": 8,
+    "timestamp": 1750012350,
+    "browser": "chrome",
+    "title": "GitHub - Pull Requests",
+    "url": "https://github.com/pulls"
+}
+```
+
+**Notes:**
+- Events are only captured while a recognized browser window is in the foreground.
+- Duplicate titles (same browser + same title) are suppressed until the title changes.
+- Common browser suffixes ("- Google Chrome", "- Microsoft Edge", etc.) are stripped.
 
 ---
 
@@ -268,15 +332,14 @@ The response is a single UTF-8 JSON message with the following structure:
 | Scenario | What Happens |
 |---|---|
 | WARP is not running | `CreateFile` fails with `ERROR_FILE_NOT_FOUND` (error 2). Your app should retry or inform the user. |
-| Malformed JSON request | WARP treats it as a default query and returns the last 1 hour of activity. |
+| Malformed JSON request | WARP treats it as a default query and returns the last 1 hour of all event types. |
 | Unknown `window` code | WARP falls back to `1h` (last 1 hour). |
-| Negative or zero `seconds` | The query returns an empty result set (`"count": 0`). |
-| No activity in the time range | Returns `{"count":0,"activities":[]}`. |
-| Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window or custom seconds to reduce result size. |
+| Unknown value in `types` array | That value is silently ignored. If no valid types remain, all types are returned. |
+| Negative or zero `seconds` | The query returns empty result sets (`"count": 0`). |
+| No activity in the time range | Returns sections with `"count": 0` and empty `"events": []`. |
+| Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
 
 ### Checking if WARP is Available
-
-Before relying on WARP data, you can probe whether the service is running:
 
 ```cpp
 // Quick availability check (C++)
@@ -303,12 +366,15 @@ bool available = System.IO.File.Exists(@"\\.\pipe\WarpFileActivityAPI");
 
 | Property | Value |
 |---|---|
-| **Retention period** | 30 days (rolling). Records older than 30 days are evicted on startup and every 6 hours. |
+| **Retention period** | 30 days (rolling). Records older than 30 days are evicted from all three tables on startup and every 6 hours. |
 | **Maximum queryable range** | 30 days (`"window":"30d"` or `"seconds":2592000`). |
 | **Database location** | `%LOCALAPPDATA%\WARP\activity.db` |
 | **Storage format** | SQLite 3 with WAL mode |
 | **Timestamp precision** | 1-second resolution (Unix epoch seconds, UTC) |
-| **OPEN event dedup window** | 2 seconds — multiple kernel-level opens of the same file within 2 seconds are collapsed into one event. |
+| **OPEN event dedup window** | 2 seconds -- multiple kernel-level opens of the same file within 2 seconds are collapsed into one event. |
+| **Browsing dedup** | Same browser + same title is reported only once until the title changes. |
+| **App launch polling interval** | 2 seconds |
+| **Browsing polling interval** | 3 seconds |
 
 ---
 
@@ -319,56 +385,74 @@ bool available = System.IO.File.Exists(@"\\.\pipe\WarpFileActivityAPI");
 Show users the files they opened most recently:
 
 ```json
-{"window":"15m"}
+{"window":"15m","types":["file"]}
 ```
 
-Filter the response for `action == "OPEN"` and display unique paths.
+Filter the response `file_activities.events` for `action == "OPEN"` and display
+unique paths.
 
 ### 2. Backup & Sync Engine
 
 Find all files created or modified since the last backup:
 
 ```json
-{"seconds":3600}
+{"seconds":3600,"types":["file"]}
 ```
 
 Filter for `action == "CREATE"` or `action == "MODIFY"`. Use the `id` field to
-track the high-water mark — on the next sync, query the full window and skip
-any `id` values you've already processed.
+track the high-water mark.
 
 ### 3. Security Auditing
 
-Generate a compliance report of all file activity over the past week:
+Generate a compliance report of all activity over the past week:
 
 ```json
 {"window":"7d"}
 ```
 
-Log every event. The `RENAME` action with `old_path` lets you track file
-provenance across renames and moves.
+Log every event across all three types. The `RENAME` action with `old_path` lets
+you track file provenance. App launch events show what was executed. Browsing
+events show what was accessed online.
 
 ### 4. Developer Tooling
 
 Detect which source files changed during a build:
 
 ```json
-{"seconds":120}
+{"seconds":120,"types":["file"]}
 ```
 
 Filter for `action == "MODIFY"` and paths matching your project directory.
 
 ### 5. Smart Cleanup Utility
 
-Find files that haven't been touched recently by comparing the full 30-day
-activity log against a directory listing:
+Find files that haven't been touched recently:
 
 ```json
-{"window":"30d"}
+{"window":"30d","types":["file"]}
 ```
 
 Collect all unique `path` values with `action == "OPEN"` or `action == "MODIFY"`.
-Any file in the target directory that does **not** appear in this set hasn't been
-accessed in at least 30 days.
+
+### 6. App Usage Analytics
+
+Show which applications the user launched today:
+
+```json
+{"window":"24h","types":["app_launch"]}
+```
+
+Group `app_launch_activities.events` by `exe_name` and count occurrences.
+
+### 7. Browsing History Dashboard
+
+Show pages visited in the last hour:
+
+```json
+{"window":"1h","types":["browsing"]}
+```
+
+Display `browsing_activities.events` with `browser`, `title`, and `url` fields.
 
 ---
 
@@ -383,7 +467,6 @@ accessed in at least 30 days.
 
 int main()
 {
-    // Connect to the WARP named pipe
     HANDLE hPipe = CreateFileW(
         L"\\\\.\\pipe\\WarpFileActivityAPI",
         GENERIC_READ | GENERIC_WRITE,
@@ -394,16 +477,14 @@ int main()
         return 1;
     }
 
-    // Set pipe to message-read mode
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
 
-    // Send request — last 15 minutes
-    const char* request = R"({"window":"15m"})";
+    // Request last 15 minutes of app launches and browsing
+    const char* request = R"({"window":"15m","types":["app_launch","browsing"]})";
     DWORD written = 0;
     WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
 
-    // Read response
     char buffer[65536] = {};
     DWORD bytesRead = 0;
     ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
@@ -423,38 +504,46 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 
-// Connect
 using var pipe = new NamedPipeClientStream(".", "WarpFileActivityAPI",
     PipeDirection.InOut);
-pipe.Connect(5000); // 5-second timeout
+pipe.Connect(5000);
 pipe.ReadMode = PipeTransmissionMode.Message;
 
-// Send request — last 6 hours
+// Request all event types for the last 6 hours
 byte[] request = Encoding.UTF8.GetBytes("""{"window":"6h"}""");
 pipe.Write(request, 0, request.Length);
 
-// Read response
 byte[] buffer = new byte[65536];
 int bytesRead = pipe.Read(buffer, 0, buffer.Length);
 string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
-// Parse and use
 using var doc = JsonDocument.Parse(json);
-int count = doc.RootElement.GetProperty("count").GetInt32();
-Console.WriteLine($"Total events: {count}");
 
-foreach (var activity in doc.RootElement.GetProperty("activities").EnumerateArray())
+// File activities
+if (doc.RootElement.TryGetProperty("file_activities", out var fa))
 {
-    string action = activity.GetProperty("action").GetString()!;
-    string path = activity.GetProperty("path").GetString()!;
-    long timestamp = activity.GetProperty("timestamp").GetInt64();
+    int count = fa.GetProperty("count").GetInt32();
+    Console.WriteLine($"File events: {count}");
+    foreach (var e in fa.GetProperty("events").EnumerateArray())
+        Console.WriteLine($"  [{e.GetProperty("action").GetString()}] {e.GetProperty("path").GetString()}");
+}
 
-    DateTimeOffset time = DateTimeOffset.FromUnixTimeSeconds(timestamp).ToLocalTime();
-    Console.WriteLine($"  [{time:HH:mm:ss}] {action,-8} {path}");
+// App launches
+if (doc.RootElement.TryGetProperty("app_launch_activities", out var al))
+{
+    int count = al.GetProperty("count").GetInt32();
+    Console.WriteLine($"App launches: {count}");
+    foreach (var e in al.GetProperty("events").EnumerateArray())
+        Console.WriteLine($"  {e.GetProperty("exe_name").GetString()} (PID {e.GetProperty("pid").GetInt32()})");
+}
 
-    // For RENAME actions, also print the old path
-    if (action == "RENAME" && activity.TryGetProperty("old_path", out var oldPath))
-        Console.WriteLine($"             from: {oldPath.GetString()}");
+// Browsing activities
+if (doc.RootElement.TryGetProperty("browsing_activities", out var ba))
+{
+    int count = ba.GetProperty("count").GetInt32();
+    Console.WriteLine($"Browsing events: {count}");
+    foreach (var e in ba.GetProperty("events").EnumerateArray())
+        Console.WriteLine($"  [{e.GetProperty("browser").GetString()}] {e.GetProperty("title").GetString()}");
 }
 ```
 
@@ -462,10 +551,6 @@ foreach (var activity in doc.RootElement.GetProperty("activities").EnumerateArra
 
 ```python
 import json
-import struct
-
-# Using the built-in win32 pipe via ctypes (no pywin32 dependency)
-# Alternatively, if pywin32 is available:
 import win32file
 import win32pipe
 
@@ -493,23 +578,32 @@ def query_warp(request_obj: dict) -> dict:
     return json.loads(response_bytes.decode("utf-8"))
 
 
-# --- Example: Get recently opened files ---
+# --- Example: Get all activity for the last 15 minutes ---
 data = query_warp({"window": "15m"})
-print(f"Total events: {data['count']}")
 
-# Filter for OPEN events only
-opens = [a for a in data["activities"] if a["action"] == "OPEN"]
-print(f"Files/folders opened in last 15 min: {len(opens)}")
-for item in opens:
-    print(f"  {item['path']}")
+if "file_activities" in data:
+    fa = data["file_activities"]
+    print(f"File events: {fa['count']}")
+    for e in fa["events"][:5]:
+        print(f"  [{e['action']}] {e['path']}")
 
-# --- Example: Get modified files in the last 2 hours ---
-data = query_warp({"window": "2h"})
-modified = [a for a in data["activities"] if a["action"] == "MODIFY"]
-unique_paths = list(dict.fromkeys(a["path"] for a in modified))
-print(f"\nUnique files modified in last 2 hours: {len(unique_paths)}")
-for p in unique_paths[:10]:
-    print(f"  {p}")
+if "app_launch_activities" in data:
+    al = data["app_launch_activities"]
+    print(f"\nApp launches: {al['count']}")
+    for e in al["events"][:5]:
+        print(f"  {e['exe_name']} (PID {e['pid']})")
+
+if "browsing_activities" in data:
+    ba = data["browsing_activities"]
+    print(f"\nBrowsing events: {ba['count']}")
+    for e in ba["events"][:5]:
+        url_str = f" - {e['url']}" if 'url' in e else ""
+        print(f"  [{e['browser']}] {e['title']}{url_str}")
+
+# --- Example: Only browsing activity for the last 2 hours ---
+data = query_warp({"window": "2h", "types": ["browsing"]})
+for e in data.get("browsing_activities", {}).get("events", []):
+    print(f"  [{e['browser']}] {e['title']}")
 ```
 
 ### PowerShell
@@ -542,22 +636,21 @@ function Query-Warp {
     }
 }
 
-# Get last 1 hour of activity
+# Get last 1 hour of all activity
 $result = Query-Warp '{"window":"1h"}'
-Write-Host "Total events: $($result.count)"
+Write-Host "File events: $($result.file_activities.count)"
+Write-Host "App launches: $($result.app_launch_activities.count)"
+Write-Host "Browsing events: $($result.browsing_activities.count)"
 
-# Show recent OPEN events
-$result.activities |
-    Where-Object { $_.action -eq "OPEN" } |
-    Select-Object timestamp, path |
+# Show recent app launches
+$result.app_launch_activities.events |
+    Select-Object timestamp, exe_name, pid |
     Format-Table -AutoSize
 
-# Get last 24 hours, group by action type
-$result = Query-Warp '{"window":"24h"}'
-$result.activities |
-    Group-Object -Property action |
-    Select-Object Name, Count |
-    Sort-Object -Property Count -Descending |
+# Only browsing activity for the last 24 hours
+$browse = Query-Warp '{"window":"24h","types":["browsing"]}'
+$browse.browsing_activities.events |
+    Select-Object timestamp, browser, title |
     Format-Table -AutoSize
 ```
 
@@ -565,11 +658,9 @@ $result.activities |
 
 ```rust
 use std::io::{Read, Write};
-use std::os::windows::io::FromRawHandle;
 use std::fs::OpenOptions;
 
 fn query_warp(request: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // On Windows, named pipes can be opened as files
     let mut pipe = OpenOptions::new()
         .read(true)
         .write(true)
@@ -578,16 +669,13 @@ fn query_warp(request: &str) -> Result<String, Box<dyn std::error::Error>> {
     pipe.write_all(request.as_bytes())?;
     pipe.flush()?;
 
-    let mut response = String::new();
     let mut buf = [0u8; 65536];
     let n = pipe.read(&mut buf)?;
-    response.push_str(std::str::from_utf8(&buf[..n])?);
-
-    Ok(response)
+    Ok(std::str::from_utf8(&buf[..n])?.to_string())
 }
 
 fn main() {
-    match query_warp(r#"{"window":"15m"}"#) {
+    match query_warp(r#"{"window":"15m","types":["app_launch"]}"#) {
         Ok(json) => println!("{}", json),
         Err(e) => eprintln!("Failed to query WARP: {}", e),
     }
@@ -619,24 +707,30 @@ function queryWarp(request) {
     });
 }
 
-// Example: Get last 30 minutes of activity
+// Example: Get last 30 minutes of all activity
 (async () => {
     try {
         const result = await queryWarp({ window: '30m' });
-        console.log(`Total events: ${result.count}`);
 
-        // Group by action
-        const grouped = {};
-        for (const a of result.activities) {
-            grouped[a.action] = (grouped[a.action] || 0) + 1;
+        // File activities
+        if (result.file_activities) {
+            console.log(`File events: ${result.file_activities.count}`);
         }
-        console.log('By action:', grouped);
 
-        // Show OPEN events
-        const opens = result.activities.filter(a => a.action === 'OPEN');
-        for (const o of opens.slice(0, 10)) {
-            const time = new Date(o.timestamp * 1000).toLocaleTimeString();
-            console.log(`  [${time}] ${o.path}`);
+        // App launches
+        if (result.app_launch_activities) {
+            console.log(`App launches: ${result.app_launch_activities.count}`);
+            for (const e of result.app_launch_activities.events.slice(0, 5)) {
+                console.log(`  ${e.exe_name} (PID ${e.pid})`);
+            }
+        }
+
+        // Browsing activity
+        if (result.browsing_activities) {
+            console.log(`Browsing events: ${result.browsing_activities.count}`);
+            for (const e of result.browsing_activities.events.slice(0, 5)) {
+                console.log(`  [${e.browser}] ${e.title}`);
+            }
         }
     } catch (err) {
         console.error('WARP is not available:', err.message);
@@ -653,34 +747,43 @@ function queryWarp(request) {
 Prefer the shortest time window that meets your needs. Querying `15m` is
 significantly faster than `30d` when the database contains millions of records.
 
-### 2. Filter Client-Side
+### 2. Request Only the Types You Need
 
-WARP returns all event types in the requested window. Filter by `action` and/or
-`path` prefix in your client code to get exactly what you need.
+Use the `"types"` array to limit the response to the event categories your
+application actually uses. This reduces response size and database query time.
 
-### 3. Track High-Water Mark with `id`
+```json
+{"window":"1h","types":["file"]}
+```
+
+### 3. Filter Client-Side
+
+Within each event type, WARP returns all events in the requested window. Filter by
+`action`, `path` prefix, `exe_name`, `browser`, etc. in your client code.
+
+### 4. Track High-Water Mark with `id`
 
 For incremental processing (e.g., backup sync), remember the highest `id` from
-your last query. On the next query, discard any events with `id` ? your
-high-water mark. This is more reliable than timestamp-based tracking.
+your last query. On the next query, discard any events with `id` <= your
+high-water mark. Each event type has its own independent `id` sequence.
 
-### 4. Handle Pipe Unavailability Gracefully
+### 5. Handle Pipe Unavailability Gracefully
 
 WARP may not be running. Always handle `CreateFile` failure and implement a
 fallback path in your application.
 
-### 5. One Connection Per Query
+### 6. One Connection Per Query
 
 Open a fresh pipe connection for each query. Don't try to reuse the handle for
-multiple request/response cycles — the pipe server expects one message per
+multiple request/response cycles -- the pipe server expects one message per
 connection.
 
-### 6. Parse Timestamps as UTC
+### 7. Parse Timestamps as UTC
 
 The `timestamp` field is Unix epoch seconds in **UTC**. Convert to local time
 in your application if needed for display.
 
-### 7. Normalize Paths for Comparison
+### 8. Normalize Paths for Comparison
 
 Paths are returned with native Windows casing. When comparing paths from
 different queries or with your own file lists, use case-insensitive comparison.
@@ -692,42 +795,50 @@ different queries or with your own file lists, use case-insensitive comparison.
 | Problem | Cause | Solution |
 |---|---|---|
 | `CreateFile` returns `INVALID_HANDLE_VALUE` with error 2 | WARP is not running | Start WARP. It requires Administrator privileges. |
-| `CreateFile` returns `INVALID_HANDLE_VALUE` with error 231 | All pipe instances are busy | Retry after a short delay (100–500 ms). |
-| Response is empty or `{"count":0,"activities":[]}` | No activity in the requested time range, or WARP was recently started | Try a wider time window. WARP only records events while it's running. |
-| `OPEN` events are missing | WARP's ETW trace may have failed to start | Ensure WARP is running with Administrator privileges. The NT Kernel Logger requires elevation. |
-| Duplicate events for the same file | Normal — a single user action can trigger multiple kernel events | Deduplicate by path + action within a short time window in your client. |
-| Paths contain `\\Device\\HarddiskVolume...` | Drive letter mapping failed for that volume | These are filtered out by WARP. If you see them, report as a bug. |
-| `ReadFile` returns partial data | Response exceeded the 64 KB pipe buffer | Use a shorter time window to reduce result size. |
+| `CreateFile` returns `INVALID_HANDLE_VALUE` with error 231 | All pipe instances are busy | Retry after a short delay (100-500 ms). |
+| Response is empty or all counts are 0 | No activity in the requested time range, or WARP was recently started | Try a wider time window. WARP only records events while it's running. |
+| `OPEN` events are missing | WARP's ETW trace may have failed to start | Ensure WARP is running with Administrator privileges. |
+| App launch events missing for a known app | The app may be in the system process blocklist | Only interactive user-session processes not in the blocklist are captured. |
+| Browsing events missing | The browser may not be in the foreground, or is not a recognized browser | Events are only captured while a supported browser window is the foreground window. |
+| Duplicate file events for the same file | Normal -- a single user action can trigger multiple kernel events | Deduplicate by path + action within a short time window in your client. |
+| `ReadFile` returns partial data | Response exceeded the 64 KB pipe buffer | Use a shorter time window or fewer event types to reduce result size. |
 
 ---
 
 ## Limitations
 
-1. **Local only** — The named pipe is not accessible from remote machines.
-2. **No filtering server-side** — You cannot filter by action type or path in the
-   request. All matching events are returned; filter in your client.
-3. **No streaming / subscription** — The API is request/response only. There is no
+1. **Local only** -- The named pipe is not accessible from remote machines.
+2. **No server-side filtering by path or action** -- You cannot filter by action
+   type, path, exe_name, or browser in the request. All matching events for the
+   requested types are returned; filter in your client.
+3. **No streaming / subscription** -- The API is request/response only. There is no
    push notification or event stream. Poll periodically if you need near-real-time
    updates.
-4. **30-day maximum** — Events older than 30 days are automatically evicted.
-5. **No authentication** — Any local process can connect to the pipe. The data
-   contains full file paths which may be sensitive.
-6. **64 KB response limit** — Very large result sets may be truncated. Use shorter
-   time windows for busy systems.
-7. **1-second timestamp granularity** — Events within the same second have the
-   same `timestamp` value. Use `id` for precise ordering.
-8. **Excluded paths** — Activity in system directories (Windows, Program Files,
+4. **30-day maximum** -- Events older than 30 days are automatically evicted.
+5. **No authentication** -- Any local process can connect to the pipe. The data
+   may contain sensitive information (file paths, browsing titles, URLs).
+6. **64 KB response limit** -- Very large result sets may be truncated. Use shorter
+   time windows or specific event types for busy systems.
+7. **1-second timestamp granularity** -- Events within the same second have the
+   same `timestamp` value. Use `id` for precise ordering within a type.
+8. **Excluded paths** -- File activity in system directories (Windows, Program Files,
    AppData, ProgramData, etc.), hidden dot-folders, and common build/cache
-   artifacts is excluded by design. See the README for the full exclusion list.
+   artifacts is excluded by design.
+9. **App launch detection latency** -- The process table is polled every 2 seconds,
+   so very short-lived processes may be missed.
+10. **Browsing detection** -- Only works when the browser is the foreground window.
+    Background tab changes are not captured. URL extraction depends on the browser
+    showing it in the title bar.
 
 ---
 
 ## Schema Reference
 
 For advanced users who want to query the SQLite database directly (e.g., for
-complex joins or aggregations), here is the schema:
+complex joins or aggregations), here are the schemas:
 
 ```sql
+-- File/folder activity
 CREATE TABLE file_activity (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
@@ -738,18 +849,43 @@ CREATE TABLE file_activity (
 
 CREATE INDEX idx_activity_ts     ON file_activity(timestamp);
 CREATE INDEX idx_activity_action ON file_activity(action, timestamp);
+
+-- Application launches
+CREATE TABLE app_launch_activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
+    exe_name  TEXT    NOT NULL,        -- Executable filename
+    exe_path  TEXT    NOT NULL,        -- Full path to executable
+    pid       INTEGER NOT NULL        -- Process ID at launch time
+);
+
+CREATE INDEX idx_app_ts ON app_launch_activity(timestamp);
+
+-- Browsing activity
+CREATE TABLE browsing_activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
+    browser   TEXT    NOT NULL,        -- Browser identifier
+    title     TEXT    NOT NULL,        -- Page title (suffix stripped)
+    url       TEXT                     -- URL if extractable; NULL otherwise
+);
+
+CREATE INDEX idx_browse_ts ON browsing_activity(timestamp);
 ```
 
-**Database location:** `%LOCALAPPDATA%\WARP\activity.db`  
+**Database location:** `%LOCALAPPDATA%\WARP\activity.db`
 **Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`
 
-> ?? **Warning:** The database is actively written to by WARP. If you open it
+> **Warning:** The database is actively written to by WARP. If you open it
 > directly, use `PRAGMA query_only=ON` or open in read-only mode to avoid
 > interfering with WARP's WAL writer. The named-pipe API is the recommended
 > access method.
 
 ---
 
-*This documentation describes WARP API version 1.0. The API is stable and
-backward-compatible — new fields may be added to response objects in future
-versions, but existing fields will not be removed or change meaning.*
+*This documentation describes WARP API version 2.0. The response format changed
+from v1.0 -- event types are now segregated at the root level rather than in a
+single flat array. The `"types"` request field is new in v2.0. Requests without
+`"types"` return all event types (backward compatible). New fields may be added
+to response objects in future versions, but existing fields will not be removed
+or change meaning.*

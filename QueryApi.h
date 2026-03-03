@@ -9,10 +9,11 @@
 // Named pipe server that exposes a JSON query API for other Windows apps.
 // Pipe name: \\.\pipe\WarpFileActivityAPI
 //
-// Protocol (text-based, line-delimited JSON):
-//   Request:  { "window": "15m" }   – valid: 15m,30m,1h,2h,6h,24h,7d,15d,30d
-//   Request:  { "seconds": 300 }    – custom time range in seconds
-//   Response: JSON array of activity records
+// Protocol (text-based, JSON):
+//   Request:  { "window": "15m" }          -- valid: 15m,30m,1h,2h,6h,24h,7d,15d,30d
+//   Request:  { "seconds": 300 }           -- custom time range in seconds
+//   Request:  { "window": "1h", "types": ["file","app_launch","browsing"] }
+//   Response: JSON with segregated event types
 class QueryApi
 {
 public:
@@ -30,5 +31,8 @@ private:
 
     void Run();
     void HandleClient(HANDLE hPipe);
-    std::string BuildJsonResponse(const std::vector<FileActivity>& activities);
+
+    static std::string WideToUtf8(const std::wstring& w);
+    static std::string EscapeJson(const std::string& s);
+    std::string BuildJsonResponse(uint32_t eventTypes, int64_t seconds);
 };

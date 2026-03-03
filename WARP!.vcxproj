@@ -189,6 +189,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="ActivityDatabase.h" />
+    <ClInclude Include="AppLaunchMonitor.h" />
+    <ClInclude Include="BrowsingMonitor.h" />
     <ClInclude Include="FileMonitor.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="IdleDetector.h" />
@@ -200,6 +202,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ActivityDatabase.cpp" />
+    <ClCompile Include="AppLaunchMonitor.cpp" />
+    <ClCompile Include="BrowsingMonitor.cpp" />
     <ClCompile Include="FileMonitor.cpp" />
     <ClCompile Include="IdleDetector.cpp" />
     <ClCompile Include="QueryApi.cpp" />

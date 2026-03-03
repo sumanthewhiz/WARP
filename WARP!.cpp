@@ -6,6 +6,8 @@
 #include "WARP!.h"
 #include "ActivityDatabase.h"
 #include "FileMonitor.h"
+#include "AppLaunchMonitor.h"
+#include "BrowsingMonitor.h"
 #include "IdleDetector.h"
 #include "QueryApi.h"
 
@@ -93,10 +95,12 @@ NOTIFYICONDATAW nid = {};
 HWND g_hWnd = nullptr;
 
 // Subsystems
-ActivityDatabase g_db;
-FileMonitor     g_fileMonitor;
-IdleDetector    g_idleDetector;
-QueryApi        g_queryApi;
+ActivityDatabase   g_db;
+FileMonitor         g_fileMonitor;
+AppLaunchMonitor    g_appLaunchMonitor;
+BrowsingMonitor     g_browsingMonitor;
+IdleDetector        g_idleDetector;
+QueryApi            g_queryApi;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -110,6 +114,10 @@ static HWND g_hResponseLabel= nullptr;
 static HWND g_hResponse     = nullptr;
 static HWND g_hBtnTheme    = nullptr;
 static HWND g_hBtnClear    = nullptr;
+static HWND g_hChkFile     = nullptr;
+static HWND g_hChkAppLaunch= nullptr;
+static HWND g_hChkBrowsing = nullptr;
+static HWND g_hFilterLabel = nullptr;
 static std::vector<HWND> g_hWindowBtns;
 
 // Forward declarations
@@ -346,6 +354,31 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDC_RESPONSE, hInstance, nullptr);
     SendMessageW(g_hResponse, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
 
+    // Event type filter checkboxes
+    g_hFilterLabel = CreateWindowW(L"STATIC",
+        L"Event Types to Query:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_FILTER_LABEL, hInstance, nullptr);
+    SendMessageW(g_hFilterLabel, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
+    g_hChkFile = CreateWindowW(L"BUTTON", L"File Activity",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_FILE, hInstance, nullptr);
+    SendMessageW(g_hChkFile, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkFile, BM_SETCHECK, BST_CHECKED, 0);
+
+    g_hChkAppLaunch = CreateWindowW(L"BUTTON", L"App Launches",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_APP_LAUNCH, hInstance, nullptr);
+    SendMessageW(g_hChkAppLaunch, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkAppLaunch, BM_SETCHECK, BST_CHECKED, 0);
+
+    g_hChkBrowsing = CreateWindowW(L"BUTTON", L"Browsing Activity",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_BROWSING, hInstance, nullptr);
+    SendMessageW(g_hChkBrowsing, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkBrowsing, BM_SETCHECK, BST_CHECKED, 0);
+
     // Clear History button (top-right, left of theme toggle)
     g_hBtnClear = CreateWindowW(L"BUTTON", L"Clear History",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
@@ -421,6 +454,15 @@ void LayoutControls(HWND hWnd)
     y += 26;
     MoveWindow(g_hBtnDefault, pad, y, 180, 30, TRUE);
     y += 38 + 8;
+
+    // Event type filter checkboxes
+    MoveWindow(g_hFilterLabel, pad, y, 180, 20, TRUE);
+    int chkX = pad + 180;
+    int chkW = 130;
+    MoveWindow(g_hChkFile,      chkX,              y, chkW, 20, TRUE);
+    MoveWindow(g_hChkAppLaunch, chkX + chkW + gap, y, chkW, 20, TRUE);
+    MoveWindow(g_hChkBrowsing,  chkX + 2 * (chkW + gap), y, 160, 20, TRUE);
+    y += 28;
 
     // Response label
     MoveWindow(g_hResponseLabel, pad, y, W - 2 * pad, 20, TRUE);
@@ -555,26 +597,47 @@ void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
 
 void OnQueryButton(HWND hWnd, int id)
 {
+    // Build the types array from checkbox state
+    std::string types;
+    {
+        bool chkFile = (SendMessageW(g_hChkFile, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        bool chkApp  = (SendMessageW(g_hChkAppLaunch, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        bool chkBrowse = (SendMessageW(g_hChkBrowsing, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+        // If none checked, default to all
+        if (!chkFile && !chkApp && !chkBrowse)
+        {
+            chkFile = chkApp = chkBrowse = true;
+        }
+
+        types = ",\"types\":[";
+        bool first = true;
+        if (chkFile)   { if (!first) types += ","; types += "\"file\"";       first = false; }
+        if (chkApp)    { if (!first) types += ","; types += "\"app_launch\""; first = false; }
+        if (chkBrowse) { if (!first) types += ","; types += "\"browsing\"";   first = false; }
+        types += "]";
+    }
+
     std::string request;
     switch (id)
     {
-    case IDB_QUERY_15M:     request = R"({"window":"15m"})"; break;
-    case IDB_QUERY_30M:     request = R"({"window":"30m"})"; break;
-    case IDB_QUERY_1H:      request = R"({"window":"1h"})";  break;
-    case IDB_QUERY_2H:      request = R"({"window":"2h"})";  break;
-    case IDB_QUERY_6H:      request = R"({"window":"6h"})";  break;
-    case IDB_QUERY_24H:     request = R"({"window":"24h"})"; break;
-    case IDB_QUERY_7D:      request = R"({"window":"7d"})";  break;
-    case IDB_QUERY_15D:     request = R"({"window":"15d"})"; break;
-    case IDB_QUERY_30D:     request = R"({"window":"30d"})"; break;
-    case IDB_QUERY_DEFAULT: request = R"({})";               break;
+    case IDB_QUERY_15M:     request = "{\"window\":\"15m\"" + types + "}"; break;
+    case IDB_QUERY_30M:     request = "{\"window\":\"30m\"" + types + "}"; break;
+    case IDB_QUERY_1H:      request = "{\"window\":\"1h\""  + types + "}"; break;
+    case IDB_QUERY_2H:      request = "{\"window\":\"2h\""  + types + "}"; break;
+    case IDB_QUERY_6H:      request = "{\"window\":\"6h\""  + types + "}"; break;
+    case IDB_QUERY_24H:     request = "{\"window\":\"24h\"" + types + "}"; break;
+    case IDB_QUERY_7D:      request = "{\"window\":\"7d\""  + types + "}"; break;
+    case IDB_QUERY_15D:     request = "{\"window\":\"15d\"" + types + "}"; break;
+    case IDB_QUERY_30D:     request = "{\"window\":\"30d\"" + types + "}"; break;
+    case IDB_QUERY_DEFAULT: request = "{" + types.substr(1) + "}";              break;
     case IDB_QUERY_CUSTOM:
     {
         wchar_t buf[64] = {};
         GetWindowTextW(g_hEditSeconds, buf, 64);
         int secs = _wtoi(buf);
         if (secs <= 0) secs = 300;
-        request = "{\"seconds\":" + std::to_string(secs) + "}";
+        request = "{\"seconds\":" + std::to_string(secs) + types + "}";
         break;
     }
     default: return;
@@ -829,9 +892,31 @@ void StartSubsystems()
     });
     g_fileMonitor.Start();
 
+    g_appLaunchMonitor.SetCallback([](const std::wstring& exeName,
+                                      const std::wstring& exePath,
+                                      DWORD pid) {
+        g_db.InsertAppLaunch(exeName, exePath, pid);
+    });
+    g_appLaunchMonitor.Start();
+
+    g_browsingMonitor.SetCallback([](const std::wstring& browser,
+                                     const std::wstring& title,
+                                     const std::wstring& url) {
+        g_db.InsertBrowsingActivity(browser, title, url);
+    });
+    g_browsingMonitor.Start();
+
     g_idleDetector.SetCallbacks(
-        []() { g_fileMonitor.Pause(); },
-        []() { g_fileMonitor.Resume(); }
+        []() {
+            g_fileMonitor.Pause();
+            g_appLaunchMonitor.Pause();
+            g_browsingMonitor.Pause();
+        },
+        []() {
+            g_fileMonitor.Resume();
+            g_appLaunchMonitor.Resume();
+            g_browsingMonitor.Resume();
+        }
     );
     g_idleDetector.Start(120000);
 
@@ -842,6 +927,8 @@ void StopSubsystems()
 {
     g_queryApi.Stop();
     g_idleDetector.Stop();
+    g_browsingMonitor.Stop();
+    g_appLaunchMonitor.Stop();
     g_fileMonitor.Stop();
     g_db.Close();
 }

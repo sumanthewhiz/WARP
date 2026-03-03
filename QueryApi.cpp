@@ -74,7 +74,6 @@ void QueryApi::Run()
             break;
         }
 
-        // Handle client in-line (pipe instances handle concurrency)
         std::thread([this, hPipe]() {
             HandleClient(hPipe);
             DisconnectNamedPipe(hPipe);
@@ -83,7 +82,7 @@ void QueryApi::Run()
     }
 }
 
-static std::string WideToUtf8(const std::wstring& w)
+std::string QueryApi::WideToUtf8(const std::wstring& w)
 {
     if (w.empty()) return "";
     int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
@@ -92,7 +91,7 @@ static std::string WideToUtf8(const std::wstring& w)
     return s;
 }
 
-static std::string EscapeJson(const std::string& s)
+std::string QueryApi::EscapeJson(const std::string& s)
 {
     std::string out;
     out.reserve(s.size() + 16);
@@ -120,9 +119,7 @@ void QueryApi::HandleClient(HANDLE hPipe)
 
     std::string request(buf, bytesRead);
 
-    // Simple JSON parsing – look for "window" or "seconds"
-    std::vector<FileActivity> results;
-
+    // Simple JSON value extractor
     auto findValue = [&](const std::string& key) -> std::string {
         auto pos = request.find("\"" + key + "\"");
         if (pos == std::string::npos) return "";
@@ -133,65 +130,140 @@ void QueryApi::HandleClient(HANDLE hPipe)
             pos++;
         size_t end = pos;
         while (end < request.size() && request[end] != '"' && request[end] != '}'
-               && request[end] != ',' && request[end] != ' ')
+               && request[end] != ',' && request[end] != ' ' && request[end] != ']')
             end++;
         return request.substr(pos, end - pos);
     };
 
+    // Parse event types from "types" array if present
+    uint32_t eventTypes = 0;
+    {
+        auto typesPos = request.find("\"types\"");
+        if (typesPos != std::string::npos)
+        {
+            auto arrStart = request.find('[', typesPos);
+            auto arrEnd = request.find(']', arrStart != std::string::npos ? arrStart : 0);
+            if (arrStart != std::string::npos && arrEnd != std::string::npos)
+            {
+                std::string arr = request.substr(arrStart, arrEnd - arrStart + 1);
+                if (arr.find("file") != std::string::npos)
+                    eventTypes |= EVENT_TYPE_FILE;
+                if (arr.find("app_launch") != std::string::npos)
+                    eventTypes |= EVENT_TYPE_APP_LAUNCH;
+                if (arr.find("browsing") != std::string::npos)
+                    eventTypes |= EVENT_TYPE_BROWSING;
+            }
+        }
+
+        // Default: all types if none specified
+        if (eventTypes == 0)
+            eventTypes = EVENT_TYPE_ALL;
+    }
+
+    // Parse time window
     std::string windowVal = findValue("window");
     std::string secondsVal = findValue("seconds");
 
+    int64_t secs = 3600; // default: 1 hour
     if (!windowVal.empty())
     {
-        TimeWindow tw = TimeWindow::Hours1;
-        if (windowVal == "15m")  tw = TimeWindow::Minutes15;
-        else if (windowVal == "30m")  tw = TimeWindow::Minutes30;
-        else if (windowVal == "1h")   tw = TimeWindow::Hours1;
-        else if (windowVal == "2h")   tw = TimeWindow::Hours2;
-        else if (windowVal == "6h")   tw = TimeWindow::Hours6;
-        else if (windowVal == "24h")  tw = TimeWindow::Hours24;
-        else if (windowVal == "7d")   tw = TimeWindow::Days7;
-        else if (windowVal == "15d")  tw = TimeWindow::Days15;
-        else if (windowVal == "30d")  tw = TimeWindow::Days30;
-
-        results = m_db->Query(tw);
+        if (windowVal == "15m")       secs = 15LL * 60;
+        else if (windowVal == "30m")  secs = 30LL * 60;
+        else if (windowVal == "1h")   secs = 3600LL;
+        else if (windowVal == "2h")   secs = 2LL * 3600;
+        else if (windowVal == "6h")   secs = 6LL * 3600;
+        else if (windowVal == "24h")  secs = 24LL * 3600;
+        else if (windowVal == "7d")   secs = 7LL * 24 * 3600;
+        else if (windowVal == "15d")  secs = 15LL * 24 * 3600;
+        else if (windowVal == "30d")  secs = 30LL * 24 * 3600;
     }
     else if (!secondsVal.empty())
     {
-        int64_t secs = _atoi64(secondsVal.c_str());
-        if (secs > 0)
-            results = m_db->QueryCustomSeconds(secs);
-    }
-    else
-    {
-        // Default: last 1 hour
-        results = m_db->Query(TimeWindow::Hours1);
+        int64_t parsed = _atoi64(secondsVal.c_str());
+        if (parsed > 0) secs = parsed;
     }
 
-    std::string json = BuildJsonResponse(results);
+    std::string json = BuildJsonResponse(eventTypes, secs);
     DWORD written = 0;
     WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
     FlushFileBuffers(hPipe);
 }
 
-std::string QueryApi::BuildJsonResponse(const std::vector<FileActivity>& activities)
+std::string QueryApi::BuildJsonResponse(uint32_t eventTypes, int64_t seconds)
 {
     std::ostringstream oss;
-    oss << "{\"count\":" << activities.size() << ",\"activities\":[";
+    oss << "{";
 
-    for (size_t i = 0; i < activities.size(); ++i)
+    bool firstSection = true;
+
+    // File activities
+    if (eventTypes & EVENT_TYPE_FILE)
     {
-        const auto& a = activities[i];
-        if (i > 0) oss << ",";
-        oss << "{\"id\":" << a.id
-            << ",\"timestamp\":" << a.timestampUtc
-            << ",\"action\":\"" << EscapeJson(WideToUtf8(a.action)) << "\""
-            << ",\"path\":\"" << EscapeJson(WideToUtf8(a.path)) << "\"";
-        if (!a.oldPath.empty())
-            oss << ",\"old_path\":\"" << EscapeJson(WideToUtf8(a.oldPath)) << "\"";
-        oss << "}";
+        auto files = m_db->QueryFilesCustomSeconds(seconds);
+        if (!firstSection) oss << ",";
+        firstSection = false;
+
+        oss << "\"file_activities\":{\"count\":" << files.size() << ",\"events\":[";
+        for (size_t i = 0; i < files.size(); ++i)
+        {
+            const auto& a = files[i];
+            if (i > 0) oss << ",";
+            oss << "{\"id\":" << a.id
+                << ",\"timestamp\":" << a.timestampUtc
+                << ",\"action\":\"" << EscapeJson(WideToUtf8(a.action)) << "\""
+                << ",\"path\":\"" << EscapeJson(WideToUtf8(a.path)) << "\"";
+            if (!a.oldPath.empty())
+                oss << ",\"old_path\":\"" << EscapeJson(WideToUtf8(a.oldPath)) << "\"";
+            oss << "}";
+        }
+        oss << "]}";
     }
 
-    oss << "]}";
+    // App launch activities
+    if (eventTypes & EVENT_TYPE_APP_LAUNCH)
+    {
+        auto apps = m_db->QueryAppLaunchesCustomSeconds(seconds);
+        if (!firstSection) oss << ",";
+        firstSection = false;
+
+        oss << "\"app_launch_activities\":{\"count\":" << apps.size() << ",\"events\":[";
+        for (size_t i = 0; i < apps.size(); ++i)
+        {
+            const auto& a = apps[i];
+            if (i > 0) oss << ",";
+            oss << "{\"id\":" << a.id
+                << ",\"timestamp\":" << a.timestampUtc
+                << ",\"exe_name\":\"" << EscapeJson(WideToUtf8(a.exeName)) << "\""
+                << ",\"exe_path\":\"" << EscapeJson(WideToUtf8(a.exePath)) << "\""
+                << ",\"pid\":" << a.pid
+                << "}";
+        }
+        oss << "]}";
+    }
+
+    // Browsing activities
+    if (eventTypes & EVENT_TYPE_BROWSING)
+    {
+        auto browse = m_db->QueryBrowsingCustomSeconds(seconds);
+        if (!firstSection) oss << ",";
+        firstSection = false;
+
+        oss << "\"browsing_activities\":{\"count\":" << browse.size() << ",\"events\":[";
+        for (size_t i = 0; i < browse.size(); ++i)
+        {
+            const auto& b = browse[i];
+            if (i > 0) oss << ",";
+            oss << "{\"id\":" << b.id
+                << ",\"timestamp\":" << b.timestampUtc
+                << ",\"browser\":\"" << EscapeJson(WideToUtf8(b.browser)) << "\""
+                << ",\"title\":\"" << EscapeJson(WideToUtf8(b.title)) << "\"";
+            if (!b.url.empty())
+                oss << ",\"url\":\"" << EscapeJson(WideToUtf8(b.url)) << "\"";
+            oss << "}";
+        }
+        oss << "]}";
+    }
+
+    oss << "}";
     return oss.str();
 }

@@ -40,6 +40,11 @@
 #define IDB_TOGGLE_THEME		413
 // Clear history
 #define IDB_CLEAR_HISTORY		414
+// Event type checkboxes
+#define IDC_CHK_FILE			420
+#define IDC_CHK_APP_LAUNCH		421
+#define IDC_CHK_BROWSING		422
+#define IDC_FILTER_LABEL        423
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
