@@ -1,0 +1,38 @@
+name: Build WARP
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        include:
+          - platform: ARM64
+            outdir: ARM64/Release
+          - platform: x64
+            outdir: x64/Release
+          - platform: x86
+            outdir: Release
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build ${{ matrix.platform }}
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=${{ matrix.platform }} /m
+
+    - name: Upload ${{ matrix.platform }} binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: WARP-${{ matrix.platform }}
+        path: ${{ matrix.outdir }}/WARP!.exe
+        if-no-files-found: error
