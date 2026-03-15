@@ -86,47 +86,78 @@ static bool IsUserProcess(DWORD pid)
                 std::transform(exe.begin(), exe.end(), exe.begin(), ::towlower);
 
                 static const wchar_t* const noisyProcesses[] = {
+                    // Search / Indexer
                     L"searchprotocolhost.exe",
                     L"searchindexer.exe",
                     L"searchfilterhost.exe",
-                    L"msmpeng.exe",          // Windows Defender
+                    L"searchhost.exe",
+                    L"searchapp.exe",
+                    // Windows Defender / Security
+                    L"msmpeng.exe",
                     L"mpcmdrun.exe",
                     L"nissrv.exe",
                     L"securityhealthservice.exe",
+                    L"securityhealthsystray.exe",
+                    L"smartscreen.exe",
+                    L"sgrmbroker.exe",
+                    // Core system
                     L"svchost.exe",
                     L"csrss.exe",
                     L"smss.exe",
                     L"lsass.exe",
                     L"services.exe",
                     L"wininit.exe",
+                    L"winlogon.exe",
                     L"spoolsv.exe",
                     L"wmiprvse.exe",
+                    L"wmiapsrv.exe",
+                    // Shell infrastructure
                     L"taskhostw.exe",
                     L"runtimebroker.exe",
                     L"backgroundtaskhost.exe",
                     L"audiodg.exe",
                     L"fontdrvhost.exe",
                     L"dwm.exe",
-                    L"msiexec.exe",
-                    L"trustedinstaller.exe",
-                    L"tiworker.exe",
-                    L"compattelrunner.exe",
-                    L"devicecensus.exe",
-                    L"musnotification.exe",
-                    L"windowsupdatebox.exe",
-                    L"onedrive.exe",
-                    L"msedgewebview2.exe",
-                    L"crashpad_handler.exe",
                     L"conhost.exe",
                     L"dllhost.exe",
                     L"sihost.exe",
                     L"ctfmon.exe",
                     L"settingsynchost.exe",
+                    L"shellexperiencehost.exe",
+                    L"startmenuexperiencehost.exe",
+                    L"applicationframehost.exe",
+                    L"textinputhost.exe",
+                    L"lockapp.exe",
+                    // Update / Servicing
+                    L"msiexec.exe",
+                    L"trustedinstaller.exe",
+                    L"tiworker.exe",
+                    L"usoclient.exe",
+                    L"usocoreworker.exe",
+                    // Telemetry
+                    L"compattelrunner.exe",
+                    L"devicecensus.exe",
+                    L"diagtrack.exe",
+                    L"musnotification.exe",
+                    L"windowsupdatebox.exe",
+                    // Sync / helpers
+                    L"onedrive.exe",
+                    L"msedgewebview2.exe",
+                    L"crashpad_handler.exe",
+                    // Widgets / Phone / Xbox
                     L"phoneexperiencehost.exe",
                     L"widgetservice.exe",
+                    L"widgets.exe",
                     L"gamebarpresencewriter.exe",
-                    L"securityhealthsystray.exe",
+                    // System settings / UWP
                     L"systemsettings.exe",
+                    L"systemsettingsbroker.exe",
+                    // Runtime hosts
+                    L"dashost.exe",
+                    L"wsappx.exe",
+                    // Error reporting
+                    L"werfault.exe",
+                    L"wermgr.exe",
                 };
 
                 for (const auto* noisy : noisyProcesses)
@@ -172,8 +203,13 @@ static void BuildDeviceMap()
 }
 
 
-// ---------- Path exclusion filter ----------
-// Returns true if the path should be excluded from activity recording.
+// ---------- "Goop" folder / path exclusion filter ----------
+// A "goop" path is a system-managed, application-internal, or transient location
+// that users would never intentionally interact with as meaningful file activity.
+// The categories below are derived from the "Intelligent Global File Searchability"
+// spec (Section 3A - Definition of Goop Folders, Categories 1-10).
+//
+// Returns true if the path should be excluded from file-activity recording.
 bool ShouldExclude(const std::wstring& path)
 {
     if (path.empty())
@@ -183,79 +219,255 @@ bool ShouldExclude(const std::wstring& path)
     std::wstring lp = path;
     std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
 
-    // --- Excluded directory prefixes (system, cache, temp, build artifacts) ---
-    // Patterns with trailing backslash match files/folders INSIDE these directories.
-    // Patterns without trailing backslash match the directory itself (for folder-open events).
-    static const wchar_t* const excludedDirs[] = {
+    // =====================================================================
+    // 1. Directory-substring matching (goop Categories 1-9)
+    //    Any path containing one of these substrings is excluded.
+    //    Patterns use trailing backslash so they match files *inside* the dir.
+    // =====================================================================
+    static const wchar_t* const goopDirs[] = {
+        // --- Cat 1: Windows OS & System Directories ---
         L"\\windows\\",
-        L"\\$recycle.bin\\",
-        L"\\system volume information\\",
-        L"\\programdata\\",
+
+        // --- Cat 2: Program Files & Application Binaries ---
         L"\\program files\\",
         L"\\program files (x86)\\",
+
+        // --- Cat 3: ProgramData (System & Application State) ---
+        L"\\programdata\\",
+
+        // --- Cat 4: User Profile - AppData ---
         L"\\appdata\\",
-        L"\\node_modules\\",
-        L"\\__pycache__\\",
+
+        // --- Cat 5: Per-Volume System & Recovery Folders ---
+        L"\\system volume information\\",
+        L"\\$recycle.bin\\",
         L"\\recovery\\",
-        L"\\msocache\\",
-        L"\\config.msi\\",
         L"\\$windows.~bt\\",
         L"\\$windows.~ws\\",
-        L"\\windowsapps\\",
-        L"\\packages\\",
-        L"\\microsoft\\windows\\",
+        L"\\$windows.~q\\",
+        L"\\$winreagent\\",
+        L"\\$getcurrent\\",
+        L"\\$sysreset\\",
+        L"\\config.msi\\",
+        L"\\msocache\\",
+        L"\\perflogs\\",
+        L"\\dfsrprivate\\",
+
+        // --- Cat 6: Developer Toolchain & Build Artifacts ---
+        L"\\node_modules\\",
+        L"\\__pycache__\\",
+        L"\\bower_components\\",
+        L"\\obj\\",
+        L"\\bin\\debug\\",
+        L"\\bin\\release\\",
+        L"\\target\\",
+        L"\\cmakefiles\\",
+        L"\\pods\\",
+        L"\\venv\\",
+        L"\\env\\",
+        L"\\coverage\\",
+
+        // --- Cat 7: User Profile - Hidden/System Shell Folders ---
+        L"\\application data\\",
+        L"\\local settings\\",
+        L"\\cookies\\",
+        L"\\nethood\\",
+        L"\\printhood\\",
+        L"\\recent\\",
+        L"\\sendto\\",
+        L"\\start menu\\",
+        L"\\templates\\",
+        L"\\my documents\\",
+        L"\\microsoftedgebackups\\",
+        L"\\intelgraphicsprofiles\\",
+
+        // --- Cat 8: Application-Specific Caches & Databases (by name) ---
+        L"\\cache\\",
+        L"\\cachestorage\\",
+        L"\\code cache\\",
+        L"\\gpucache\\",
+        L"\\dawncache\\",
+        L"\\grshadercache\\",
+        L"\\shadercache\\",
+        L"\\crash reports\\",
+        L"\\crashdumps\\",
+        L"\\crashpad\\",
+        L"\\blob_storage\\",
+        L"\\indexeddb\\",
+        L"\\local storage\\",
+        L"\\session storage\\",
+        L"\\service worker\\",
+        L"\\webstorage\\",
+        L"\\databases\\",
+        L"\\logs\\",
+        L"\\log\\",
         L"\\temp\\",
         L"\\tmp\\",
+
+        // --- Cat 9: OS Upgrade, Recovery & Rollback Artifacts ---
+        L"\\windows.old\\",
+        L"\\onedrivetemp\\",
+        L"\\inetpub\\",
+
+        // --- Additional (not in spec but consistently noisy) ---
+        L"\\windowsapps\\",
+        L"\\packages\\",
+        L"\\intel\\",
+        L"\\amd\\",
+        L"\\nvidia\\",
+        L"\\boot\\",
+        L"\\~snapshot\\",
+        L"\\servicing\\",
+        L"\\winsxs\\",
     };
 
-    for (const auto* dir : excludedDirs)
+    for (const auto* dir : goopDirs)
     {
         if (lp.find(dir) != std::wstring::npos)
             return true;
     }
 
-    // Also exclude the system folders themselves (path ends with the folder name,
-    // no trailing backslash — happens when the folder is opened directly via ETW).
-    static const wchar_t* const excludedDirNames[] = {
+    // =====================================================================
+    // 2. Directory-suffix matching (path ends with folder name, no trailing \)
+    //    Catches the directory *itself* being opened (e.g. via ETW).
+    // =====================================================================
+    static const wchar_t* const goopDirSuffixes[] = {
+        // Cat 1
         L"\\windows",
-        L"\\$recycle.bin",
-        L"\\system volume information",
-        L"\\programdata",
+        // Cat 2
         L"\\program files",
         L"\\program files (x86)",
+        // Cat 3
+        L"\\programdata",
+        // Cat 4
         L"\\appdata",
-        L"\\node_modules",
-        L"\\__pycache__",
+        // Cat 5
+        L"\\system volume information",
+        L"\\$recycle.bin",
         L"\\recovery",
-        L"\\msocache",
-        L"\\config.msi",
         L"\\$windows.~bt",
         L"\\$windows.~ws",
-        L"\\windowsapps",
+        L"\\$windows.~q",
+        L"\\$winreagent",
+        L"\\$getcurrent",
+        L"\\$sysreset",
+        L"\\config.msi",
+        L"\\msocache",
+        L"\\perflogs",
+        L"\\dfsrprivate",
+        // Cat 6
+        L"\\node_modules",
+        L"\\__pycache__",
+        L"\\bower_components",
+        L"\\obj",
+        L"\\target",
+        L"\\cmakefiles",
+        L"\\pods",
+        L"\\venv",
+        L"\\env",
+        L"\\coverage",
+        // Cat 7
+        L"\\application data",
+        L"\\local settings",
+        L"\\cookies",
+        L"\\nethood",
+        L"\\printhood",
+        L"\\recent",
+        L"\\sendto",
+        L"\\start menu",
+        L"\\templates",
+        L"\\my documents",
+        L"\\microsoftedgebackups",
+        L"\\intelgraphicsprofiles",
+        // Cat 8
+        L"\\cache",
+        L"\\cachestorage",
+        L"\\code cache",
+        L"\\gpucache",
+        L"\\dawncache",
+        L"\\grshadercache",
+        L"\\shadercache",
+        L"\\crash reports",
+        L"\\crashdumps",
+        L"\\crashpad",
+        L"\\blob_storage",
+        L"\\indexeddb",
+        L"\\local storage",
+        L"\\session storage",
+        L"\\service worker",
+        L"\\webstorage",
+        L"\\databases",
+        L"\\logs",
+        L"\\log",
         L"\\temp",
         L"\\tmp",
+        // Cat 9
+        L"\\windows.old",
+        L"\\onedrivetemp",
+        L"\\inetpub",
+        // Additional
+        L"\\windowsapps",
+        L"\\intel",
+        L"\\amd",
+        L"\\nvidia",
+        L"\\boot",
+        L"\\servicing",
+        L"\\winsxs",
     };
 
-    for (const auto* dn : excludedDirNames)
+    for (const auto* dn : goopDirSuffixes)
     {
         size_t dnLen = wcslen(dn);
         if (lp.size() >= dnLen && lp.compare(lp.size() - dnLen, dnLen, dn) == 0)
             return true;
     }
 
-    // Exclude any folder whose name starts with a dot (e.g. \.git\, \.vs\, \.ssh\, \.vscode\)
+    // =====================================================================
+    // 3. Dot-prefixed folder names at any depth (Cat 6 catch-all)
+    //    Matches \.git\, \.vs\, \.ssh\, \.vscode\, \.hg\, \.svn\, \.cargo\,
+    //    \.gradle\, \.m2\, \.nuget\, \.npm\, \.yarn\, \.conda\, \.tox\, etc.
+    // =====================================================================
     {
         size_t pos = 0;
         while ((pos = lp.find(L"\\.", pos)) != std::wstring::npos)
         {
-            // Make sure there is at least one more char after the dot that isn't a backslash
             if (pos + 2 < lp.size() && lp[pos + 2] != L'\\')
                 return true;
             pos += 2;
         }
     }
 
-    // --- Excluded file extensions ---
+    // =====================================================================
+    // 4. CHKDSK recovered-fragment folders (Cat 5): \found.000\ .. \found.999\
+    // =====================================================================
+    if (lp.find(L"\\found.") != std::wstring::npos)
+    {
+        size_t fp = 0;
+        while ((fp = lp.find(L"\\found.", fp)) != std::wstring::npos)
+        {
+            size_t numStart = fp + 7; // length of "\\found."
+            if (numStart + 3 <= lp.size())
+            {
+                bool allDigits = true;
+                for (size_t d = 0; d < 3 && numStart + d < lp.size(); ++d)
+                {
+                    wchar_t ch = lp[numStart + d];
+                    if (ch < L'0' || ch > L'9') { allDigits = false; break; }
+                }
+                if (allDigits)
+                {
+                    size_t afterDigits = numStart + 3;
+                    if (afterDigits >= lp.size() || lp[afterDigits] == L'\\')
+                        return true;
+                }
+            }
+            fp += 7;
+        }
+    }
+
+    // =====================================================================
+    // 5. Excluded file extensions
+    // =====================================================================
     static const wchar_t* const excludedExts[] = {
         L".exe", L".dll", L".sys", L".drv", L".ocx",
         L".tmp", L".temp", L".etl", L".evtx",
@@ -273,9 +485,14 @@ bool ShouldExclude(const std::wstring& path)
         L".efi", L".wim",
         L".jar",
         L"thumbs.db", L"desktop.ini",
+        L".partial", L".crdownload", L".opdownload",
+        L".journal", L".chk",
+        L".dmp", L".hdmp", L".mdmp",
+        L".diagcab", L".diagpkg",
+        L".manifest",
+        L".pol",
     };
 
-    // Find the last dot for extension check
     size_t dotPos = lp.rfind(L'.');
     if (dotPos != std::wstring::npos)
     {
@@ -287,21 +504,59 @@ bool ShouldExclude(const std::wstring& path)
         }
     }
 
-    // Also check full filename for known system files without extensions containing a dot
+    // =====================================================================
+    // 6. Known system / NTFS metadata filenames (Cat 7, 10)
+    // =====================================================================
     size_t slashPos = lp.rfind(L'\\');
     if (slashPos != std::wstring::npos)
     {
         std::wstring filename = lp.substr(slashPos + 1);
+
+        // Cat 10: NTFS metadata artifacts
+        if (!filename.empty() && filename[0] == L'$')
+        {
+            static const wchar_t* const ntfsFiles[] = {
+                L"$mft", L"$mftmirr", L"$logfile", L"$bitmap",
+                L"$boot", L"$badclus", L"$secure", L"$upcase",
+                L"$attrdef", L"$extend",
+            };
+            for (const auto* nf : ntfsFiles)
+            {
+                if (filename == nf)
+                    return true;
+            }
+        }
+
+        // Well-known system files (Cat 7 + legacy)
         if (filename == L"thumbs.db" ||
             filename == L"desktop.ini" ||
             filename == L"ntuser.dat" ||
             filename == L"usrclass.dat" ||
             filename == L"pagefile.sys" ||
             filename == L"swapfile.sys" ||
-            filename == L"hiberfil.sys")
+            filename == L"hiberfil.sys" ||
+            filename == L"bootmgr" ||
+            filename == L"bootnxt" ||
+            filename == L"autoexec.bat" ||
+            filename == L"config.sys" ||
+            filename == L"iconcache.db")
         {
             return true;
         }
+
+        // Cat 7: NTUSER.DAT* and ntuser.* pattern (user registry hives)
+        if (filename.size() >= 10 && filename.compare(0, 10, L"ntuser.dat") == 0)
+            return true;
+        if (filename.size() >= 7 && filename.compare(0, 7, L"ntuser.") == 0)
+            return true;
+
+        // Office lock files (e.g. ~$Document.docx)
+        if (filename.size() > 2 && filename[0] == L'~' && filename[1] == L'$')
+            return true;
+
+        // Generic temp files (e.g. ~DF1234.tmp, ~WRS{...}.tmp)
+        if (!filename.empty() && filename[0] == L'~')
+            return true;
     }
 
     return false;

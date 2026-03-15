@@ -22,9 +22,10 @@ long as the PC is actively being used.
 | **Built-in API test panel** | 9 predefined time-window buttons, a custom-seconds input field, and a default-query button -- all wired to the named-pipe API. Responses are pretty-printed as indented JSON in a scrollable monospace area. |
 | **Event type filter checkboxes** | Three checkboxes (**File Activity**, **App Launches**, **Browsing Activity**) control which event types are included in query results. All are checked by default. |
 | **Idle / sleep awareness** | Monitoring pauses automatically when the PC has been idle for >= 2 minutes or enters sleep/hibernate, and resumes the moment user input is detected or the PC wakes. |
-| **File-system monitoring** | Every fixed, removable, and network drive is watched recursively via `ReadDirectoryChangesW`. |
-| **Shell-level monitoring** | `SHChangeNotifyRegister` on the entire shell namespace catches higher-level operations (copy, move, shell renames) that pure file-system notifications may miss. |
-| **App launch monitoring** | New user-initiated process launches are detected by polling the process table every 2 seconds. System and background processes are filtered out. |
+| **File-system monitoring** | Every fixed, removable, and network drive is watched recursively via `ReadDirectoryChangesW`. All paths are filtered through a comprehensive **goop exclusion list** (10 categories, 100+ patterns) derived from the *Intelligent Global File Searchability* spec to discard system-managed, application-internal, and transient file activity. |
+| **Shell-level monitoring** | `SHChangeNotifyRegister` on the entire shell namespace catches higher-level operations (copy, move, shell renames) that pure file-system notifications may miss. The same goop path exclusion is applied. |
+| **ETW file-open monitoring** | An NT Kernel Logger ETW trace captures every `NtCreateFile`/`NtOpenFile` call. Events are filtered to **user-initiated processes only** via session-ID checks and a 53-entry noisy-process blocklist, then passed through the goop path filter. |
+| **App launch monitoring** | New process launches are detected by polling the process table every 2 seconds. A three-layer filter ensures only **user-initiated** launches are recorded: (1) 65+ entry exe-name blocklist, (2) system-directory path check, (3) parent-process heuristic (rejects children of `services.exe`/`svchost.exe`). |
 | **Browsing activity monitoring** | The foreground window is polled every 3 seconds. When a recognized browser is active, the page title (and URL if present) is captured and deduplicated. |
 | **SQLite storage** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across three tables. |
 | **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. |
@@ -40,8 +41,8 @@ WARP captures three categories of events:
 
 | Event Type | Description | Source |
 |---|---|---|
-| **File Activity** | File/folder creates, opens, modifications, deletes, renames | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
-| **App Launch** | User-initiated application launches (exe name, path, PID) | Process table polling via `CreateToolhelp32Snapshot` |
+| **File Activity** | User-initiated file/folder creates, opens, modifications, deletes, renames. System/goop paths excluded. | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
+| **App Launch** | User-initiated application launches only (exe name, path, PID). System processes filtered by name, path, and parent. | Process table polling via `CreateToolhelp32Snapshot` |
 | **Browsing Activity** | Browser page title changes (browser name, page title, URL) | Foreground window title polling via `GetForegroundWindow` + `GetWindowText` |
 
 ---
@@ -137,6 +138,45 @@ file-open events from interactive user processes.
 
 Detected actions: **CREATE**, **OPEN**, **DELETE**, **MODIFY**, **RENAME**.
 
+**User-only filtering (ETW path):**
+
+The ETW callback filters every file-open event through `IsUserProcess()`, which:
+- Rejects PIDs 0 and 4 (System Idle / System kernel).
+- Rejects session-0 processes (all Windows services).
+- Rejects 53 known noisy user-session system processes (search indexer, Defender,
+  shell infrastructure, update agents, telemetry, OneDrive sync, etc.).
+- Rejects any PID it cannot open (`PROCESS_QUERY_LIMITED_INFORMATION`).
+
+Results are cached per-PID and refreshed every 60 seconds.
+
+**Goop folder exclusion (all three paths):**
+
+Every file path from all three sources (ReadDirectoryChangesW, shell notifications,
+and ETW) is passed through `ShouldExclude()`, a comprehensive goop filter derived
+from the *Intelligent Global File Searchability* spec (Section 3A). The filter
+implements 10 goop categories:
+
+| Category | Examples |
+|---|---|
+| **1. Windows OS directories** | `\Windows\` and all subdirectories |
+| **2. Program Files** | `\Program Files\`, `\Program Files (x86)\` |
+| **3. ProgramData** | `\ProgramData\` (entire tree) |
+| **4. AppData** | `\AppData\` (entire tree -- caches, browser data, runtime state) |
+| **5. Per-volume system folders** | `\System Volume Information\`, `\$Recycle.Bin\`, `\Recovery\`, `\$WINDOWS.~BT\`, `\$WINDOWS.~WS\`, `\$WINDOWS.~Q\`, `\$WinREAgent\`, `\$GetCurrent\`, `\$SysReset\`, `\Config.Msi\`, `\MSOCache\`, `\PerfLogs\`, `\DfsrPrivate\`, `\found.000\`–`\found.999\` (CHKDSK fragments) |
+| **6. Developer toolchain** | `\node_modules\`, `\__pycache__\`, `\obj\`, `\bin\Debug\`, `\bin\Release\`, `\target\`, `\bower_components\`, `\CMakeFiles\`, `\Pods\`, `\venv\`, `\env\`, `\coverage\`, plus **all dot-prefixed folders** (`.git`, `.vs`, `.vscode`, `.cargo`, `.gradle`, `.nuget`, `.npm`, `.yarn`, `.conda`, etc.) |
+| **7. User profile shell junctions** | `\Application Data\`, `\Local Settings\`, `\Cookies\`, `\NetHood\`, `\PrintHood\`, `\Recent\`, `\SendTo\`, `\Start Menu\`, `\Templates\`, `\My Documents\`, `\MicrosoftEdgeBackups\`, `\IntelGraphicsProfiles\` |
+| **8. App caches by name pattern** | `\Cache\`, `\CacheStorage\`, `\Code Cache\`, `\GPUCache\`, `\DawnCache\`, `\GrShaderCache\`, `\ShaderCache\`, `\Crash Reports\`, `\CrashDumps\`, `\Crashpad\`, `\blob_storage\`, `\IndexedDB\`, `\Local Storage\`, `\Session Storage\`, `\Service Worker\`, `\WebStorage\`, `\databases\`, `\Logs\`, `\Log\`, `\Temp\`, `\Tmp\` |
+| **9. OS upgrade/recovery** | `\Windows.old\`, `\OneDriveTemp\`, `\inetpub\` |
+| **10. NTFS metadata** | `$MFT`, `$MFTMirr`, `$LogFile`, `$Bitmap`, `$Boot`, `$BadClus`, `$Secure`, `$UpCase`, `$AttrDef`, `$Extend` |
+
+Additional file-level exclusions: 49+ file extensions (`.exe`, `.dll`, `.sys`,
+`.tmp`, `.log`, `.pdb`, `.dat`, etc.), system filenames (`pagefile.sys`,
+`hiberfil.sys`, `NTUSER.DAT*`, `bootmgr`, etc.), Office lock files (`~$...`), and
+temp-file prefixes (`~...`).
+
+> **Note:** The goop exclusion applies **only to file activities**. App launch and
+> browsing monitors are not affected by these path filters.
+
 The monitor exposes `Pause()` / `Resume()` methods that the idle detector calls to
 suspend event recording when the PC is inactive.
 
@@ -146,13 +186,31 @@ A polling thread that takes a snapshot of all running processes every 2 seconds 
 `CreateToolhelp32Snapshot`. New PIDs that were not present in the previous snapshot
 are classified as newly launched applications.
 
-Filters applied:
-- **Session 0 excluded** -- all Windows services run in session 0; only interactive
-  sessions (>= 1) are reported.
-- **System process blocklist** -- 35+ known system/noise processes (svchost, dwm,
-  csrss, RuntimeBroker, SearchIndexer, Windows Defender, etc.) are excluded.
-- **Self-exclusion** -- WARP's own process is excluded.
+A three-layer filter ensures only user-initiated launches are recorded:
 
+1. **Session 0 excluded** -- all Windows services run in session 0; only interactive
+   sessions (>= 1) are reported.
+2. **System process blocklist** (`IsSystemProcess`) -- 65+ known system/noise
+   process names organized by category:
+   - Core OS (`svchost`, `csrss`, `lsass`, `services`, `winlogon`, …)
+   - Shell infrastructure (`dwm`, `explorer`, `RuntimeBroker`, `sihost`,
+     `ShellExperienceHost`, `StartMenuExperienceHost`, …)
+   - Search / Indexer (`SearchIndexer`, `SearchHost`, …)
+   - Security (`MsMpEng`, `SmartScreen`, `SgrmBroker`, …)
+   - Windows Update (`TrustedInstaller`, `TiWorker`, `UsoClient`, `msiexec`, …)
+   - Telemetry (`CompatTelRunner`, `DiagTrack`, `DeviceCensus`, …)
+   - UWP / Widgets / Xbox (`Widgets`, `GameBar`, `PhoneExperienceHost`, …)
+   - .NET runtime hosts (`ngen`, `mscorsvw`, `wsappx`, …)
+   - Misc (`consent`, `cmd`, `powershell`, `pwsh`, `WerFault`, …)
+   - Self (`warp!.exe`)
+3. **System-directory path check** (`IsSystemExePath`) -- rejects processes running
+   from `\Windows\System32\`, `\SysWOW64\`, `\SystemApps\`,
+   `\ImmersiveControlPanel\`, `\WinSxS\`, `\Servicing\`, `\Security\`, or
+   `\Windows\Temp\`.
+4. **Parent-process heuristic** (`IsSpawnedByServiceHost`) -- rejects processes
+   whose parent is `services.exe`, `svchost.exe`, or PID 0/4 (System kernel).
+
+A new process must pass all four layers to be reported as a user-initiated launch.
 Each detected launch reports the executable name, full path, and PID.
 
 #### `BrowsingMonitor` (`BrowsingMonitor.h` / `BrowsingMonitor.cpp`)
@@ -377,8 +435,8 @@ automatically via the linker's UAC manifest setting.
 1. On launch the app requests elevation (UAC prompt).
 2. The main window is created but kept hidden; a light-bulb system-tray icon appears.
 3. The SQLite database is opened (created if it doesn't exist) and old records are evicted from all three tables.
-4. File-system, shell, and ETW monitors start on all eligible drives.
-5. The app launch monitor begins polling the process table.
+4. File-system, shell, and ETW monitors start on all eligible drives. The goop path filter is active from the start, discarding file activity from 100+ system/cache/build/temp directory patterns.
+5. The app launch monitor begins polling the process table. Only user-initiated launches (passing session, name, path, and parent-process checks) are recorded.
 6. The browsing monitor begins polling the foreground window.
 7. The idle detector begins polling for user inactivity and power events.
 8. The inference engine is initialized with direct access to the SQLite database.
