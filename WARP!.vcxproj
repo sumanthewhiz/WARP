@@ -224,6 +224,7 @@
     <Image Include="WARP!.ico" />
   </ItemGroup>
   <ItemGroup>
+    <None Include=".github\workflows\build.yml" />
     <None Include=".gitignore" />
     <None Include="API.md" />
     <None Include="README.md" />

@@ -9,16 +9,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-
-    strategy:
-      matrix:
-        include:
-          - platform: ARM64
-            outdir: ARM64/Release
-          - platform: x64
-            outdir: x64/Release
-          - platform: x86
-            outdir: Release
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout repository
@@ -27,12 +19,41 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    - name: Build ${{ matrix.platform }}
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=${{ matrix.platform }} /m
+    - name: Build ARM64
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=ARM64 /m
 
-    - name: Upload ${{ matrix.platform }} binary
+    - name: Build x64
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /m
+
+    - name: Build x86
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /m
+
+    - name: Upload ARM64 artifact
       uses: actions/upload-artifact@v4
       with:
-        name: WARP-${{ matrix.platform }}
-        path: ${{ matrix.outdir }}/WARP!.exe
+        name: WARP-ARM64
+        path: binaries/ARM64/
         if-no-files-found: error
+
+    - name: Upload x64 artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WARP-x64
+        path: binaries/x64/
+        if-no-files-found: error
+
+    - name: Upload x86 artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WARP-x86
+        path: binaries/x86/
+        if-no-files-found: error
+
+    - name: Commit updated binaries
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add binaries/ -f
+        git diff --cached --quiet || git commit -m "Update binaries for ARM64, x64, x86 [skip ci]"
+        git push

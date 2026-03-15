@@ -98,5 +98,6 @@
     <None Include=".gitignore" />
     <None Include="README.md" />
     <None Include="API.md" />
+    <None Include="_patch_vcxproj.ps1" />
   </ItemGroup>
 </Project>

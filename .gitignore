@@ -15,6 +15,11 @@ ARM64/
 *.res
 *.aps
 
+# Override: track binaries/ folder (post-build outputs for distribution)
+!binaries/
+!binaries/**
+!binaries/**/*.exe
+
 # Visual Studio user/cache files
 .vs/
 *.vcxproj.user
