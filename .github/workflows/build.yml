@@ -2,9 +2,9 @@ name: Build WARP
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release-1.0.0, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, release-1.0.0, dev ]
 
 jobs:
   build:
@@ -15,6 +15,25 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Determine branch label
+      id: branch
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          RAW="${{ github.base_ref }}"
+        else
+          RAW="${{ github.ref_name }}"
+        fi
+        # main -> releasepreview, everything else keeps its branch name
+        if [ "$RAW" = "main" ]; then
+          LABEL="releasepreview"
+        else
+          LABEL="$RAW"
+        fi
+        echo "raw=$RAW" >> "$GITHUB_OUTPUT"
+        echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+        echo "Branch: $RAW  Label: $LABEL"
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
@@ -28,32 +47,63 @@ jobs:
     - name: Build x86
       run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /m
 
-    - name: Upload ARM64 artifact
+    - name: Create zip packages
+      shell: pwsh
+      run: |
+        $label = "${{ steps.branch.outputs.label }}"
+        $platforms = @(
+          @{ arch = "ARM64"; src = "ARM64/Release" },
+          @{ arch = "x64";   src = "x64/Release"   },
+          @{ arch = "x86";   src = "Release"        }
+        )
+
+        New-Item -ItemType Directory -Path "binaries" -Force | Out-Null
+
+        foreach ($p in $platforms) {
+          # Stage files into a temp WARP/ folder inside the zip
+          $staging = "staging/WARP"
+          if (Test-Path "staging") { Remove-Item "staging" -Recurse -Force }
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
+          Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
+
+          $zipName = "WARP-$label-$($p.arch).zip"
+          $zipPath = "binaries/$zipName"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "staging/*" -DestinationPath $zipPath -Force
+
+          Remove-Item "staging" -Recurse -Force
+          Write-Host "Created: $zipPath"
+        }
+
+        Get-ChildItem "binaries" -File | ForEach-Object { Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1KB, 1)) KB)" }
+
+    - name: Upload ARM64 zip
       uses: actions/upload-artifact@v4
       with:
-        name: WARP-ARM64
-        path: binaries/ARM64/
+        name: WARP-${{ steps.branch.outputs.label }}-ARM64
+        path: binaries/WARP-${{ steps.branch.outputs.label }}-ARM64.zip
         if-no-files-found: error
 
-    - name: Upload x64 artifact
+    - name: Upload x64 zip
       uses: actions/upload-artifact@v4
       with:
-        name: WARP-x64
-        path: binaries/x64/
+        name: WARP-${{ steps.branch.outputs.label }}-x64
+        path: binaries/WARP-${{ steps.branch.outputs.label }}-x64.zip
         if-no-files-found: error
 
-    - name: Upload x86 artifact
+    - name: Upload x86 zip
       uses: actions/upload-artifact@v4
       with:
-        name: WARP-x86
-        path: binaries/x86/
+        name: WARP-${{ steps.branch.outputs.label }}-x86
+        path: binaries/WARP-${{ steps.branch.outputs.label }}-x86.zip
         if-no-files-found: error
 
     - name: Commit updated binaries
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      if: github.event_name == 'push'
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add binaries/ -f
-        git diff --cached --quiet || git commit -m "Update binaries for ARM64, x64, x86 [skip ci]"
+        git diff --cached --quiet || git commit -m "Update ${{ steps.branch.outputs.label }} zip packages [skip ci]"
         git push

@@ -98,6 +98,6 @@
     <None Include=".gitignore" />
     <None Include="README.md" />
     <None Include="API.md" />
-    <None Include="_patch_vcxproj.ps1" />
+    <None Include=".github\workflows\build.yml" />
   </ItemGroup>
 </Project>
