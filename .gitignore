@@ -15,10 +15,10 @@ ARM64/
 *.res
 *.aps
 
-# Override: track binaries/ folder (post-build outputs for distribution)
+# Override: track binaries/ folder (zip distribution packages)
 !binaries/
 !binaries/**
-!binaries/**/*.exe
+!binaries/**/*.zip
 
 # Visual Studio user/cache files
 .vs/
