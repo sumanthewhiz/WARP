@@ -67,19 +67,19 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-ARM64
-        path: artifacts/ARM64/WARP
+        path: artifacts/ARM64
         if-no-files-found: error
 
     - name: Upload x64 zip
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-x64
-        path: artifacts/x64/WARP
+        path: artifacts/x64
         if-no-files-found: error
 
     - name: Upload x86 zip
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-x86
-        path: artifacts/x86/WARP
+        path: artifacts/x86
         if-no-files-found: error
