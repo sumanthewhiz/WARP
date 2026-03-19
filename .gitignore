@@ -1,8 +1,10 @@
 # Build output
+# Build output
 Debug/
 Release/
 x64/
 ARM64/
+binaries/
 *.obj
 *.pdb
 *.ilk
@@ -14,11 +16,6 @@ ARM64/
 *.pch
 *.res
 *.aps
-
-# Override: track binaries/ folder (zip distribution packages)
-!binaries/
-!binaries/**
-!binaries/**/*.zip
 
 # Visual Studio user/cache files
 .vs/
