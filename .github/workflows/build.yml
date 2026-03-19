@@ -46,54 +46,40 @@ jobs:
     - name: Build x86
       run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /m
 
-    - name: Create zip packages
+    - name: Stage artifacts
       shell: pwsh
       run: |
-        $label = "${{ steps.branch.outputs.label }}"
         $platforms = @(
           @{ arch = "ARM64"; src = "ARM64/Release" },
           @{ arch = "x64";   src = "x64/Release"   },
           @{ arch = "x86";   src = "Release"        }
         )
 
-        New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
-
         foreach ($p in $platforms) {
-          # Stage files into a temp WARP/ folder inside the zip
-          $staging = "staging/WARP"
-          if (Test-Path "staging") { Remove-Item "staging" -Recurse -Force }
+          $staging = "artifacts/$($p.arch)/WARP"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
-
-          $zipName = "WARP-$label-$($p.arch).zip"
-          $zipPath = "artifacts/$zipName"
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "staging/*" -DestinationPath $zipPath -Force
-
-          Remove-Item "staging" -Recurse -Force
-          Write-Host "Created: $zipPath"
+          Write-Host "Staged $($p.arch): $staging"
         }
-
-        Get-ChildItem "artifacts" -File | ForEach-Object { Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1KB, 1)) KB)" }
 
     - name: Upload ARM64 zip
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-ARM64
-        path: artifacts/WARP-${{ steps.branch.outputs.label }}-ARM64.zip
+        path: artifacts/ARM64/WARP
         if-no-files-found: error
 
     - name: Upload x64 zip
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-x64
-        path: artifacts/WARP-${{ steps.branch.outputs.label }}-x64.zip
+        path: artifacts/x64/WARP
         if-no-files-found: error
 
     - name: Upload x86 zip
       uses: actions/upload-artifact@v4
       with:
         name: WARP-${{ steps.branch.outputs.label }}-x86
-        path: artifacts/WARP-${{ steps.branch.outputs.label }}-x86.zip
+        path: artifacts/x86/WARP
         if-no-files-found: error
