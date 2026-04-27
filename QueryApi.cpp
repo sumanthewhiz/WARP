@@ -204,6 +204,8 @@ void QueryApi::HandleClient(HANDLE hPipe)
                     eventTypes |= EVENT_TYPE_FILE;
                 if (arr.find("app_launch") != std::string::npos)
                     eventTypes |= EVENT_TYPE_APP_LAUNCH;
+                if (arr.find("app_focus") != std::string::npos)
+                    eventTypes |= EVENT_TYPE_APP_FOCUS;
                 if (arr.find("browsing") != std::string::npos)
                     eventTypes |= EVENT_TYPE_BROWSING;
             }
@@ -314,6 +316,29 @@ std::string QueryApi::BuildJsonResponse(uint32_t eventTypes, int64_t seconds)
             if (!b.url.empty())
                 oss << ",\"url\":\"" << EscapeJson(WideToUtf8(b.url)) << "\"";
             oss << "}";
+        }
+        oss << "]}";
+    }
+
+    // App focus activities
+    if (eventTypes & EVENT_TYPE_APP_FOCUS)
+    {
+        auto focus = m_db->QueryAppFocusCustomSeconds(seconds);
+        if (!firstSection) oss << ",";
+        firstSection = false;
+
+        oss << "\"app_focus_activities\":{\"count\":" << focus.size() << ",\"events\":[";
+        for (size_t i = 0; i < focus.size(); ++i)
+        {
+            const auto& f = focus[i];
+            if (i > 0) oss << ",";
+            oss << "{\"id\":" << f.id
+                << ",\"timestamp\":" << f.timestampUtc
+                << ",\"exe_name\":\"" << EscapeJson(WideToUtf8(f.exeName)) << "\""
+                << ",\"exe_path\":\"" << EscapeJson(WideToUtf8(f.exePath)) << "\""
+                << ",\"window_title\":\"" << EscapeJson(WideToUtf8(f.windowTitle)) << "\""
+                << ",\"duration_secs\":" << f.durationSecs
+                << "}";
         }
         oss << "]}";
     }

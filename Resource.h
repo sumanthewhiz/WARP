@@ -44,7 +44,8 @@
 #define IDC_CHK_FILE			420
 #define IDC_CHK_APP_LAUNCH		421
 #define IDC_CHK_BROWSING		422
-#define IDC_FILTER_LABEL        423
+#define IDC_CHK_APP_FOCUS		423
+#define IDC_FILTER_LABEL        424
 
 // Inference exploration
 #define IDB_INFER_TOP			430

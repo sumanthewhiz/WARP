@@ -10,7 +10,8 @@
 static const uint32_t EVENT_TYPE_FILE       = 0x01;
 static const uint32_t EVENT_TYPE_APP_LAUNCH = 0x02;
 static const uint32_t EVENT_TYPE_BROWSING   = 0x04;
-static const uint32_t EVENT_TYPE_ALL        = 0x07;
+static const uint32_t EVENT_TYPE_APP_FOCUS  = 0x08;
+static const uint32_t EVENT_TYPE_ALL        = 0x0F;
 
 struct FileActivity
 {
@@ -37,6 +38,16 @@ struct BrowsingActivity
     std::wstring browser;        // e.g. "chrome", "msedge", "firefox"
     std::wstring title;          // page/tab title from window title bar
     std::wstring url;            // URL if extractable, else empty
+};
+
+struct AppFocusActivity
+{
+    int64_t      id;
+    int64_t      timestampUtc;   // Unix epoch seconds (when focus started)
+    std::wstring exeName;        // e.g. "OUTLOOK.EXE"
+    std::wstring exePath;        // full path to the executable
+    std::wstring windowTitle;    // foreground window title
+    int          durationSecs;   // how long the app was in the foreground
 };
 
 enum class TimeWindow
@@ -84,6 +95,15 @@ public:
 
     std::vector<BrowsingActivity> QueryBrowsing(TimeWindow window);
     std::vector<BrowsingActivity> QueryBrowsingCustomSeconds(int64_t seconds);
+
+    // App focus activity (foreground window tracking)
+    bool InsertAppFocusActivity(const std::wstring& exeName,
+                                const std::wstring& exePath,
+                                const std::wstring& windowTitle,
+                                int durationSecs);
+
+    std::vector<AppFocusActivity> QueryAppFocus(TimeWindow window);
+    std::vector<AppFocusActivity> QueryAppFocusCustomSeconds(int64_t seconds);
 
     void EvictOlderThan30Days();
     void ClearAll();

@@ -44,6 +44,9 @@ public:
     // Called after every raw browsing event is written.
     void OnBrowsingEvent(const std::wstring& url, int64_t eventTs);
 
+    // Called after every foreground-app focus session ends.
+    void OnAppFocusEvent(const std::wstring& exePath, int64_t eventTs);
+
     // Batch lookup for QueryInferences op.
     // paths: list of entity keys to look up (already UTF-8 lowercase).
     // fields: which fields to include in the response (empty = all).
@@ -55,6 +58,10 @@ public:
 
     // Clear the in-memory cache (called when user clears history).
     void ClearCache();
+
+    // Recompute open_count_7d / open_count_30d from raw event tables
+    // and recalculate recency_score. Call on startup and periodically.
+    void RefreshRollingCounts();
 
 private:
     struct sqlite3** m_dbHandle = nullptr;

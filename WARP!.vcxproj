@@ -192,6 +192,7 @@
     <ClInclude Include="AppLaunchMonitor.h" />
     <ClInclude Include="BrowsingMonitor.h" />
     <ClInclude Include="FileMonitor.h" />
+    <ClInclude Include="ForegroundMonitor.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="IdleDetector.h" />
     <ClInclude Include="InferenceEngine.h" />
@@ -206,6 +207,7 @@
     <ClCompile Include="AppLaunchMonitor.cpp" />
     <ClCompile Include="BrowsingMonitor.cpp" />
     <ClCompile Include="FileMonitor.cpp" />
+    <ClCompile Include="ForegroundMonitor.cpp" />
     <ClCompile Include="IdleDetector.cpp" />
     <ClCompile Include="QueryApi.cpp" />
     <ClCompile Include="InferenceEngine.cpp" />
@@ -227,6 +229,7 @@
     <None Include=".github\workflows\build.yml" />
     <None Include=".gitignore" />
     <None Include="API.md" />
+    <None Include="projectContext.md" />
     <None Include="README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

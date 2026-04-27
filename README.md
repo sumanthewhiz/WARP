@@ -1,10 +1,10 @@
 # WARP - Windows Activity Reasoning Platform
 
 WARP is a lightweight Windows desktop application that silently monitors file/folder
-activity, application launches, and browsing activity on the local PC, stores
-everything in a rolling 30-day on-disk database, and exposes a queryable named-pipe
-API so that other applications running on the same machine can programmatically
-retrieve activity history.
+activity, application launches, foreground app focus (with window titles and dwell
+time), and browsing activity on the local PC, stores everything in a rolling 30-day
+on-disk database, and exposes a queryable named-pipe API so that other applications
+running on the same machine can programmatically retrieve activity history.
 
 The application starts minimized to the system tray (notification area), requires
 administrator privileges, and is designed to run continuously in the background for as
@@ -20,15 +20,16 @@ long as the PC is actively being used.
 | **Administrator privileges** | The linker UAC setting requests `requireAdministrator`, so a UAC prompt is shown on launch. |
 | **Modern themed UI** | Dark-on-light default theme with Segoe UI / Cascadia Mono fonts, owner-drawn buttons with rounded corners and accent borders, and a one-click **Dark Mode / Light Mode** toggle in the top-right corner. |
 | **Built-in API test panel** | 9 predefined time-window buttons, a custom-seconds input field, and a default-query button -- all wired to the named-pipe API. Responses are pretty-printed as indented JSON in a scrollable monospace area. |
-| **Event type filter checkboxes** | Three checkboxes (**File Activity**, **App Launches**, **Browsing Activity**) control which event types are included in query results. All are checked by default. |
+| **Event type filter checkboxes** | Four checkboxes (**File Activity**, **App Launches**, **App Focus**, **Browsing Activity**) control which event types are included in query results. All are checked by default. |
 | **Idle / sleep awareness** | Monitoring pauses automatically when the PC has been idle for >= 2 minutes or enters sleep/hibernate, and resumes the moment user input is detected or the PC wakes. |
 | **File-system monitoring** | Every fixed, removable, and network drive is watched recursively via `ReadDirectoryChangesW`. All paths are filtered through a comprehensive **goop exclusion list** (10 categories, 100+ patterns) derived from the *Intelligent Global File Searchability* spec to discard system-managed, application-internal, and transient file activity. |
 | **Shell-level monitoring** | `SHChangeNotifyRegister` on the entire shell namespace catches higher-level operations (copy, move, shell renames) that pure file-system notifications may miss. The same goop path exclusion is applied. |
 | **ETW file-open monitoring** | An NT Kernel Logger ETW trace captures every `NtCreateFile`/`NtOpenFile` call. Events are filtered to **user-initiated processes only** via session-ID checks and a 53-entry noisy-process blocklist, then passed through the goop path filter. |
 | **App launch monitoring** | New process launches are detected by polling the process table every 2 seconds. A three-layer filter ensures only **user-initiated** launches are recorded: (1) 65+ entry exe-name blocklist, (2) system-directory path check, (3) parent-process heuristic (rejects children of `services.exe`/`svchost.exe`). |
 | **Browsing activity monitoring** | The foreground window is polled every 3 seconds. When a recognized browser is active, the page title (and URL if present) is captured and deduplicated. |
-| **SQLite storage** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across three tables. |
-| **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. |
+| **Foreground app monitoring** | The foreground window is polled every 3 seconds for *all* user applications (not just browsers). When the foreground app changes, the previous session's exe name, exe path, window title, and dwell time (in seconds) are recorded. System/shell processes are excluded via a 35+ entry blocklist. |
+| **SQLite storage** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across four tables. |
+| **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. Rolling window counts (`open_count_7d`, `open_count_30d`) in the inference engine are also recomputed on this schedule. |
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps, access counts, and an exponential-decay recency score. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
@@ -43,6 +44,7 @@ WARP captures three categories of events:
 |---|---|---|
 | **File Activity** | User-initiated file/folder creates, opens, modifications, deletes, renames. System/goop paths excluded. | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
 | **App Launch** | User-initiated application launches only (exe name, path, PID). System processes filtered by name, path, and parent. | Process table polling via `CreateToolhelp32Snapshot` |
+| **App Focus** | Foreground application sessions with window title and dwell time (seconds). System/shell processes excluded. | Foreground window polling via `GetForegroundWindow` + `GetWindowText` |
 | **Browsing Activity** | Browser page title changes (browser name, page title, URL) | Foreground window title polling via `GetForegroundWindow` + `GetWindowText` |
 
 ---
@@ -54,21 +56,24 @@ WARP captures three categories of events:
 |                            WARP!.cpp                                  |
 |                        (Win32 entry point)                            |
 |  +-----------+ +---------+ +----------+ +----------+ +-----------+   |
-|  |FileMonitor| |AppLaunch| |Browsing  | |IdleDetect| | QueryApi  |   |
-|  | .h/.cpp   | |Monitor  | |Monitor   | |or .h/.cpp| | .h/.cpp   |   |
-|  |           | |.h/.cpp  | |.h/.cpp   | |          | |           |   |
-|  +-----+-----+ +----+----+ +----+-----+ +-----+----+ +-----+-----+  |
-|        |             |           |             |             |        |
-|        | callback    | callback  | callback    | pause/      | read   |
-|        +------------>+---------->+------------>| resume      |<------>|
-|        |             |           |             +------------>|        |
-|        |             |           |             |             |        |
-+--------+-----+-------+-----+-----+-------------+------+------+-------+
-         |     |       |     |     |                     |
-   ReadDirectory   Toolhelp32   GetForeground  GetLastInput  Named Pipe
-   ChangesW /      Snapshot     Window +       Info / WM_    \\.\pipe\
-   SHChangeNotify               GetWindowText  POWERBROADCAST WarpFileActivityAPI
-   / ETW
+|  |FileMonitor| |AppLaunch| |Browsing  | |Foreground| | QueryApi  |   |
+|  | .h/.cpp   | |Monitor  | |Monitor   | |Monitor   | | .h/.cpp   |   |
+|  |           | |.h/.cpp  | |.h/.cpp   | |.h/.cpp   | |           |   |
+|  +-----+-----+ +----+----+ +----+-----+ +----+-----+ +-----+-----+  |
+|        |             |           |            |             |         |
+|        | callback    | callback  | callback   | callback    |         |
+|        +------------>+---------->+----------->+------------>|         |
+|        |             |           |            |             |         |
+|  +-----------+                                        +-----+-----+  |
+|  |IdleDetect |  pause / resume all four monitors      |           |  |
+|  |or .h/.cpp |--------------------------------------->| read      |  |
+|  +-----------+                                        |<--------->|  |
++--------+-----+-------+-----+-----+------+------+------+-----------+--+
+         |     |       |     |     |      |      |            |
+   ReadDirectory   Toolhelp32   GetForeground  GetForeground  Named Pipe
+   ChangesW /      Snapshot     Window +       Window +       \\.\pipe\
+   SHChangeNotify               GetWindowText  GetWindowText  WarpFileActivityAPI
+   / ETW                        (browsers)     (all apps)
                    +------------------+
                    | InferenceEngine  |  <-- updated per event
                    | .h/.cpp          |      (recency scores,
@@ -97,9 +102,10 @@ tray) with a modern themed layout:
 - **Custom seconds section** -- a numeric edit field and "Send Custom Query" button.
 - **Default query section** -- a single button that sends an empty `{}` request
   (returns last 1 hour).
-- **Event type filter** -- three checkboxes (**File Activity**, **App Launches**,
-  **Browsing Activity**) that control which event types are queried. All checked by
-  default. The selected types are sent as a `"types"` array in the JSON request.
+- **Event type filter** -- four checkboxes (**File Activity**, **App Launches**,
+  **App Focus**, **Browsing Activity**) that control which event types are queried.
+  All checked by default. The selected types are sent as a `"types"` array in the
+  JSON request.
 - **Inference exploration section** -- labelled "Explore Precomputed Inferences":
   - *Entity type filter* -- three checkboxes (**Files**, **Apps**, **URLs**) to
     select which entity types to include. All checked by default.
@@ -228,6 +234,28 @@ Processing:
 - **Deduplication** -- the same title + browser combination is reported only once
   until the user navigates to a different page.
 
+#### `ForegroundMonitor` (`ForegroundMonitor.h` / `ForegroundMonitor.cpp`)
+
+A polling thread that checks the foreground window every 3 seconds for **all user
+applications**, not just browsers. When the foreground changes (different PID or
+different window title), the previous session is emitted with:
+
+- **exe_name** -- executable filename (e.g. `OUTLOOK.EXE`).
+- **exe_path** -- full path to the executable.
+- **window_title** -- the window title that was active during the session.
+- **duration_secs** -- how many seconds the app was in the foreground.
+
+Sessions shorter than 3 seconds (one poll interval) are discarded.
+
+A 35+ entry blocklist (`IsSystemForeground`) excludes system/shell processes:
+`explorer.exe`, `dwm.exe`, `csrss.exe`, `SearchHost.exe`, `Widgets.exe`,
+`consent.exe`, `warp!.exe`, and others.
+
+This monitor provides the **app usage context** (window titles and dwell time)
+required by user-context scenarios such as improving search relevance based on
+current app activity, inferring user intent from window titles, and tracking app
+usage frequency and duration patterns over time.
+
 #### `IdleDetector` (`IdleDetector.h` / `IdleDetector.cpp`)
 
 A polling thread that checks `GetLastInputInfo` every 5 seconds. When the idle
@@ -238,7 +266,8 @@ A message-only window is also created to receive `WM_POWERBROADCAST` notificatio
 (`PBT_APMSUSPEND` / `PBT_APMRESUMEAUTOMATIC`) so that sleep/wake transitions
 trigger the same pause/resume path.
 
-When idle or asleep, all three monitors (file, app launch, browsing) are paused.
+When idle or asleep, all four monitors (file, app launch, foreground, browsing) are
+paused.
 
 #### `ActivityDatabase` (`ActivityDatabase.h` / `ActivityDatabase.cpp`)
 
@@ -280,6 +309,17 @@ CREATE INDEX idx_activity_action ON file_activity(action, timestamp);
 CREATE INDEX idx_app_ts        ON app_launch_activity(timestamp);
 CREATE INDEX idx_browse_ts     ON browsing_activity(timestamp);
 
+CREATE TABLE app_focus_activity (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       INTEGER NOT NULL,       -- Unix epoch seconds (when focus started)
+    exe_name        TEXT    NOT NULL,        -- executable filename
+    exe_path        TEXT    NOT NULL,        -- full path to the executable
+    window_title    TEXT    NOT NULL,        -- foreground window title
+    duration_secs   INTEGER NOT NULL         -- seconds in the foreground
+);
+
+CREATE INDEX idx_focus_ts      ON app_focus_activity(timestamp);
+
 -- Inference table (precomputed per-entity analytics)
 CREATE TABLE inference (
     entity_key        TEXT PRIMARY KEY,
@@ -301,8 +341,11 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 **Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`.
 
-**Eviction:** Records older than 30 days are deleted from all three event tables on
-startup and every 6 hours via a `WM_TIMER`.
+**Eviction:** Records older than 30 days are deleted from all four event tables on
+startup and every 6 hours via a `WM_TIMER`. Rolling window counts in the inference
+engine (`open_count_7d`, `open_count_30d`) are also recomputed on this schedule via
+`RefreshRollingCounts()`, ensuring they accurately reflect actual events in their
+respective time windows.
 
 #### `InferenceEngine` (`InferenceEngine.h` / `InferenceEngine.cpp`)
 
@@ -310,8 +353,8 @@ A real-time analytics layer that maintains per-entity inference records across
 three entity types: **files**, **apps**, and **URLs**.
 
 Every time a raw event is written to the database, the corresponding monitor
-callback also calls `OnFileEvent`, `OnAppLaunchEvent`, or `OnBrowsingEvent` on the
-inference engine. The engine:
+callback also calls `OnFileEvent`, `OnAppLaunchEvent`, `OnAppFocusEvent`, or
+`OnBrowsingEvent` on the inference engine. The engine:
 
 1. Normalizes the entity key to lowercase UTF-8.
 2. Loads or creates an `InferenceRecord` (in-memory cache backed by the `inference`
@@ -391,7 +434,8 @@ immediately.
 | [Send Default Query]                                       |
 |                                                            |
 | Event Types to Query:                                      |
-|   [x] File Activity  [x] App Launches  [x] Browsing Act.  |
+|   [x] File Activity  [x] App Launches  [x] App Focus      |
+|   [x] Browsing Act.                                        |
 |                                                            |
 | Explore Precomputed Inferences                             |
 | Entity Types: [x] Files [x] Apps [x] URLs  Top N: [50]    |
@@ -438,12 +482,18 @@ automatically via the linker's UAC manifest setting.
 4. File-system, shell, and ETW monitors start on all eligible drives. The goop path filter is active from the start, discarding file activity from 100+ system/cache/build/temp directory patterns.
 5. The app launch monitor begins polling the process table. Only user-initiated launches (passing session, name, path, and parent-process checks) are recorded.
 6. The browsing monitor begins polling the foreground window.
-7. The idle detector begins polling for user inactivity and power events.
-8. The inference engine is initialized with direct access to the SQLite database.
-9. The named-pipe server starts accepting connections.
-10. Every detected event (file, app launch, or browsing) is inserted into the appropriate database table **and** fed to the inference engine, which incrementally updates per-entity scores in real time.
-11. Every 6 hours, records older than 30 days are purged from all event tables.
-12. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
+7. The foreground monitor begins polling for all foreground app changes (window
+   titles, dwell time).
+8. The idle detector begins polling for user inactivity and power events.
+9. The inference engine is initialized with direct access to the SQLite database.
+   Rolling window counts are recomputed from the raw event tables.
+10. The named-pipe server starts accepting connections.
+11. Every detected event (file, app launch, app focus, or browsing) is inserted into
+    the appropriate database table **and** fed to the inference engine, which
+    incrementally updates per-entity scores in real time.
+12. Every 6 hours, records older than 30 days are purged from all event tables and
+    inference rolling counts are recomputed.
+13. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
 13. Right-clicking the tray icon shows **Open** / **Exit**. *Open* shows the window maximized; *Exit* tears everything down cleanly.
 14. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
 15. The "Explore Precomputed Inferences" section can be used to browse the top entities by recency score (filtered by entity type) or look up the inference record for a specific file path, app path, or URL.
@@ -515,9 +565,10 @@ Any request can include a `"types"` array to specify which event categories to r
 |---|---|
 | `file` | File/folder activity |
 | `app_launch` | Application launch events |
+| `app_focus` | Foreground app focus sessions (window title + dwell time) |
 | `browsing` | Browsing activity events |
 
-If `"types"` is omitted, all three event types are returned (backward compatible).
+If `"types"` is omitted, all four event types are returned (backward compatible).
 
 **Examples:**
 
@@ -690,6 +741,27 @@ Only the requested event types are included in the response:
                 "title": "Stack Overflow - Search"
             }
         ]
+    },
+    "app_focus_activities": {
+        "count": 2,
+        "events": [
+            {
+                "id": 5,
+                "timestamp": 1750012345,
+                "exe_name": "OUTLOOK.EXE",
+                "exe_path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\OUTLOOK.EXE",
+                "window_title": "Tax Returns for Nancy - Outlook",
+                "duration_secs": 300
+            },
+            {
+                "id": 4,
+                "timestamp": 1750012000,
+                "exe_name": "EXCEL.EXE",
+                "exe_path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
+                "window_title": "Route planner simulator.xlsx - Excel",
+                "duration_secs": 600
+            }
+        ]
     }
 }
 ```
@@ -729,6 +801,19 @@ Only the requested event types are included in the response:
 | `events[].browser` | string | Browser identifier (`chrome`, `msedge`, `firefox`, `brave`, `opera`, `vivaldi`, `ie`). |
 | `events[].title` | string | Page title (browser suffix stripped). |
 | `events[].url` | string *(optional)* | URL if extractable from the title bar. |
+
+#### Response fields -- app_focus_activities
+
+| Field | Type | Description |
+|---|---|---|
+| `app_focus_activities.count` | integer | Total number of focus session records. |
+| `app_focus_activities.events` | array | Ordered list (most recent first). |
+| `events[].id` | integer | Auto-increment row ID. |
+| `events[].timestamp` | integer | Unix epoch seconds (UTC) when the focus session started. |
+| `events[].exe_name` | string | Executable filename (e.g. `"OUTLOOK.EXE"`). |
+| `events[].exe_path` | string | Full path to the executable. |
+| `events[].window_title` | string | The window title during this foreground session. |
+| `events[].duration_secs` | integer | How many seconds the app was in the foreground. |
 
 ### Client examples
 
@@ -890,14 +975,16 @@ WARP!\
 |-- framework.h                 Precompiled / common system headers
 |-- targetver.h                 Windows SDK version targeting
 |
-|-- ActivityDatabase.h          Database class interface (3 tables)
+|-- ActivityDatabase.h          Database class interface (4 tables)
 |-- ActivityDatabase.cpp        SQLite storage implementation
 |-- FileMonitor.h               File/shell monitoring interface
 |-- FileMonitor.cpp             ReadDirectoryChangesW + SHChangeNotify + ETW impl
 |-- AppLaunchMonitor.h          App launch monitoring interface
 |-- AppLaunchMonitor.cpp        Process table polling impl
 |-- BrowsingMonitor.h           Browsing activity monitoring interface
-|-- BrowsingMonitor.cpp         Foreground window title polling impl
+|-- BrowsingMonitor.cpp         Foreground window title polling impl (browsers)
+|-- ForegroundMonitor.h         Foreground app focus monitoring interface
+|-- ForegroundMonitor.cpp       Foreground window polling impl (all apps, dwell time)
 |-- IdleDetector.h              Idle/sleep detector interface
 |-- IdleDetector.cpp            GetLastInputInfo + WM_POWERBROADCAST impl
 |-- QueryApi.h                  Named-pipe API interface

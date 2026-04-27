@@ -99,6 +99,19 @@ bool ActivityDatabase::Open(const std::wstring& dbPath)
     Execute("CREATE INDEX IF NOT EXISTS idx_inference_updated_at ON inference(updated_at);");
     Execute("CREATE INDEX IF NOT EXISTS idx_inference_version ON inference(version);");
 
+    // App focus activity table (foreground window tracking with dwell time)
+    const char* createFocusTable =
+        "CREATE TABLE IF NOT EXISTS app_focus_activity ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  timestamp       INTEGER NOT NULL,"
+        "  exe_name        TEXT    NOT NULL,"
+        "  exe_path        TEXT    NOT NULL,"
+        "  window_title    TEXT    NOT NULL,"
+        "  duration_secs   INTEGER NOT NULL"
+        ");";
+    Execute(createFocusTable);
+    Execute("CREATE INDEX IF NOT EXISTS idx_focus_ts ON app_focus_activity(timestamp);");
+
     return true;
 }
 
@@ -326,6 +339,77 @@ std::vector<BrowsingActivity> ActivityDatabase::QueryBrowsingCustomSeconds(int64
     return results;
 }
 
+// ===================== App focus activity =====================
+
+bool ActivityDatabase::InsertAppFocusActivity(const std::wstring& exeName,
+                                              const std::wstring& exePath,
+                                              const std::wstring& windowTitle,
+                                              int durationSecs)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_db) return false;
+
+    const char* sql = "INSERT INTO app_focus_activity(timestamp, exe_name, exe_path, window_title, duration_secs) VALUES(?,?,?,?,?);";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return false;
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    sqlite3_bind_int64(stmt, 1, now);
+
+    std::string nUtf8 = WideToUtf8(exeName);
+    sqlite3_bind_text(stmt, 2, nUtf8.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::string pUtf8 = WideToUtf8(exePath);
+    sqlite3_bind_text(stmt, 3, pUtf8.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::string tUtf8 = WideToUtf8(windowTitle);
+    sqlite3_bind_text(stmt, 4, tUtf8.c_str(), -1, SQLITE_TRANSIENT);
+
+    sqlite3_bind_int(stmt, 5, durationSecs);
+
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+std::vector<AppFocusActivity> ActivityDatabase::QueryAppFocus(TimeWindow window)
+{
+    return QueryAppFocusCustomSeconds(WindowToSeconds(window));
+}
+
+std::vector<AppFocusActivity> ActivityDatabase::QueryAppFocusCustomSeconds(int64_t seconds)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<AppFocusActivity> results;
+    if (!m_db) return results;
+
+    int64_t cutoff = static_cast<int64_t>(std::time(nullptr)) - seconds;
+
+    const char* sql = "SELECT id, timestamp, exe_name, exe_path, window_title, duration_secs "
+                      "FROM app_focus_activity WHERE timestamp >= ? ORDER BY timestamp DESC;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return results;
+
+    sqlite3_bind_int64(stmt, 1, cutoff);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        AppFocusActivity f;
+        f.id           = sqlite3_column_int64(stmt, 0);
+        f.timestampUtc = sqlite3_column_int64(stmt, 1);
+        f.exeName      = Utf8ToWide(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+        f.exePath      = Utf8ToWide(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+        f.windowTitle  = Utf8ToWide(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)));
+        f.durationSecs = sqlite3_column_int(stmt, 5);
+        results.push_back(std::move(f));
+    }
+
+    sqlite3_finalize(stmt);
+    return results;
+}
+
 // ===================== Eviction & utilities =====================
 
 void ActivityDatabase::EvictOlderThan30Days()
@@ -339,6 +423,7 @@ void ActivityDatabase::EvictOlderThan30Days()
         "DELETE FROM file_activity WHERE timestamp < ?;",
         "DELETE FROM app_launch_activity WHERE timestamp < ?;",
         "DELETE FROM browsing_activity WHERE timestamp < ?;",
+        "DELETE FROM app_focus_activity WHERE timestamp < ?;",
     };
 
     for (const char* sql : tables)
@@ -360,6 +445,7 @@ void ActivityDatabase::ClearAll()
     Execute("DELETE FROM file_activity;");
     Execute("DELETE FROM app_launch_activity;");
     Execute("DELETE FROM browsing_activity;");
+    Execute("DELETE FROM app_focus_activity;");
     Execute("DELETE FROM inference;");
 }
 

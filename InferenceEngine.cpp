@@ -255,6 +255,30 @@ void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
     }
 }
 
+void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath, int64_t eventTs)
+{
+    if (exePath.empty()) return;
+
+    std::string key = NormalizeKey(exePath);
+
+    std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+    InferenceRecord& rec = LoadOrCreate(key, "app");
+
+    rec.lastEventTs    = eventTs;
+    rec.lastOpenTs     = eventTs;
+    rec.openCount7d++;
+    rec.openCount30d++;
+    rec.openCountTotal++;
+    rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
+    rec.version++;
+    rec.updatedAt      = eventTs;
+
+    {
+        std::lock_guard<std::mutex> dbLock(*m_dbMutex);
+        PersistRecord(rec);
+    }
+}
+
 // ===================== Query Handlers =====================
 
 std::string InferenceEngine::HandleQueryInferences(
@@ -408,4 +432,186 @@ void InferenceEngine::ClearCache()
 {
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     m_cache.clear();
+}
+
+void InferenceEngine::RefreshRollingCounts()
+{
+    if (!m_dbHandle || !*m_dbHandle || !m_dbMutex)
+        return;
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    int64_t cutoff7d  = now - 7LL * 24 * 3600;
+    int64_t cutoff30d = now - 30LL * 24 * 3600;
+
+    // Collect fresh 7d/30d OPEN counts from the three raw-event tables.
+    // file_activity: count OPEN actions per path (lowercased)
+    // app_launch_activity: every row is an "open" per exe_path (lowercased)
+    // browsing_activity: every row is a "visit" per url or title (lowercased)
+    struct Counts { int c7d = 0; int c30d = 0; };
+    std::unordered_map<std::string, Counts> freshCounts;
+
+    std::lock_guard<std::mutex> dbLock(*m_dbMutex);
+
+    // --- File OPEN counts ---
+    {
+        const char* sql =
+            "SELECT LOWER(path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) "
+            "FROM file_activity WHERE action = 'OPEN' AND timestamp >= ? "
+            "GROUP BY LOWER(path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_int(stmt, 1);
+                c.c30d = sqlite3_column_int(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- App launch counts (every launch = an open) ---
+    {
+        const char* sql =
+            "SELECT LOWER(exe_path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) "
+            "FROM app_launch_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(exe_path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_int(stmt, 1);
+                c.c30d = sqlite3_column_int(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- App focus counts (every focus session = an open for the app) ---
+    {
+        const char* sql =
+            "SELECT LOWER(exe_path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) "
+            "FROM app_focus_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(exe_path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  += sqlite3_column_int(stmt, 1);
+                c.c30d += sqlite3_column_int(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- Browsing counts (every visit = an open; key = url if non-empty, else title) ---
+    {
+        const char* sql =
+            "SELECT LOWER(CASE WHEN url IS NOT NULL AND url != '' THEN url ELSE title END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) "
+            "FROM browsing_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(CASE WHEN url IS NOT NULL AND url != '' THEN url ELSE title END);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_int(stmt, 1);
+                c.c30d = sqlite3_column_int(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- Walk all inference records and patch counts + recency_score ---
+    {
+        const char* selSql =
+            "SELECT entity_key, entity_type, last_event_ts, last_open_ts, last_edit_ts,"
+            "       open_count_7d, open_count_30d, open_count_total,"
+            "       recency_score, version, updated_at"
+            " FROM inference;";
+        sqlite3_stmt* selStmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, selSql, -1, &selStmt, nullptr) != SQLITE_OK)
+            return;
+
+        const char* updSql =
+            "UPDATE inference SET open_count_7d=?, open_count_30d=?, "
+            "recency_score=?, version=version+1, updated_at=? "
+            "WHERE entity_key=?;";
+        sqlite3_stmt* updStmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, updSql, -1, &updStmt, nullptr) != SQLITE_OK)
+        {
+            sqlite3_finalize(selStmt);
+            return;
+        }
+
+        while (sqlite3_step(selStmt) == SQLITE_ROW)
+        {
+            const char* ek = reinterpret_cast<const char*>(sqlite3_column_text(selStmt, 0));
+            if (!ek) continue;
+            std::string key(ek);
+
+            int old7d  = sqlite3_column_int(selStmt, 5);
+            int old30d = sqlite3_column_int(selStmt, 6);
+            int64_t lastOpenTs = sqlite3_column_int64(selStmt, 3);
+
+            auto it = freshCounts.find(key);
+            int new7d  = it != freshCounts.end() ? it->second.c7d  : 0;
+            int new30d = it != freshCounts.end() ? it->second.c30d : 0;
+
+            if (new7d != old7d || new30d != old30d)
+            {
+                double score = ComputeRecencyScore(now, lastOpenTs, new7d);
+                sqlite3_reset(updStmt);
+                sqlite3_bind_int(updStmt, 1, new7d);
+                sqlite3_bind_int(updStmt, 2, new30d);
+                sqlite3_bind_double(updStmt, 3, score);
+                sqlite3_bind_int64(updStmt, 4, now);
+                sqlite3_bind_text(updStmt, 5, key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(updStmt);
+            }
+        }
+
+        sqlite3_finalize(selStmt);
+        sqlite3_finalize(updStmt);
+    }
+
+    // Invalidate in-memory cache so subsequent queries pick up fresh data
+    {
+        std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+        m_cache.clear();
+    }
 }

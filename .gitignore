@@ -25,3 +25,6 @@ binaries/
 *.opensdf
 *.cachefile
 ipch/
+
+# Project context (local only)
+projectContext.md

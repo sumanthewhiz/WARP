@@ -8,6 +8,7 @@
 #include "FileMonitor.h"
 #include "AppLaunchMonitor.h"
 #include "BrowsingMonitor.h"
+#include "ForegroundMonitor.h"
 #include "IdleDetector.h"
 #include "QueryApi.h"
 #include "InferenceEngine.h"
@@ -102,6 +103,7 @@ ActivityDatabase   g_db;
 FileMonitor         g_fileMonitor;
 AppLaunchMonitor    g_appLaunchMonitor;
 BrowsingMonitor     g_browsingMonitor;
+ForegroundMonitor   g_foregroundMonitor;
 IdleDetector        g_idleDetector;
 QueryApi            g_queryApi;
 InferenceEngine     g_inference;
@@ -120,6 +122,7 @@ static HWND g_hBtnTheme    = nullptr;
 static HWND g_hBtnClear    = nullptr;
 static HWND g_hChkFile     = nullptr;
 static HWND g_hChkAppLaunch= nullptr;
+static HWND g_hChkAppFocus = nullptr;
 static HWND g_hChkBrowsing = nullptr;
 static HWND g_hFilterLabel = nullptr;
 static std::vector<HWND> g_hWindowBtns;
@@ -390,6 +393,12 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
     SendMessageW(g_hChkAppLaunch, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     SendMessageW(g_hChkAppLaunch, BM_SETCHECK, BST_CHECKED, 0);
 
+    g_hChkAppFocus = CreateWindowW(L"BUTTON", L"App Focus",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_APP_FOCUS, hInstance, nullptr);
+    SendMessageW(g_hChkAppFocus, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hChkAppFocus, BM_SETCHECK, BST_CHECKED, 0);
+
     g_hChkBrowsing = CreateWindowW(L"BUTTON", L"Browsing Activity",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
         0, 0, 0, 0, hWnd, (HMENU)IDC_CHK_BROWSING, hInstance, nullptr);
@@ -536,7 +545,8 @@ void LayoutControls(HWND hWnd)
     int chkW = 130;
     MoveWindow(g_hChkFile,      chkX,              y, chkW, 20, TRUE);
     MoveWindow(g_hChkAppLaunch, chkX + chkW + gap, y, chkW, 20, TRUE);
-    MoveWindow(g_hChkBrowsing,  chkX + 2 * (chkW + gap), y, 160, 20, TRUE);
+    MoveWindow(g_hChkAppFocus,  chkX + 2 * (chkW + gap), y, chkW, 20, TRUE);
+    MoveWindow(g_hChkBrowsing,  chkX + 3 * (chkW + gap), y, 160, 20, TRUE);
     y += 28;
 
     // --- Inference exploration section ---
@@ -702,18 +712,20 @@ void OnQueryButton(HWND hWnd, int id)
     {
         bool chkFile = (SendMessageW(g_hChkFile, BM_GETCHECK, 0, 0) == BST_CHECKED);
         bool chkApp  = (SendMessageW(g_hChkAppLaunch, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        bool chkFocus = (SendMessageW(g_hChkAppFocus, BM_GETCHECK, 0, 0) == BST_CHECKED);
         bool chkBrowse = (SendMessageW(g_hChkBrowsing, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
         // If none checked, default to all
-        if (!chkFile && !chkApp && !chkBrowse)
+        if (!chkFile && !chkApp && !chkFocus && !chkBrowse)
         {
-            chkFile = chkApp = chkBrowse = true;
+            chkFile = chkApp = chkFocus = chkBrowse = true;
         }
 
         types = ",\"types\":[";
         bool first = true;
         if (chkFile)   { if (!first) types += ","; types += "\"file\"";       first = false; }
         if (chkApp)    { if (!first) types += ","; types += "\"app_launch\""; first = false; }
+        if (chkFocus)  { if (!first) types += ","; types += "\"app_focus\"";  first = false; }
         if (chkBrowse) { if (!first) types += ","; types += "\"browsing\"";   first = false; }
         types += "]";
     }
@@ -872,7 +884,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_TIMER:
         if (wParam == IDT_EVICTION_TIMER)
+        {
             g_db.EvictOlderThan30Days();
+            g_inference.RefreshRollingCounts();
+        }
         break;
 
     case WM_PAINT:
@@ -990,6 +1005,7 @@ void StartSubsystems()
 
     // Initialize inference engine with direct DB access
     g_inference.Init(g_db.DbHandle(), g_db.DbMutex());
+    g_inference.RefreshRollingCounts();
 
     g_fileMonitor.SetCallback([](const std::wstring& action,
                                  const std::wstring& path,
@@ -1018,16 +1034,28 @@ void StartSubsystems()
     });
     g_browsingMonitor.Start();
 
+    g_foregroundMonitor.SetCallback([](const std::wstring& exeName,
+                                       const std::wstring& exePath,
+                                       const std::wstring& windowTitle,
+                                       int durationSecs) {
+        g_db.InsertAppFocusActivity(exeName, exePath, windowTitle, durationSecs);
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        g_inference.OnAppFocusEvent(exePath, now);
+    });
+    g_foregroundMonitor.Start();
+
     g_idleDetector.SetCallbacks(
         []() {
             g_fileMonitor.Pause();
             g_appLaunchMonitor.Pause();
             g_browsingMonitor.Pause();
+            g_foregroundMonitor.Pause();
         },
         []() {
             g_fileMonitor.Resume();
             g_appLaunchMonitor.Resume();
             g_browsingMonitor.Resume();
+            g_foregroundMonitor.Resume();
         }
     );
     g_idleDetector.Start(120000);
@@ -1293,6 +1321,7 @@ void StopSubsystems()
 {
     g_queryApi.Stop();
     g_idleDetector.Stop();
+    g_foregroundMonitor.Stop();
     g_browsingMonitor.Stop();
     g_appLaunchMonitor.Stop();
     g_fileMonitor.Stop();

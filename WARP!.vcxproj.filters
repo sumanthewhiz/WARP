@@ -99,5 +99,6 @@
     <None Include="README.md" />
     <None Include="API.md" />
     <None Include=".github\workflows\build.yml" />
+    <None Include="projectContext.md" />
   </ItemGroup>
 </Project>
