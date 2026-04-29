@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "QueryApi.h"
 #include "InferenceEngine.h"
+#include "TopicInference.h"
 #include <sstream>
 #include <string>
 #include <vector>
@@ -17,11 +18,12 @@ QueryApi::~QueryApi()
     if (m_stopEvent) CloseHandle(m_stopEvent);
 }
 
-void QueryApi::Start(ActivityDatabase* db, InferenceEngine* inference)
+void QueryApi::Start(ActivityDatabase* db, InferenceEngine* inference, TopicInference* topicInf)
 {
     if (m_running) return;
     m_db = db;
     m_inference = inference;
+    m_topicInf = topicInf;
     m_running = true;
     ResetEvent(m_stopEvent);
     m_thread = std::thread(&QueryApi::Run, this);
@@ -168,6 +170,15 @@ void QueryApi::HandleClient(HANDLE hPipe)
         auto paths  = extractStringArray("paths");
         auto fields = extractStringArray("fields");
         std::string json = m_inference->HandleQueryInferences(paths, fields);
+        DWORD written = 0;
+        WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
+        FlushFileBuffers(hPipe);
+        return;
+    }
+
+    if (opVal == "GetRecentContext" && m_topicInf)
+    {
+        std::string json = m_topicInf->GetRecentContext();
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);

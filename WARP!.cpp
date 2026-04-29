@@ -12,6 +12,7 @@
 #include "IdleDetector.h"
 #include "QueryApi.h"
 #include "InferenceEngine.h"
+#include "TopicInference.h"
 
 #include <string>
 #include <shlobj.h>
@@ -107,6 +108,7 @@ ForegroundMonitor   g_foregroundMonitor;
 IdleDetector        g_idleDetector;
 QueryApi            g_queryApi;
 InferenceEngine     g_inference;
+TopicInference      g_topicInference;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -138,6 +140,9 @@ static HWND g_hEditInferPath  = nullptr;
 static HWND g_hBtnInferLookup = nullptr;
 static HWND g_hEditInferTopN  = nullptr;
 static HWND g_hInferTopNLabel = nullptr;
+
+// Topic context button
+static HWND g_hBtnTopicContext = nullptr;
 
 // Forward declarations
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -475,6 +480,12 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDB_INFER_LOOKUP, hInstance, nullptr);
     SendMessageW(g_hBtnInferLookup, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
+    // Topic context button
+    g_hBtnTopicContext = CreateWindowW(L"BUTTON", L"Show Recent Context",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+        0, 0, 0, 0, hWnd, (HMENU)IDB_TOPIC_CONTEXT, hInstance, nullptr);
+    SendMessageW(g_hBtnTopicContext, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+
     LayoutControls(hWnd);
 }
 
@@ -573,6 +584,10 @@ void LayoutControls(HWND hWnd)
     MoveWindow(g_hEditInferPath, pad, y, editW, 26, TRUE);
     MoveWindow(g_hBtnInferLookup, pad + editW + gap, y, lookupBtnW, 26, TRUE);
     y += 34;
+
+    // Topic context button
+    MoveWindow(g_hBtnTopicContext, pad, y, 200, 30, TRUE);
+    y += 38;
 
     // Response label
     MoveWindow(g_hResponseLabel, pad, y, W - 2 * pad, 20, TRUE);
@@ -788,6 +803,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ClearHistory(hWnd);
         else if (wmId == IDB_INFER_TOP || wmId == IDB_INFER_LOOKUP)
             OnInferenceButton(hWnd, wmId);
+        else if (wmId == IDB_TOPIC_CONTEXT)
+            SendApiQuery(hWnd, "{\"op\":\"GetRecentContext\"}");
         else
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
@@ -977,6 +994,7 @@ void ClearHistory(HWND hWnd)
     {
         g_db.ClearAll();
         g_inference.ClearCache();
+        g_topicInference.ClearHistory();
         SetWindowTextW(g_hResponse, L"Activity history cleared.");
     }
 }
@@ -1060,7 +1078,34 @@ void StartSubsystems()
     );
     g_idleDetector.Start(120000);
 
-    g_queryApi.Start(&g_db, &g_inference);
+    g_queryApi.Start(&g_db, &g_inference, &g_topicInference);
+
+    // Initialize and start topic inference (MiniLM semantic model).
+    // Look for models directory next to the executable first,
+    // then fall back to %LOCALAPPDATA%\WARP\models.
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring exeDir(exePath);
+        auto pos = exeDir.find_last_of(L"\\/");
+        if (pos != std::wstring::npos)
+            exeDir = exeDir.substr(0, pos);
+
+        std::wstring modelsDir = exeDir + L"\\models";
+
+        // Check if model exists next to exe
+        std::wstring modelFile = modelsDir + L"\\minilm.onnx";
+        if (GetFileAttributesW(modelFile.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            // Fall back to LOCALAPPDATA\WARP\models
+            wchar_t appData[MAX_PATH] = {};
+            SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appData);
+            modelsDir = std::wstring(appData) + L"\\WARP\\models";
+        }
+
+        if (g_topicInference.Init(modelsDir))
+            g_topicInference.Start(&g_db);
+    }
 }
 
 void OnInferenceButton(HWND hWnd, int id)
@@ -1319,6 +1364,7 @@ void OnInferenceButton(HWND hWnd, int id)
 
 void StopSubsystems()
 {
+    g_topicInference.Stop();
     g_queryApi.Stop();
     g_idleDetector.Stop();
     g_foregroundMonitor.Stop();

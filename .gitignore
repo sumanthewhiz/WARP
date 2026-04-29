@@ -28,3 +28,10 @@ ipch/
 
 # Project context (local only)
 projectContext.md
+
+# NuGet packages
+packages/
+*.nupkg
+
+# ML model files (too large for git — download separately)
+models/

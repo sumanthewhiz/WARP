@@ -59,6 +59,10 @@
 #define IDC_EDIT_INFER_TOPN		438
 #define IDC_INFER_TOPN_LABEL	439
 
+// Topic context inference
+#define IDB_TOPIC_CONTEXT		440
+#define IDT_TOPIC_TIMER			302
+
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif

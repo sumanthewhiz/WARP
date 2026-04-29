@@ -3,7 +3,7 @@
 
 # WARP Activity API -- Integration Guide
 
-> **Version:** 3.0
+> **Version:** 4.0
 > **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`
 > **Transport:** Windows Named Pipe (message mode)
 > **Encoding:** UTF-8 JSON
@@ -29,6 +29,7 @@ timestamps) to make better-informed decisions in their own workflows.
   - [Inference Operations](#5-inference-operations)
     - [QueryInferences](#queryinferences)
     - [GetInferenceDeltas](#getinferencedeltas)
+    - [GetRecentContext](#getrecentcontext)
 - [Response Format](#response-format)
   - [Top-Level Structure](#top-level-structure)
   - [File Activity Fields](#file-activity-fields)
@@ -38,6 +39,7 @@ timestamps) to make better-informed decisions in their own workflows.
 - [Inference Response Format](#inference-response-format)
   - [QueryInferences Response](#queryinferences-response)
   - [GetInferenceDeltas Response](#getinferencedeltas-response)
+  - [GetRecentContext Response](#getrecentcontext-response)
   - [Inference Record Fields](#inference-record-fields)
 - [Error Handling](#error-handling)
 - [Data Retention & Limits](#data-retention--limits)
@@ -51,6 +53,7 @@ timestamps) to make better-informed decisions in their own workflows.
   - [Browsing History Dashboard](#7-browsing-history-dashboard)
   - [Smart File Ranking](#8-smart-file-ranking)
   - [Incremental Inference Sync](#9-incremental-inference-sync)
+  - [Semantic Context Awareness](#10-semantic-context-awareness)
 - [Client Examples](#client-examples)
   - [C++ (Win32)](#c-win32)
   - [C# (.NET)](#c-net)
@@ -92,6 +95,7 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 | Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
 | Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
+| Semantic context awareness | Use `GetRecentContext` to get the top 3 semantic topics the user is currently working on, inferred by a local MiniLM embedding model |
 
 ---
 
@@ -213,10 +217,9 @@ compatible with v1.0 clients that don't send `"types"`).
 
 ### 5. Inference Operations
 
-In addition to raw event queries, the pipe supports two **inference operations**
-that return precomputed per-entity analytics. Inference requests are identified by
-the `"op"` field. These operations do **not** use `"window"`, `"seconds"`, or
-`"types"` -- they operate on the `inference` table directly.
+In addition to raw event queries, the pipe supports three **inference operations**
+that return precomputed analytics. Inference requests are identified by the `"op"`
+field. These operations do **not** use `"window"`, `"seconds"`, or `"types"`.
 
 #### QueryInferences
 
@@ -271,6 +274,29 @@ you received in the previous response to get only new/updated records.
   "since_version": 1042
 }
 ```
+
+#### GetRecentContext
+
+Retrieve the most recently deduced **semantic topics** from the MiniLM-powered
+topic inference engine. This operation has no parameters.
+
+Every 5 minutes, WARP gathers all activities from the last 15-minute window,
+embeds each activity's descriptive text with a local **all-MiniLM-L6-v2** sentence
+transformer (384-dimensional embeddings via ONNX Runtime), matches each embedding
+to the nearest topic from ~50 pre-embedded candidate labels via cosine similarity,
+and selects the top 3 topics that collectively cover >= 90 % of activities.
+
+```json
+{
+  "op": "GetRecentContext"
+}
+```
+
+The response provides a snapshot of what the user is currently working on, based
+on genuine semantic understanding (not keyword matching). For example, a window
+title *"Reviewing John's changes to the auth module"* will match the topic *"Code
+review and pull request review"* even without any keyword overlap, because both
+occupy nearby points in the model's embedding space.
 
 ---
 
@@ -488,6 +514,44 @@ Each section has:
   again with `since_version` set to the highest `version` in the response.
 - All fields are always present in delta records (no field projection).
 
+### GetRecentContext Response
+
+```json
+{
+  "recent_context": {
+    "timestamp": 1750012345,
+    "activity_count": 47,
+    "coverage_pct": 93.6,
+    "topics": [
+      "C and C++ software development and programming",
+      "Source control and Git version management",
+      "Technical research and documentation reading"
+    ],
+    "history_count": 12,
+    "model": "all-MiniLM-L6-v2"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | `integer` | Unix epoch seconds (UTC) when this inference was produced. |
+| `activity_count` | `integer` | Total number of activities examined in the 15-minute window. |
+| `coverage_pct` | `number` | Percentage of activities covered by the top 3 topics (target >= 90 %). |
+| `topics` | `string[]` | Up to 3 semantic topic labels, ordered by coverage. Empty array if no activities or model not loaded. |
+| `history_count` | `integer` | Number of stored inference snapshots (max 288 = 24 hours at 5-min intervals). |
+| `model` | `string` | The embedding model used (`"all-MiniLM-L6-v2"`). |
+
+**Notes:**
+- If the MiniLM model was not loaded (missing model files), `topics` will be empty
+  and `activity_count` will be 0.
+- If no activities occurred in the 15-minute window, `topics` will contain
+  `["(no recent activity)"]`.
+- The inference runs every 5 minutes. Calling `GetRecentContext` between runs
+  returns the result from the most recent completed cycle.
+- Results are stored in memory (not persisted to disk). Restarting WARP clears
+  the history.
+
 ### Inference Record Fields
 
 | Field | Type | Description |
@@ -519,6 +583,7 @@ Each section has:
 | Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
 | `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
 | `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
+| `GetRecentContext` returns empty topics | The MiniLM model files are missing, or no activities occurred in the last 15 minutes, or WARP was just started and the first inference cycle hasn't completed yet. |
 | Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
 
 ### Checking if WARP is Available
@@ -674,6 +739,30 @@ Only records updated after version 1042 are returned. Repeat until `"deltas"` is
 empty. This is ideal for dashboard widgets or IDE extensions that need near-real-time
 insight without re-querying the full dataset.
 
+### 10. Semantic Context Awareness
+
+Understand what the user is currently working on to provide contextually relevant
+suggestions, search results, or UI adaptations:
+
+```json
+{"op": "GetRecentContext"}
+```
+
+The response tells you the user's top 3 semantic themes (e.g., *"C and C++ software
+development"*, *"Debugging and troubleshooting"*, *"Technical research and
+documentation reading"*). Use this to:
+
+- **Search ranking** -- boost results related to the user's current context.
+- **Smart suggestions** -- recommend tools, files, or actions relevant to the
+  detected activity theme.
+- **Dashboard widgets** -- show a "Currently working on" summary.
+- **Focus analytics** -- track topic distribution over time by polling every
+  5 minutes and logging the results.
+
+The topics are derived from a local MiniLM sentence-embedding model that genuinely
+understands meaning -- not keyword matching -- so they remain accurate even when
+activity descriptions use synonyms, paraphrases, or domain-specific jargon.
+
 ---
 
 ## Client Examples
@@ -710,6 +799,44 @@ int main()
     ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
 
     printf("Response (%lu bytes):\n%s\n", bytesRead, buffer);
+
+    CloseHandle(hPipe);
+    return 0;
+}
+```
+
+**GetRecentContext example (C++):**
+
+```cpp
+#include <windows.h>
+#include <cstdio>
+#include <cstring>
+
+int main()
+{
+    HANDLE hPipe = CreateFileW(
+        L"\\\\.\\.\\pipe\\WarpFileActivityAPI",
+        GENERIC_READ | GENERIC_WRITE,
+        0, nullptr, OPEN_EXISTING, 0, nullptr);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf("WARP is not running (error %lu)\n", GetLastError());
+        return 1;
+    }
+
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+
+    // Get current semantic context
+    const char* request = R"({"op":"GetRecentContext"})";
+    DWORD written = 0;
+    WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
+
+    char buffer[65536] = {};
+    DWORD bytesRead = 0;
+    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
+
+    printf("Current context:\n%s\n", buffer);
 
     CloseHandle(hPipe);
     return 0;
@@ -937,6 +1064,14 @@ data = query_warp({"window": "2h", "types": ["browsing"]})
 for e in data.get("browsing_activities", {}).get("events", []):
     print(f"  [{e['browser']}] {e['title']}")
 
+# --- Example: GetRecentContext (semantic topic understanding) ---
+context = query_warp({"op": "GetRecentContext"})
+rc = context.get("recent_context", {})
+print(f"\nCurrent context ({rc.get('activity_count', 0)} activities, "
+      f"{rc.get('coverage_pct', 0):.1f}% coverage):")
+for topic in rc.get("topics", []):
+    print(f"  - {topic}")
+
 # --- Example: QueryInferences for specific files ---
 inference = query_warp({
     "op": "QueryInferences",
@@ -1011,8 +1146,16 @@ $browse.browsing_activities.events |
     Select-Object timestamp, browser, title |
     Format-Table -AutoSize
 
+# GetRecentContext -- what is the user working on?
+$context = Query-Warp '{"op":"GetRecentContext"}'
+$rc = $context.recent_context
+Write-Host "`nCurrent context ($($rc.activity_count) activities, $($rc.coverage_pct)% coverage):"
+foreach ($topic in $rc.topics) {
+    Write-Host "  - $topic"
+}
+
 # QueryInferences for specific files
-$inf = Query-Warp '{"op":"QueryInferences","paths":["C:\\Users\\Alice\\Documents\\report.docx"],"fields":["recency_score","open_count_7d"]}'
+$inf = Query-Warp
 $inf.results.PSObject.Properties | ForEach-Object {
     Write-Host "$($_.Name): score=$($_.Value.recency_score), opens_7d=$($_.Value.open_count_7d)"
 }
@@ -1101,6 +1244,14 @@ function queryWarp(request) {
             for (const e of result.browsing_activities.events.slice(0, 5)) {
                 console.log(`  [${e.browser}] ${e.title}`);
             }
+        }
+
+        // GetRecentContext -- what is the user working on?
+        const context = await queryWarp({ op: 'GetRecentContext' });
+        const rc = context.recent_context || {};
+        console.log(`\nCurrent context (${rc.activity_count} activities, ${rc.coverage_pct}% coverage):`);
+        for (const topic of (rc.topics || [])) {
+            console.log(`  - ${topic}`);
         }
 
         // QueryInferences -- get recency scores for specific files
@@ -1199,6 +1350,20 @@ transfer and parsing overhead.
 ```json
 {"op": "GetInferenceDeltas", "since_version": 1042}
 ```
+
+### 10. Use `GetRecentContext` for Contextual Awareness
+
+Poll `GetRecentContext` periodically to adapt your application to what the user
+is currently working on. The inference runs every 5 minutes, so polling more
+frequently than that will return the same result.
+
+```json
+{"op": "GetRecentContext"}
+```
+
+The `coverage_pct` field indicates confidence -- values above 90 % mean the
+topics strongly represent recent activity. Lower values suggest the user is
+context-switching across many unrelated tasks.
 
 ---
 
@@ -1313,7 +1478,14 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 3.0.*
+*This documentation describes WARP API version 4.0.*
+
+*Changes from v3.0:*
+- *New `"op": "GetRecentContext"` request that returns the top 3 semantic topics
+  the user is currently working on, inferred by a local all-MiniLM-L6-v2 sentence-
+  embedding model via ONNX Runtime. The model embeds each activity's descriptive
+  text and matches it to the nearest topic candidate via cosine similarity.*
+- *All existing operations are unchanged and fully backward compatible.*
 
 *Changes from v2.0:*
 - *New `"op": "QueryInferences"` request for batch lookup of precomputed per-entity

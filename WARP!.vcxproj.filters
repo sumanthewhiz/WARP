@@ -51,6 +51,12 @@
     <ClInclude Include="InferenceEngine.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ForegroundMonitor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TopicInference.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WARP!.cpp">
@@ -78,6 +84,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="InferenceEngine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ForegroundMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TopicInference.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

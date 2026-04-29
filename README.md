@@ -33,6 +33,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps, access counts, and an exponential-decay recency score. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
+| **Semantic topic inference** | Every 5 minutes, all activities from the last 15-minute window are gathered, and a local **all-MiniLM-L6-v2** sentence-embedding model (run via ONNX Runtime) computes 384-dimensional vector embeddings for each activity's descriptive text. Each embedding is matched to the closest topic from ~50 pre-embedded candidate labels via cosine similarity. A greedy set-cover then selects the **top 3 semantic topics** that collectively explain ≥ 90 % of recent activities. Results are stored with timestamps and retrievable via the **Show Recent Context** button or the `GetRecentContext` API operation. |
 
 ---
 
@@ -86,6 +87,15 @@ WARP captures three categories of events:
                             |
                           SQLite
                        activity.db
+
+         +------------------------------------------+
+         | TopicInference .h/.cpp                    |
+         | (BertTokenizer.h + MiniLM ONNX model)     |
+         |   every 5 min: embed last 15 min of       |
+         |   activities → cosine match → top 3 topics|
+         +------------------------------------------+
+                        reads from
+                      ActivityDB + ONNX Runtime
 ```
 
 ### Component overview
@@ -376,6 +386,57 @@ Two query operations are exposed through the named pipe (see the
 Clearing the activity history (`ClearAll`) also clears the inference in-memory
 cache via `ClearCache()`.
 
+#### `TopicInference` (`TopicInference.h` / `TopicInference.cpp`)
+
+A semantic topic-deduction engine that uses a local **all-MiniLM-L6-v2**
+sentence-transformer model (via ONNX Runtime) to understand what the user has been
+working on.
+
+**Lifecycle:**
+
+1. `Init(modelsDir)` -- loads `vocab.txt` into the `BertTokenizer`, creates an ONNX
+   Runtime session for `minilm.onnx`, and pre-embeds ~50 candidate topic labels
+   (e.g. *"C and C++ software development and programming"*, *"Email reading and
+   writing correspondence"*, *"Debugging and troubleshooting software issues"*).
+2. `Start(db)` / `Stop()` -- manages a background timer thread.
+3. Every **5 minutes**, `DeduceTopics()` runs:
+   - Gathers all file, app launch, browsing, and focus activities from the last
+     **15 minutes** via `ActivityDatabase`.
+   - Composes a natural-language description for each activity (e.g.
+     *"Working in devenv.exe: WARP!.cpp - Visual Studio"*).
+   - Embeds each description into a **384-dimensional vector** using the MiniLM
+     model with mean pooling and L2 normalisation.
+   - Matches each activity embedding to the **nearest topic candidate** via cosine
+     similarity (dot product on normalised vectors).
+   - A **greedy set-cover** selects the top 3 topics that collectively cover
+     ≥ 90 % of activities.
+4. Results (`TopicResult`: timestamp, 3 topic strings, coverage %, activity count)
+   are stored in a rolling buffer (up to 288 entries = 24 hours).
+
+The `GetRecentContext()` method returns the latest result as JSON (see the
+[GetRecentContext API](#getrecentcontext) section below).
+
+Because the model computes **dense semantic embeddings**, it genuinely understands
+meaning: *"reviewing John's changes to the auth module"* matches *"Code review and
+pull request review"* even with zero keyword overlap -- both map to nearby points in
+the 384-dimensional semantic space.
+
+#### `BertTokenizer` (`BertTokenizer.h`)
+
+A header-only BERT WordPiece tokenizer implementation in C++. Loads `vocab.txt`
+(~30 000 tokens), then:
+
+1. **Basic tokenization** -- lowercases the input and splits on whitespace and
+   punctuation.
+2. **WordPiece sub-word tokenization** -- for each word, performs greedy
+   longest-match lookup against the vocabulary, using `##` prefixed sub-tokens for
+   continuation pieces.
+3. **Framing** -- wraps the token sequence with `[CLS]` ... `[SEP]` and pads to
+   the configured maximum sequence length (128 tokens).
+
+This is the same tokenizer algorithm used by the Hugging Face `transformers`
+library for BERT-family models.
+
 #### `QueryApi` (`QueryApi.h` / `QueryApi.cpp`)
 
 A named-pipe server listening on:
@@ -387,7 +448,7 @@ A named-pipe server listening on:
 The pipe is created with `PIPE_UNLIMITED_INSTANCES` so multiple clients can connect
 concurrently. Each client connection is served on a detached thread.
 
-The API accepts three kinds of requests:
+The API accepts four kinds of requests:
 
 1. **Event queries** — retrieve raw activity events for a time window, optionally
    filtered by event type via the `"types"` array. The response JSON is segregated
@@ -395,8 +456,11 @@ The API accepts three kinds of requests:
 2. **`QueryInferences`** — batch lookup of precomputed inference records.
 3. **`GetInferenceDeltas`** — incremental sync of inference records since a version
    watermark.
+4. **`GetRecentContext`** — retrieve the most recently deduced semantic topics from
+   the MiniLM topic inference engine.
 
-Inference operations are routed to the `InferenceEngine` instance; event queries
+Inference operations are routed to the `InferenceEngine` instance;
+`GetRecentContext` is routed to the `TopicInference` instance; event queries
 are handled by `BuildJsonResponse` which reads directly from `ActivityDatabase`.
 
 ---
@@ -442,7 +506,9 @@ immediately.
 |                                  [Show Top Inferences]     |
 | [Enter path or URL to look up...                ] [Lookup] |
 |                                                            |
-| API Response                                               |
+| [Show Recent Context]                                      |
+|                                                            |
+| API Response
 | +--------------------------------------------------------+ |
 | | {                                                      | |
 | |   "file_activities": { ... },                          | |
@@ -465,12 +531,29 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
 - Windows 10 SDK (10.0 or later)
 - C++14 standard
 
-The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`);
-no external dependencies are required.
+The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
+and uses **Microsoft.ML.OnnxRuntime** (NuGet, v1.22.0) for running the MiniLM
+semantic model.
 
-Open `WARP!.sln` in Visual Studio and build any configuration (Debug/Release x
-Win32/x64/ARM64). The output executable will request administrator privileges
-automatically via the linker's UAC manifest setting.
+**Steps:**
+
+1. Open `WARP!.sln` in Visual Studio 2022.
+2. NuGet restore will automatically fetch `Microsoft.ML.OnnxRuntime` into the
+   `packages/` directory.
+3. Download the MiniLM model files into the `models/` directory:
+   - `minilm.onnx` (~86 MB) from
+     [Hugging Face](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx)
+   - `vocab.txt` (~220 KB) from
+     [Hugging Face](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt)
+4. Build any configuration (Debug/Release × Win32/x64/ARM64).
+
+The build will automatically:
+- Copy `onnxruntime.dll` to the output directory.
+- Copy `models/minilm.onnx` and `models/vocab.txt` to `$(OutDir)models/` if they
+  exist in the project directory.
+
+At runtime, the app looks for the `models/` directory next to the executable first,
+then falls back to `%LOCALAPPDATA%\WARP\models`.
 
 ---
 
@@ -488,13 +571,18 @@ automatically via the linker's UAC manifest setting.
 9. The inference engine is initialized with direct access to the SQLite database.
    Rolling window counts are recomputed from the raw event tables.
 10. The named-pipe server starts accepting connections.
-11. Every detected event (file, app launch, app focus, or browsing) is inserted into
+11. The topic inference engine loads the MiniLM ONNX model and vocabulary, pre-embeds
+    ~50 topic candidate labels, and begins its 5-minute inference cycle.
+12. Every detected event (file, app launch, app focus, or browsing) is inserted into
     the appropriate database table **and** fed to the inference engine, which
     incrementally updates per-entity scores in real time.
-12. Every 6 hours, records older than 30 days are purged from all event tables and
+13. Every 5 minutes, the topic inference engine gathers all activities from the last
+    15 minutes, embeds each with MiniLM, matches to the nearest semantic topic, and
+    stores the top 3 topics with a coverage percentage.
+14. Every 6 hours, records older than 30 days are purged from all event tables and
     inference rolling counts are recomputed.
-13. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
-13. Right-clicking the tray icon shows **Open** / **Exit**. *Open* shows the window maximized; *Exit* tears everything down cleanly.
+15. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
+16. Right-clicking the tray icon shows **Open** / **Exit**.
 14. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
 15. The "Explore Precomputed Inferences" section can be used to browse the top entities by recency score (filtered by entity type) or look up the inference record for a specific file path, app path, or URL.
 16. Clearing activity history also clears the inference engine's in-memory cache.
@@ -657,6 +745,45 @@ Returns up to 5 000 records per call, ordered by ascending `version`.
   ]
 }
 ```
+
+##### GetRecentContext
+
+Retrieve the most recently deduced semantic topics from the MiniLM-powered topic
+inference engine. No parameters are required.
+
+```json
+{
+  "op": "GetRecentContext"
+}
+```
+
+**Response:**
+
+```json
+{
+  "recent_context": {
+    "timestamp": 1750012345,
+    "activity_count": 47,
+    "coverage_pct": 93.6,
+    "topics": [
+      "C and C++ software development and programming",
+      "Source control and Git version management",
+      "Technical research and documentation reading"
+    ],
+    "history_count": 12,
+    "model": "all-MiniLM-L6-v2"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | `integer` | When this inference was produced (Unix epoch seconds). |
+| `activity_count` | `integer` | Total activities examined in the 15-minute window. |
+| `coverage_pct` | `number` | Percentage of activities covered by the top 3 topics. |
+| `topics` | `string[]` | Up to 3 semantic topic labels, ordered by coverage. |
+| `history_count` | `integer` | Number of stored inference snapshots (max 288 = 24 h). |
+| `model` | `string` | The embedding model used (`"all-MiniLM-L6-v2"`). |
 
 ##### Inference record fields
 
@@ -991,6 +1118,14 @@ WARP!\
 |-- QueryApi.cpp                Pipe server and JSON serialization impl
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
 |-- InferenceEngine.cpp         Real-time scoring, QueryInferences & GetInferenceDeltas impl
+|-- TopicInference.h            Semantic topic inference interface (MiniLM embedding pipeline)
+|-- TopicInference.cpp          ONNX Runtime model loading, embedding, topic deduction impl
+|-- BertTokenizer.h             Header-only BERT WordPiece tokenizer for MiniLM
+|
+|-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime)
+|-- models/                     MiniLM model files (not checked in — see Building)
+|   |-- minilm.onnx             all-MiniLM-L6-v2 ONNX model (~86 MB)
+|   +-- vocab.txt               BERT WordPiece vocabulary (~220 KB)
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)
 +-- sqlite3.h                   SQLite public header
