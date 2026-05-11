@@ -581,6 +581,21 @@ void FileMonitor::SetCallback(FileActivityCallback cb)
 
 std::vector<std::wstring> FileMonitor::GetDriveRoots()
 {
+    // -------------------------------------------------------------------
+    // RDCW (ReadDirectoryChangesW) policy:
+    //   * Fixed drives (DRIVE_FIXED): SKIP. The Microsoft-Windows-Kernel-File
+    //     ETW provider already gives us every Create/Write/Delete/Rename
+    //     event on every NTFS volume and gives us the source PID. Running
+    //     RDCW recursively on C:\ and the like was the dominant source of
+    //     duplicate events (RDCW + ETW + shell notifications would all
+    //     fire for the same write) AND a major battery/CPU regressor.
+    //   * Removable drives (DRIVE_REMOVABLE) and network mounts
+    //     (DRIVE_REMOTE): KEEP. ETW for removable USB volumes can be
+    //     spotty (the kernel-file provider may or may not fire on
+    //     hot-plugged FAT32 volumes depending on the FS filter stack), and
+    //     network redirector traffic does not always surface with a usable
+    //     device-path mapping. RDCW remains the safety net for those.
+    // -------------------------------------------------------------------
     std::vector<std::wstring> roots;
     DWORD drives = GetLogicalDrives();
     for (int i = 0; i < 26; ++i)
@@ -589,7 +604,7 @@ std::vector<std::wstring> FileMonitor::GetDriveRoots()
         {
             wchar_t root[4] = { static_cast<wchar_t>(L'A' + i), L':', L'\\', L'\0' };
             UINT type = GetDriveTypeW(root);
-            if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_REMOTE)
+            if (type == DRIVE_REMOVABLE || type == DRIVE_REMOTE)
             {
                 roots.push_back(root);
             }
