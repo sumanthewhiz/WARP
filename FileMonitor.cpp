@@ -223,6 +223,38 @@ bool ShouldExclude(const std::wstring& path)
     std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
 
     // =====================================================================
+    // 0. AppData allowlist -- re-admit user-meaningful files that live
+    //    under AppData and would otherwise be lost to the blanket
+    //    \appdata\ exclusion below. These represent first-class user
+    //    documents (OneNote notebooks, Sticky Notes, VS auto-recovered
+    //    files, draft Word docs) that happen to live under a system
+    //    profile directory by application convention.
+    //
+    //    Order matters: we check this BEFORE any goop pattern fires,
+    //    so anything matching here bypasses the rest of ShouldExclude.
+    // =====================================================================
+    static const wchar_t* const appdataAllowlist[] = {
+        // OneNote -- notebook section files (.one, .onetoc2 cache)
+        L"\\microsoft\\onenote\\",
+        // Outlook -- mail stores (PST/OST). Already noisy but they're the
+        // canonical "user opened mail" signal so we admit and let the
+        // file-extension filter and per-PID burst limit cap volume.
+        L"\\microsoft\\outlook\\",
+        // Sticky Notes (legacy desktop and modern Plumsail)
+        L"\\microsoft\\sticky notes\\",
+        L"\\microsoft\\windows\\stickynotes\\",
+        // Visual Studio recoverable backups (an "edited and never saved"
+        // file lives here until close)
+        L"\\microsoft\\visualstudio\\",
+        // Office unsaved drafts (Word/Excel/PPT AutoRecover destination)
+        L"\\microsoft\\office\\unsavedfiles\\",
+        // Notepad++ session backups
+        L"\\notepad++\\backup\\",
+    };
+    for (const auto* w : appdataAllowlist)
+        if (lp.find(w) != std::wstring::npos) return false;
+
+    // =====================================================================
     // 1. Directory-substring matching (goop Categories 1-9)
     //    Any path containing one of these substrings is excluded.
     //    Patterns use trailing backslash so they match files *inside* the dir.
@@ -322,6 +354,73 @@ bool ShouldExclude(const std::wstring& path)
         L"\\~snapshot\\",
         L"\\servicing\\",
         L"\\winsxs\\",
+
+        // --- Extension goop (added 2025) ---
+        // Modern build caches not on the original list
+        L"\\.gradle\\caches\\",
+        L"\\.gradle\\daemon\\",
+        L"\\.gradle\\native\\",
+        L"\\.cargo\\registry\\",
+        L"\\.cargo\\git\\",
+        L"\\.rustup\\toolchains\\",
+        L"\\.nuget\\packages\\",
+        L"\\.npm\\_cacache\\",
+        L"\\.yarn\\cache\\",
+        L"\\.pnpm-store\\",
+        L"\\.bazel\\",
+        L"\\bazel-out\\",
+        L"\\bazel-bin\\",
+        L"\\bazel-testlogs\\",
+        L"\\.ccache\\",
+        L"\\.dotnet\\",
+        L"\\.gradle-cache\\",
+        L"\\.vagrant\\",
+        L"\\.terraform\\",
+        L"\\.pulumi\\",
+
+        // IDE caches
+        L"\\.idea\\caches\\",
+        L"\\.idea\\shelf\\",
+        L"\\.idea\\workspace\\",
+        L"\\jetbrains\\",
+        L"\\.vscode-server\\",
+        L"\\.vscode\\extensions\\",
+        L"\\.cursor\\",
+
+        // VCS internals (the dot-prefix loop catches \.git\ etc, but
+        // these are noisy enough to call out explicitly)
+        L"\\.git\\objects\\",
+        L"\\.git\\refs\\",
+        L"\\.git\\logs\\",
+        L"\\.git\\index",
+        L"\\.git\\head",
+        L"\\.git\\packed-refs",
+
+        // Container / VM I/O -- the host sees enormous overlay activity
+        L"\\docker\\containers\\",
+        L"\\docker\\overlay2\\",
+        L"\\docker\\image\\",
+        L"\\docker\\volumes\\",
+        L"\\.docker\\desktop\\",
+        L"\\hyper-v\\",
+        L"\\virtualization\\",
+        L"\\rootfs\\",                  // WSL distro root
+        L"\\wsl$\\",                    // WSL UNC path inside an NT path
+        L"\\wsl.localhost\\",
+        L"\\appcontainerprofiles\\",
+
+        // Cloud sync clients (high-volume background reconciliation)
+        L"\\onedrive\\.849c9593-d756-4e56-8d6e-42412f2a707b\\", // staging
+        L"\\onedrive\\setup\\",
+        L"\\onedrive\\filecoauth\\",
+        L"\\onedrivetemp\\",
+        L"\\dropbox\\.dropbox.cache\\",
+        L"\\dropbox\\config\\",
+        L"\\dropbox\\instance",
+        L"\\google\\drive\\",
+        L"\\googledriveFS\\",
+        L"\\box\\",                     // matches Box.com sync directory
+        L"\\sharepoint\\",
     };
 
     for (const auto* dir : goopDirs)
@@ -494,6 +593,19 @@ bool ShouldExclude(const std::wstring& path)
         L".diagcab", L".diagpkg",
         L".manifest",
         L".pol",
+        // VM / container disk images -- enormous, opaque, never user-meaningful
+        L".vhd", L".vhdx", L".vmdk", L".vdi", L".qcow2",
+        L".iso", L".img",
+        // Build / cache artifacts not yet listed
+        L".o", L".a", L".lib", L".so", L".dylib",
+        L".class", L".pyc", L".pyo",
+        L".rlib", L".rmeta",       // Rust artifacts
+        L".gch",                   // GCC precompiled header
+        L".d",                     // make-dep file
+        L".map",                   // linker map
+        L".swo", L".swp",          // Vim swap
+        // ETW / profiler outputs
+        L".btr", L".vsp", L".vspx",
     };
 
     size_t dotPos = lp.rfind(L'.');
