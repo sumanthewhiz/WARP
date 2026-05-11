@@ -21,17 +21,17 @@ long as the PC is actively being used.
 | **Modern themed UI** | Dark-on-light default theme with Segoe UI / Cascadia Mono fonts, owner-drawn buttons with rounded corners and accent borders, and a one-click **Dark Mode / Light Mode** toggle in the top-right corner. |
 | **Built-in API test panel** | 9 predefined time-window buttons, a custom-seconds input field, and a default-query button -- all wired to the named-pipe API. Responses are pretty-printed as indented JSON in a scrollable monospace area. |
 | **Event type filter checkboxes** | Four checkboxes (**File Activity**, **App Launches**, **App Focus**, **Browsing Activity**) control which event types are included in query results. All are checked by default. |
-| **Idle / sleep awareness** | Monitoring pauses automatically when the PC has been idle for >= 2 minutes or enters sleep/hibernate, and resumes the moment user input is detected or the PC wakes. |
-| **File-system monitoring** | Every fixed, removable, and network drive is watched recursively via `ReadDirectoryChangesW`. All paths are filtered through a comprehensive **goop exclusion list** (10 categories, 100+ patterns) derived from the *Intelligent Global File Searchability* spec to discard system-managed, application-internal, and transient file activity. |
+| **Two-tier idle / sleep awareness** | A *soft* threshold (default 2 min) downgrades event confidence; a *hard* threshold (default 5 min) pauses monitoring outright. Sleep / hibernate transitions trigger an immediate hard pause. On wake (and for 5 s after), `EventContext::SetWakeBoundary()` multiplies the producer's confidence by 0.2 to attenuate the burst of background I/O that follows resume. |
+| **File-system monitoring** | Removable and network drives are watched recursively via `ReadDirectoryChangesW`. **Fixed drives no longer use RDCW** — they are covered exclusively by the ETW path (below) to eliminate the duplicate-event firehose that user-mode RDCW produced for system / cache / build directories. All paths are filtered through a comprehensive **goop exclusion list** (12 categories, 130+ patterns including Docker / WSL / OneDrive / Dropbox) and an explicit **AppData re-admit allowlist** (OneNote, Outlook, Sticky Notes, Visual Studio, Office UnsavedFiles, Notepad++ backup) that is checked *before* goop matching so genuine user files inside `\AppData\` survive. |
 | **Shell-level monitoring** | `SHChangeNotifyRegister` on the entire shell namespace catches higher-level operations (copy, move, shell renames) that pure file-system notifications may miss. The same goop path exclusion is applied. |
-| **ETW file-open monitoring** | An NT Kernel Logger ETW trace captures every `NtCreateFile`/`NtOpenFile` call. Events are filtered to **user-initiated processes only** via session-ID checks and a 53-entry noisy-process blocklist, then passed through the goop path filter. |
-| **App launch monitoring** | New process launches are detected by polling the process table every 2 seconds. A three-layer filter ensures only **user-initiated** launches are recorded: (1) 65+ entry exe-name blocklist, (2) system-directory path check, (3) parent-process heuristic (rejects children of `services.exe`/`svchost.exe`). |
-| **Browsing activity monitoring** | The foreground window is polled every 3 seconds. When a recognized browser is active, the page title (and URL if present) is captured and deduplicated. |
-| **Foreground app monitoring** | The foreground window is polled every 3 seconds for *all* user applications (not just browsers). When the foreground app changes, the previous session's exe name, exe path, window title, and dwell time (in seconds) are recorded. System/shell processes are excluded via a 35+ entry blocklist. |
-| **SQLite storage** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across four tables. |
-| **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. Rolling window counts (`open_count_7d`, `open_count_30d`) in the inference engine are also recomputed on this schedule. |
+| **ETW file monitoring (private session)** | A dedicated `WARP-FileTrace` private ETW session attaches to the manifested **Microsoft-Windows-Kernel-File** provider (no longer the shared NT Kernel Logger), so WARP cannot be starved by another consumer turning the global session off. Each event is enriched with the multi-signal `SystemProcessClassifier` (parent ancestry, image path, Authenticode subject, session, integrity, name pattern) and a per-PID **token bucket** (64 tokens / sec) — events that drain the bucket are downgraded to confidence 0.1 instead of being recorded as full-weight user activity. |
+| **App launch monitoring (ETW + window correlation)** | New process launches arrive on a `WARP-ProcessTrace` private session attached to **Microsoft-Windows-Kernel-Process** (the 2 s polling loop is gone). Every PID is parked with `LaunchCorrelator`, which uses a `SetWinEventHook(EVENT_OBJECT_CREATE)` to wait up to 5 s for the launched process to create its first top-level visible window. Headless launches (services, COM surrogates, scheduled tasks, build steps) miss the window deadline and are emitted with confidence 0.3 — visible launches get confidence 1.0 and a `created_window_ms` value. The same `SystemProcessClassifier` runs in parallel as a redundant veto. |
+| **Browsing activity monitoring** | The foreground window is no longer polled. `BrowsingMonitor` subscribes to `ForegroundChangeBroker`; when focus enters a recognised browser, a scoped per-PID `SetWinEventHook(EVENT_OBJECT_NAMECHANGE, …, pid, threadId, …)` is installed that fires on the actual title-bar update. URLs are extracted by `UrlExtractor` (UIA, MTA worker thread, bounded queue) so a hung browser process cannot block the message pump. |
+| **Foreground app monitoring (event-driven)** | A single global `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` lives in `ForegroundChangeBroker` and fans out to every interested monitor. The 1 Hz `GetForegroundWindow()` poll is removed. When focus changes, the previous session's exe name, exe path, window title, and dwell time (seconds) are recorded; system / shell processes are excluded via the same `SystemProcessClassifier`. |
+| **SQLite storage with EventContext** | All events are persisted in `%LOCALAPPDATA%\WARP\activity.db` using WAL mode across four tables. Every row carries a uniform **EventContext** payload — `source_pid`, `source_exe`, `foreground_pid`, `foreground_exe`, `ms_since_input`, `parent_pid`, `parent_exe`, `created_window_ms`, and `confidence` (REAL, default 1.0) — so downstream consumers can filter or weight events by the producer's user-intent estimate. Migration is idempotent (`ALTER TABLE … ADD COLUMN`); upgrading from an older WARP install does not require a fresh DB. |
+| **30-day rolling eviction** | Records older than 30 days are deleted on startup and every 6 hours thereafter from all tables. Rolling window counts (`open_count_7d`, `open_count_30d`) in the inference engine are also recomputed on this schedule as `SUM(COALESCE(confidence, 1.0))` so noisy events contribute proportionally less to popularity ranking. |
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
-| **Inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps, access counts, and an exponential-decay recency score. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
+| **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
 | **Semantic topic inference** | Every 5 minutes, all activities from the last 15-minute window are gathered, and a local **all-MiniLM-L6-v2** sentence-embedding model (run via ONNX Runtime) computes 384-dimensional vector embeddings for each activity's descriptive text. Each embedding is matched to the closest topic from ~50 pre-embedded candidate labels via cosine similarity. A greedy set-cover then selects the **top 3 semantic topics** that collectively explain ≥ 90 % of recent activities. Results are stored with timestamps and retrievable via the **Show Recent Context** button or the `GetRecentContext` API operation. |
 
@@ -43,59 +43,72 @@ WARP captures three categories of events:
 
 | Event Type | Description | Source |
 |---|---|---|
-| **File Activity** | User-initiated file/folder creates, opens, modifications, deletes, renames. System/goop paths excluded. | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
-| **App Launch** | User-initiated application launches only (exe name, path, PID). System processes filtered by name, path, and parent. | Process table polling via `CreateToolhelp32Snapshot` |
-| **App Focus** | Foreground application sessions with window title and dwell time (seconds). System/shell processes excluded. | Foreground window polling via `GetForegroundWindow` + `GetWindowText` |
-| **Browsing Activity** | Browser page title changes (browser name, page title, URL) | Foreground window title polling via `GetForegroundWindow` + `GetWindowText` |
+| **File Activity** | User-initiated file/folder creates, opens, modifications, deletes, renames. System/goop paths excluded; per-PID classifier and token-bucket downgrade noisy producers. | ETW `Microsoft-Windows-Kernel-File` (private session) for fixed drives; `ReadDirectoryChangesW` for removable / network; `SHChangeNotifyRegister` |
+| **App Launch** | Process creation events correlated against the appearance of a top-level visible window (5 s deadline). Headless launches downgraded to confidence 0.3. | ETW `Microsoft-Windows-Kernel-Process` (private session) + `LaunchCorrelator` (`SetWinEventHook(EVENT_OBJECT_CREATE)`) |
+| **App Focus** | Foreground application sessions with window title and dwell time (seconds). System/shell processes excluded by `SystemProcessClassifier`. | `ForegroundChangeBroker` (single global `EVENT_SYSTEM_FOREGROUND` hook) |
+| **Browsing Activity** | Browser page title changes (browser name, page title, URL). URL extracted via UI Automation, not parsed from the title bar. | `ForegroundChangeBroker` + scoped per-PID `EVENT_OBJECT_NAMECHANGE` hook + `UrlExtractor` (UIA on MTA worker thread) |
 
 ---
 
 ## Architecture
 
 ```
-+-----------------------------------------------------------------------+
-|                            WARP!.cpp                                  |
-|                        (Win32 entry point)                            |
-|  +-----------+ +---------+ +----------+ +----------+ +-----------+   |
-|  |FileMonitor| |AppLaunch| |Browsing  | |Foreground| | QueryApi  |   |
-|  | .h/.cpp   | |Monitor  | |Monitor   | |Monitor   | | .h/.cpp   |   |
-|  |           | |.h/.cpp  | |.h/.cpp   | |.h/.cpp   | |           |   |
-|  +-----+-----+ +----+----+ +----+-----+ +----+-----+ +-----+-----+  |
-|        |             |           |            |             |         |
-|        | callback    | callback  | callback   | callback    |         |
-|        +------------>+---------->+----------->+------------>|         |
-|        |             |           |            |             |         |
-|  +-----------+                                        +-----+-----+  |
-|  |IdleDetect |  pause / resume all four monitors      |           |  |
-|  |or .h/.cpp |--------------------------------------->| read      |  |
-|  +-----------+                                        |<--------->|  |
-+--------+-----+-------+-----+-----+------+------+------+-----------+--+
-         |     |       |     |     |      |      |            |
-   ReadDirectory   Toolhelp32   GetForeground  GetForeground  Named Pipe
-   ChangesW /      Snapshot     Window +       Window +       \\.\pipe\
-   SHChangeNotify               GetWindowText  GetWindowText  WarpFileActivityAPI
-   / ETW                        (browsers)     (all apps)
-                   +------------------+
-                   | InferenceEngine  |  <-- updated per event
-                   | .h/.cpp          |      (recency scores,
-                   +--------+---------+       access counts)
-                            |
-                   +--------+---------+
-                   |  ActivityDB      |
-                   |  .h/.cpp         |
-                   +--------+---------+
-                            |
-                          SQLite
-                       activity.db
++----------------------------------------------------------------------------+
+|                              WARP!.cpp                                     |
+|                        (Win32 entry point + UI)                            |
++----------------------------------------------------------------------------+
 
-         +------------------------------------------+
-         | TopicInference .h/.cpp                    |
-         | (BertTokenizer.h + MiniLM ONNX model)     |
-         |   every 5 min: embed last 15 min of       |
-         |   activities → cosine match → top 3 topics|
-         +------------------------------------------+
-                        reads from
-                      ActivityDB + ONNX Runtime
+  Producers (run on dedicated threads / ETW callbacks)
+  ----------------------------------------------------
+   FileMonitor        AppLaunchMonitor   BrowsingMonitor    ForegroundMonitor
+   --------------     ---------------    ---------------    -----------------
+   ETW Kernel-File    ETW Kernel-Process broker subscriber  broker subscriber
+   (private session,  (private session)  + per-PID NAME-    (event-driven)
+    fixed drives)     + LaunchCorrelator CHANGE hook
+   RDChangesW         (window-create     + UrlExtractor
+   (rm / net only)     hook, 5s window)   (UIA, MTA worker
+   SHChangeNotify                          thread, bounded
+                                           queue)
+
+   Each producer emits an event + a populated EventContext:
+     {sourcePid, sourceExe, foregroundPid, foregroundExe,
+      msSinceInput, parentPid, parentExe, createdWindowMs, confidence}
+
+  Cross-cutting infrastructure
+  ----------------------------
+   ForegroundChangeBroker     SystemProcessClassifier   IdleDetector
+   ----------------------     -----------------------   ------------
+   single global              multi-signal voting:      two-tier:
+   EVENT_SYSTEM_FOREGROUND    parent ancestry,          soft -> attenuate
+   hook fans out to           image path,                       confidence
+   subscribers                Authenticode subject,     hard -> pause
+                              session, integrity,       monitors
+                              name pattern              + wake boundary
+                                                        (5s, x0.2 conf)
+
+  Storage + analytics
+  -------------------
+   InferenceEngine -> ActivityDatabase -> SQLite (activity.db)
+   ---------------    -----------------    ---------------------
+   counters +=        4 activity tables    %LOCALAPPDATA%\WARP\
+   confidence         + uniform Event-     activity.db (WAL mode)
+   recency =          Context columns
+   e^(-Δt/τ) + ...    + inference table
+
+  Query surface
+  -------------
+   QueryApi -> Named pipe \\.\pipe\WarpFileActivityAPI
+   --------    -----------------------------------------
+   serves event queries, QueryInferences, GetInferenceDeltas,
+   and GetRecentContext
+
+  Semantic layer (independent)
+  ----------------------------
+   TopicInference (BertTokenizer + MiniLM ONNX)
+   ---------------------------------------------
+   every 5 min: embed last 15 min of activities -> cosine match
+   against ~50 pre-embedded topic labels -> greedy set-cover for
+   top 3 topics covering >= 90% of activities
 ```
 
 ### Component overview
@@ -145,32 +158,40 @@ tray menu terminates the process.
 
 #### `FileMonitor` (`FileMonitor.h` / `FileMonitor.cpp`)
 
-Spawns one background thread per logical drive (fixed, removable, or network) that
-calls `ReadDirectoryChangesW` in overlapped mode with recursive watching. A
-separate thread registers for shell change notifications via
-`SHChangeNotifyRegister` on the desktop namespace root to capture shell-level
-events. An additional thread runs an NT Kernel Logger ETW trace to capture
-file-open events from interactive user processes.
+Composite file-activity producer that reconciles three sources:
+
+1. **ETW (`Microsoft-Windows-Kernel-File`, private session)** — owns *fixed*
+   drives. The monitor opens its own `WARP-FileTrace` private session via
+   `StartTraceW` + `EnableTraceEx2` so a misbehaving global consumer cannot
+   starve it (older WARP shared the NT Kernel Logger, which any other tool
+   could disable). Each event arrives on the consumer thread, is enriched
+   with an `EventContext` (source/foreground/parent IDs, `ms_since_input`,
+   `confidence`), then run through `SystemProcessClassifier` (cached
+   per-PID) and a per-PID **token bucket** of 64 tokens / sec. Events that
+   classify as system are dropped; events that drain the bucket are
+   downgraded to confidence 0.1 instead of being dropped — so a real burst
+   of user saves (e.g. a build finishing) still survives, just at lower
+   weight.
+2. **`ReadDirectoryChangesW`** — kept *only* for removable and network
+   drives. The previous design ran RDCW on every fixed drive too, which
+   double-counted every event with the ETW path and forced WARP to do all
+   filtering in user mode. Fixed-drive RDCW is now removed.
+3. **`SHChangeNotifyRegister`** — kept for shell-level operations (copy,
+   move, shell renames) that the file-system layer alone cannot
+   reconstruct.
 
 Detected actions: **CREATE**, **OPEN**, **DELETE**, **MODIFY**, **RENAME**.
 
-**User-only filtering (ETW path):**
+**Goop folder exclusion + AppData allowlist (all three paths):**
 
-The ETW callback filters every file-open event through `IsUserProcess()`, which:
-- Rejects PIDs 0 and 4 (System Idle / System kernel).
-- Rejects session-0 processes (all Windows services).
-- Rejects 53 known noisy user-session system processes (search indexer, Defender,
-  shell infrastructure, update agents, telemetry, OneDrive sync, etc.).
-- Rejects any PID it cannot open (`PROCESS_QUERY_LIMITED_INFORMATION`).
-
-Results are cached per-PID and refreshed every 60 seconds.
-
-**Goop folder exclusion (all three paths):**
-
-Every file path from all three sources (ReadDirectoryChangesW, shell notifications,
-and ETW) is passed through `ShouldExclude()`, a comprehensive goop filter derived
-from the *Intelligent Global File Searchability* spec (Section 3A). The filter
-implements 10 goop categories:
+Every file path from all three sources is passed through `ShouldExclude()`,
+which now (a) applies an explicit **AppData re-admit allowlist** *before*
+goop matching so genuine user files inside `\AppData\` survive, then
+(b) runs the goop filter. The allowlist covers OneNote (`OneNote\\…\.one`),
+Outlook OST/PST under `\AppData\Local\Microsoft\Outlook\`, Sticky Notes
+(`Microsoft.MicrosoftStickyNotes_*\…`), Visual Studio user settings,
+Office UnsavedFiles, and Notepad++ backup. The goop filter itself
+implements 12 categories:
 
 | Category | Examples |
 |---|---|
@@ -184,6 +205,8 @@ implements 10 goop categories:
 | **8. App caches by name pattern** | `\Cache\`, `\CacheStorage\`, `\Code Cache\`, `\GPUCache\`, `\DawnCache\`, `\GrShaderCache\`, `\ShaderCache\`, `\Crash Reports\`, `\CrashDumps\`, `\Crashpad\`, `\blob_storage\`, `\IndexedDB\`, `\Local Storage\`, `\Session Storage\`, `\Service Worker\`, `\WebStorage\`, `\databases\`, `\Logs\`, `\Log\`, `\Temp\`, `\Tmp\` |
 | **9. OS upgrade/recovery** | `\Windows.old\`, `\OneDriveTemp\`, `\inetpub\` |
 | **10. NTFS metadata** | `$MFT`, `$MFTMirr`, `$LogFile`, `$Bitmap`, `$Boot`, `$BadClus`, `$Secure`, `$UpCase`, `$AttrDef`, `$Extend` |
+| **11. Container / WSL backing stores** | `\docker-desktop-data\`, `\wsl\…\ext4.vhdx`, `\Hyper-V\Virtual Machines\`, `\Containers\BaseImages\` |
+| **12. Cloud-sync staging dirs** | `\OneDrive\…\.849C9593-…`, `\Dropbox\.dropbox.cache\`, `\Box\…\.box\`, `\Google\DriveFS\`, `\iCloudDrive\…\.icloud` |
 
 Additional file-level exclusions: 49+ file extensions (`.exe`, `.dll`, `.sys`,
 `.tmp`, `.log`, `.pdb`, `.dat`, etc.), system filenames (`pagefile.sys`,
@@ -194,72 +217,81 @@ temp-file prefixes (`~...`).
 > browsing monitors are not affected by these path filters.
 
 The monitor exposes `Pause()` / `Resume()` methods that the idle detector calls to
-suspend event recording when the PC is inactive.
+suspend event recording when the PC is hard-idle.
 
 #### `AppLaunchMonitor` (`AppLaunchMonitor.h` / `AppLaunchMonitor.cpp`)
 
-A polling thread that takes a snapshot of all running processes every 2 seconds via
-`CreateToolhelp32Snapshot`. New PIDs that were not present in the previous snapshot
-are classified as newly launched applications.
+Subscribes to the **Microsoft-Windows-Kernel-Process** ETW provider via a
+private `WARP-ProcessTrace` session, so every process create event is
+delivered the moment the kernel emits it (no more 2 s `CreateToolhelp32Snapshot`
+poll, which raced against short-lived processes that started and exited
+between samples).
 
-A three-layer filter ensures only user-initiated launches are recorded:
+For each new PID the monitor:
 
-1. **Session 0 excluded** -- all Windows services run in session 0; only interactive
-   sessions (>= 1) are reported.
-2. **System process blocklist** (`IsSystemProcess`) -- 65+ known system/noise
-   process names organized by category:
-   - Core OS (`svchost`, `csrss`, `lsass`, `services`, `winlogon`, …)
-   - Shell infrastructure (`dwm`, `explorer`, `RuntimeBroker`, `sihost`,
-     `ShellExperienceHost`, `StartMenuExperienceHost`, …)
-   - Search / Indexer (`SearchIndexer`, `SearchHost`, …)
-   - Security (`MsMpEng`, `SmartScreen`, `SgrmBroker`, …)
-   - Windows Update (`TrustedInstaller`, `TiWorker`, `UsoClient`, `msiexec`, …)
-   - Telemetry (`CompatTelRunner`, `DiagTrack`, `DeviceCensus`, …)
-   - UWP / Widgets / Xbox (`Widgets`, `GameBar`, `PhoneExperienceHost`, …)
-   - .NET runtime hosts (`ngen`, `mscorsvw`, `wsappx`, …)
-   - Misc (`consent`, `cmd`, `powershell`, `pwsh`, `WerFault`, …)
-   - Self (`warp!.exe`)
-3. **System-directory path check** (`IsSystemExePath`) -- rejects processes running
-   from `\Windows\System32\`, `\SysWOW64\`, `\SystemApps\`,
-   `\ImmersiveControlPanel\`, `\WinSxS\`, `\Servicing\`, `\Security\`, or
-   `\Windows\Temp\`.
-4. **Parent-process heuristic** (`IsSpawnedByServiceHost`) -- rejects processes
-   whose parent is `services.exe`, `svchost.exe`, or PID 0/4 (System kernel).
+1. Builds an `EventContext` from the source/parent metadata that the ETW
+   record carries directly — no separate `OpenProcess` round trip needed.
+2. Hands the PID to `LaunchCorrelator`, which "parks" it for up to 5 s
+   while listening on `SetWinEventHook(EVENT_OBJECT_CREATE)` for the
+   process's first top-level visible window. If a window appears the
+   launch is emitted with `created_window_ms` populated and confidence
+   1.0; if the deadline expires the launch is still emitted but with
+   confidence 0.3 so headless launches (services, COM surrogates,
+   scheduled-task workers, build-step children) ride at a fraction of
+   the weight of user-visible launches instead of contaminating the
+   "what apps did the user run" picture.
+3. Runs the same `SystemProcessClassifier` used by `FileMonitor` as a
+   redundant veto so well-known service ancestries are dropped even
+   if they momentarily race a window onto the screen.
 
-A new process must pass all four layers to be reported as a user-initiated launch.
-Each detected launch reports the executable name, full path, and PID.
+Every detected launch reports the executable name, full path, PID, and
+the populated `EventContext`.
 
 #### `BrowsingMonitor` (`BrowsingMonitor.h` / `BrowsingMonitor.cpp`)
 
-A polling thread that checks the foreground window every 3 seconds. When the
-foreground process matches a recognized browser, the window title is captured.
+Subscribes to `ForegroundChangeBroker`. When the foreground process is a
+recognised browser, the monitor installs a **scoped** per-PID
+`SetWinEventHook(EVENT_OBJECT_NAMECHANGE, …, pid, threadId, …)` so it
+fires only when *that browser's* title bar updates — and tears the hook
+down the moment focus leaves. This avoids the global NAMECHANGE
+firehose (every IME composition, status-bar tick, and tooltip change in
+the system) that a process-agnostic hook would deliver.
 
-Supported browsers: **Chrome**, **Edge**, **Firefox**, **Brave**, **Opera**,
-**Vivaldi**, **Internet Explorer**.
+URLs are not parsed from the title bar (which is unreliable and locale-
+dependent). Instead the monitor enqueues a request to `UrlExtractor`,
+which uses **UI Automation** on a dedicated MTA worker thread to read
+the actual address-bar `Value` property out of the browser. Because
+UIA crosses process boundaries (and a hung browser can hang any UIA
+caller), the extractor uses a bounded queue (32 entries; oldest dropped
+on overflow) so the foreground broker thread never blocks.
+
+Supported browsers: **Chrome**, **Edge**, **Firefox**, **Brave**,
+**Opera**, **Vivaldi**, **Internet Explorer**.
 
 Processing:
 - Common browser suffixes ("- Google Chrome", "- Microsoft Edge", etc.) are stripped
   to extract the clean page title.
-- If the title looks like a URL (`http://` or `https://`), it is captured separately.
-- **Deduplication** -- the same title + browser combination is reported only once
-  until the user navigates to a different page.
+- The same `(browser, title)` combination is reported only once until the
+  page changes.
 
 #### `ForegroundMonitor` (`ForegroundMonitor.h` / `ForegroundMonitor.cpp`)
 
-A polling thread that checks the foreground window every 3 seconds for **all user
-applications**, not just browsers. When the foreground changes (different PID or
-different window title), the previous session is emitted with:
+Subscribes to `ForegroundChangeBroker`. The previous 1 Hz
+`GetForegroundWindow()` poll is gone — the broker delivers a
+notification the moment Windows changes the foreground, with no
+per-second wakeup cost when the user isn't actively switching apps.
 
-- **exe_name** -- executable filename (e.g. `OUTLOOK.EXE`).
-- **exe_path** -- full path to the executable.
-- **window_title** -- the window title that was active during the session.
-- **duration_secs** -- how many seconds the app was in the foreground.
+When the foreground changes (different PID or different window title),
+the previous session is emitted with:
 
-Sessions shorter than 3 seconds (one poll interval) are discarded.
+- **exe_name** — executable filename (e.g. `OUTLOOK.EXE`).
+- **exe_path** — full path to the executable.
+- **window_title** — the window title that was active during the session.
+- **duration_secs** — how many seconds the app was in the foreground.
 
-A 35+ entry blocklist (`IsSystemForeground`) excludes system/shell processes:
-`explorer.exe`, `dwm.exe`, `csrss.exe`, `SearchHost.exe`, `Widgets.exe`,
-`consent.exe`, `warp!.exe`, and others.
+Sessions shorter than 3 seconds are discarded. System / shell processes
+are excluded via `SystemProcessClassifier` rather than a hard-coded
+name list.
 
 This monitor provides the **app usage context** (window titles and dwell time)
 required by user-context scenarios such as improving search relevance based on
@@ -268,16 +300,122 @@ usage frequency and duration patterns over time.
 
 #### `IdleDetector` (`IdleDetector.h` / `IdleDetector.cpp`)
 
-A polling thread that checks `GetLastInputInfo` every 5 seconds. When the idle
-duration exceeds the configured threshold (default 2 minutes) the `onIdle` callback
-fires; when input resumes, the `onActive` callback fires.
+A polling thread that checks `GetLastInputInfo` every 5 seconds and
+manages **two thresholds**:
 
-A message-only window is also created to receive `WM_POWERBROADCAST` notifications
-(`PBT_APMSUSPEND` / `PBT_APMRESUMEAUTOMATIC`) so that sleep/wake transitions
-trigger the same pause/resume path.
+| Threshold | Default | What happens |
+|---|---|---|
+| **Soft** (`SetSoftIdleThreshold`) | 2 minutes | Fires `onSoftIdle`. Monitors keep running but `EventContext.confidence` for new events is attenuated, so events that fire during idle (Windows Update, Defender scans, telemetry uploads) contribute less weight to inference and ranking. |
+| **Hard** (`SetHardIdleThreshold`) | 5 minutes | Fires `onHardIdle`. All four monitors are paused outright. |
 
-When idle or asleep, all four monitors (file, app launch, foreground, browsing) are
-paused.
+A message-only window receives `WM_POWERBROADCAST` notifications
+(`PBT_APMSUSPEND` / `PBT_APMRESUMEAUTOMATIC`) so sleep / hibernate
+trigger an immediate hard pause regardless of input activity. On wake,
+`EventContext::SetWakeBoundary()` is armed for 5 seconds — every event
+captured during that window has its confidence multiplied by 0.2 so the
+post-wake burst of background I/O (driver init, Defender catch-up,
+sync clients reconnecting) does not look like a flood of user activity.
+
+#### `EventContext` (`EventContext.h` / `EventContext.cpp`)
+
+A shared value type that travels with every event from the producing
+monitor through to `ActivityDatabase` and `InferenceEngine`. Fields:
+
+| Field | Meaning |
+|---|---|
+| `sourcePid` / `sourceExe` | The process that actually performed the I/O or generated the event. |
+| `foregroundPid` / `foregroundExe` | The user-facing process owning the foreground window at event time. |
+| `parentPid` / `parentExe` | The parent of the source process (for ancestry checks). |
+| `msSinceInput` | Milliseconds since the last keyboard / mouse / touch input from `GetLastInputInfo`. |
+| `createdWindowMs` | For app launches: time from process create to first top-level visible window (set by `LaunchCorrelator`). |
+| `confidence` | Producer's `[0, 1]` estimate that this event is user-initiated. Default 1.0. Attenuated by the soft-idle and wake-boundary multipliers, by the per-PID token bucket, and by `LaunchCorrelator` when no window appears in time. |
+
+`EventContext::CaptureContext(pid)` populates a context for a given source
+PID at event time and applies the wake-boundary multiplier (×0.2 if the
+event lands inside the 5 s window after `SetWakeBoundary()` was armed).
+`ActivityDatabase::BindEventContext()` binds the nine context fields onto
+any prepared statement that has the columns appended in the standard
+order.
+
+#### `LaunchCorrelator` (`LaunchCorrelator.h` / `LaunchCorrelator.cpp`)
+
+Bridges the gap between "process was created" and "user actually saw a
+window". The correlator is started on the WARP UI thread (so it can use
+`SetWinEventHook(WINEVENT_OUTOFCONTEXT)`, which requires a message
+pump on the calling thread) and listens for `EVENT_OBJECT_CREATE` on
+top-level windows. `AppLaunchMonitor` calls `Park(pid, callback)` when a
+new PID arrives; the callback fires once with `created_window_ms` set
+when a visible top-level window appears for that PID, or once with
+`created_window_ms = -1` after a 5 s timeout. Headless launches fall in
+the latter bucket and are emitted at confidence 0.3.
+
+#### `SystemProcessClassifier` (`SystemProcessClassifier.h` / `SystemProcessClassifier.cpp`)
+
+Replaces the old hard-coded "is this exe name in a 65-entry list"
+checks. Each unknown PID is run through six independent signals:
+
+1. **Parent ancestry** — service host (`services.exe`, `svchost.exe`,
+   `wininit.exe`) anywhere in the chain.
+2. **Image path** — `\Windows\System32\`, `\WinSxS\`, `\SystemApps\`,
+   `\WindowsApps\`, `\Servicing\`, `\Windows\Temp\`, etc.
+3. **Authenticode subject** — read via `WinVerifyTrust` +
+   `CryptMsgGetParam` and matched against Microsoft Windows
+   subjects (`Microsoft Windows`, `Microsoft Windows Publisher`,
+   `Microsoft Corporation` for OS-signed binaries).
+4. **Session ID** — session 0 is non-interactive by definition.
+5. **Token integrity level** — System / High-mandatory in a
+   non-interactive session is a strong system signal.
+6. **Name pattern** — well-known noise patterns
+   (`*svc.exe`, `*Host.exe`, `*Broker.exe`, `*Agent.exe` plus
+   the explicit MsMpEng / SearchIndexer / SIHClient / WmiPrvSE list).
+
+Each signal contributes a vote. A configurable threshold decides whether
+the PID is "system" or "user". Results are cached per-PID with a 60 s
+TTL. The point of this design is robustness to a single signal being
+spoofed or unavailable — e.g. an unsigned binary running from
+`\Users\Public\` that nonetheless lives in the service host ancestry is
+still classified as system.
+
+> Implementation note: `CertGetNameStringW` returns `const wchar_t*` for
+> the buffer, so the Authenticode reader uses a `std::vector<wchar_t>`
+> rather than `std::wstring::data()`.
+
+#### `ForegroundChangeBroker` (`ForegroundChangeBroker.h` / `ForegroundChangeBroker.cpp`)
+
+A single global `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, …,
+WINEVENT_OUTOFCONTEXT, …)` installed on the WARP UI thread.
+Subscribers (`ForegroundMonitor`, `BrowsingMonitor`, anything else
+that needs foreground transitions) register a callback via
+`Subscribe()`; the broker invokes them all in order when the
+foreground window changes. The broker eliminates the previous
+1 Hz `GetForegroundWindow()` poll in `ForegroundMonitor` and the
+3 s poll in `BrowsingMonitor`, plus the duplicated work of both
+monitors asking the same question every interval.
+
+#### `UrlExtractor` (`UrlExtractor.h` / `UrlExtractor.cpp`)
+
+Asynchronous UI Automation client that reads the actual URL out of
+browser address bars. Why not parse the title bar? Title bars are
+locale-dependent, frequently empty (e.g. on `about:blank`), and
+strip query strings — the address-bar `Value` property is the
+ground truth. Why a worker thread? UIA crosses process boundaries
+into the browser; if the browser is hung the calling thread blocks
+indefinitely. The extractor:
+
+- Runs on a dedicated worker thread that calls
+  `CoInitializeEx(MULTITHREADED)` once and creates a single
+  `IUIAutomation` instance.
+- Accepts requests via a bounded queue (32 entries; drops the oldest
+  on overflow) so a hung browser cannot back-pressure the
+  foreground broker thread.
+- For each request, walks the UIA tree from the top-level browser
+  window, finds the address-bar `EditControl` (Chrome / Edge:
+  `automation_id == "address-bar"` or class `Chrome_OmniboxView`;
+  Firefox: `automation_id == "urlbar-input"`), and reads
+  `Value.Value`.
+
+Empty / failed extractions fall back to leaving the URL field NULL so
+the title-only browsing event still records.
 
 #### `ActivityDatabase` (`ActivityDatabase.h` / `ActivityDatabase.cpp`)
 
@@ -289,57 +427,85 @@ A thread-safe SQLite wrapper. The database is stored at:
 
 **Schema:**
 
+The four activity tables share a uniform **EventContext** suffix —
+`source_pid`, `source_exe`, `foreground_pid`, `foreground_exe`,
+`ms_since_input`, `parent_pid`, `parent_exe`, `created_window_ms`,
+`confidence` (REAL DEFAULT 1.0). On open, `ActivityDatabase` runs an
+idempotent `ALTER TABLE … ADD COLUMN` for each context column on each
+activity table, so upgrading from an older WARP install does not require
+a fresh DB (SQLite returns a duplicate-column error which is silently
+ignored). For brevity the DDL below shows the context columns only on
+`file_activity`; the other three tables carry the same nine columns.
+
 ```sql
 CREATE TABLE file_activity (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
     action    TEXT    NOT NULL,        -- CREATE | OPEN | DELETE | MODIFY | RENAME
     path      TEXT    NOT NULL,        -- full path of the affected file/folder
-    old_path  TEXT                     -- previous path (RENAME only; NULL otherwise)
+    old_path  TEXT,                    -- previous path (RENAME only; NULL otherwise)
+    -- EventContext (added to every activity table via idempotent ALTER):
+    source_pid        INTEGER,
+    source_exe        TEXT,
+    foreground_pid    INTEGER,
+    foreground_exe    TEXT,
+    ms_since_input    INTEGER,
+    parent_pid        INTEGER,
+    parent_exe        TEXT,
+    created_window_ms INTEGER,
+    confidence        REAL DEFAULT 1.0
 );
 
 CREATE TABLE app_launch_activity (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    exe_name  TEXT    NOT NULL,        -- e.g. "notepad.exe"
-    exe_path  TEXT    NOT NULL,        -- full path to the executable
-    pid       INTEGER NOT NULL        -- process ID at launch time
+    timestamp INTEGER NOT NULL,
+    exe_name  TEXT    NOT NULL,
+    exe_path  TEXT    NOT NULL,
+    pid       INTEGER NOT NULL
+    -- + EventContext columns
 );
 
 CREATE TABLE browsing_activity (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    browser   TEXT    NOT NULL,        -- e.g. "chrome", "msedge", "firefox"
-    title     TEXT    NOT NULL,        -- page title from window title bar
-    url       TEXT                     -- URL if extractable; NULL otherwise
+    timestamp INTEGER NOT NULL,
+    browser   TEXT    NOT NULL,
+    title     TEXT    NOT NULL,
+    url       TEXT
+    -- + EventContext columns
 );
-
-CREATE INDEX idx_activity_ts   ON file_activity(timestamp);
-CREATE INDEX idx_activity_action ON file_activity(action, timestamp);
-CREATE INDEX idx_app_ts        ON app_launch_activity(timestamp);
-CREATE INDEX idx_browse_ts     ON browsing_activity(timestamp);
 
 CREATE TABLE app_focus_activity (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp       INTEGER NOT NULL,       -- Unix epoch seconds (when focus started)
-    exe_name        TEXT    NOT NULL,        -- executable filename
-    exe_path        TEXT    NOT NULL,        -- full path to the executable
-    window_title    TEXT    NOT NULL,        -- foreground window title
-    duration_secs   INTEGER NOT NULL         -- seconds in the foreground
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     INTEGER NOT NULL,
+    exe_name      TEXT    NOT NULL,
+    exe_path      TEXT    NOT NULL,
+    window_title  TEXT    NOT NULL,
+    duration_secs INTEGER NOT NULL
+    -- + EventContext columns
 );
 
-CREATE INDEX idx_focus_ts      ON app_focus_activity(timestamp);
+CREATE INDEX idx_activity_ts      ON file_activity(timestamp);
+CREATE INDEX idx_activity_action  ON file_activity(action, timestamp);
+CREATE INDEX idx_app_ts           ON app_launch_activity(timestamp);
+CREATE INDEX idx_browse_ts        ON browsing_activity(timestamp);
+CREATE INDEX idx_focus_ts         ON app_focus_activity(timestamp);
+CREATE INDEX idx_file_src_pid     ON file_activity(source_pid);
+CREATE INDEX idx_file_conf        ON file_activity(confidence);
 
--- Inference table (precomputed per-entity analytics)
+-- Inference table (precomputed per-entity analytics).
+-- open_count_* columns have INTEGER affinity but store REAL values
+-- (SQLite's dynamic typing accepts REAL into INTEGER-affinity columns
+-- losslessly; we read them back via sqlite3_column_double). They
+-- accumulate the producer's `confidence` rather than counting events.
 CREATE TABLE inference (
     entity_key        TEXT PRIMARY KEY,
     entity_type       TEXT,         -- 'file', 'app', or 'url'
     last_event_ts     INTEGER,
     last_open_ts      INTEGER,
     last_edit_ts      INTEGER,
-    open_count_7d     INTEGER,
-    open_count_30d    INTEGER,
-    open_count_total  INTEGER,
+    open_count_7d     INTEGER,      -- stores REAL; sum of confidence over 7 days
+    open_count_30d    INTEGER,      -- stores REAL; sum of confidence over 30 days
+    open_count_total  INTEGER,      -- stores REAL; lifetime sum of confidence
     recency_score     REAL,         -- 0-255 composite score
     version           INTEGER,      -- monotonic per-entity version
     updated_at        INTEGER
@@ -354,8 +520,9 @@ CREATE INDEX idx_inference_version    ON inference(version);
 **Eviction:** Records older than 30 days are deleted from all four event tables on
 startup and every 6 hours via a `WM_TIMER`. Rolling window counts in the inference
 engine (`open_count_7d`, `open_count_30d`) are also recomputed on this schedule via
-`RefreshRollingCounts()`, ensuring they accurately reflect actual events in their
-respective time windows.
+`RefreshRollingCounts()`, which now `SUM(COALESCE(confidence, 1.0))` from the raw
+event tables (rather than `COUNT(*)`) so the periodic resync agrees with the
+per-event update path.
 
 #### `InferenceEngine` (`InferenceEngine.h` / `InferenceEngine.cpp`)
 
@@ -369,11 +536,24 @@ callback also calls `OnFileEvent`, `OnAppLaunchEvent`, `OnAppFocusEvent`, or
 1. Normalizes the entity key to lowercase UTF-8.
 2. Loads or creates an `InferenceRecord` (in-memory cache backed by the `inference`
    SQLite table).
-3. Increments counters (`open_count_7d`, `open_count_30d`, `open_count_total`) and
-   updates timestamps (`last_event_ts`, `last_open_ts`, `last_edit_ts`).
+3. Adds the producer's `confidence` (a REAL value in `[0, 1]`) to the
+   running counters `open_count_7d`, `open_count_30d`,
+   `open_count_total`, and updates timestamps (`last_event_ts`,
+   `last_open_ts`, `last_edit_ts`). The previous design used
+   `(confidence >= 0.5) ? 1 : 0` and dropped low-confidence events
+   entirely; the new design lets a stream of (n) events with average
+   confidence c contribute (n × c) so a steady trickle of dim signal
+   still surfaces in popularity ranking, just at a commensurate weight.
 4. Recomputes a **recency score** using exponential decay:
    `score = 200 × e^(−Δt / 172800) + 5 × ln(1 + open_count_7d)`, capped at 255.
 5. Bumps the record `version` and persists via `INSERT OR REPLACE`.
+
+`RefreshRollingCounts()` (run on the 6-hour eviction schedule) recomputes
+the rolling windows from the raw event tables as
+`SUM(COALESCE(confidence, 1.0))` rather than `COUNT(*)`, so the periodic
+resync agrees with the per-event update path. JSON serialisation rounds
+the counters to integer via `llround()` so the documented integer
+`open_count_*` API contract is preserved for existing clients.
 
 Two query operations are exposed through the named pipe (see the
 [Inference API](#5-inference-api) section below):
@@ -561,31 +741,57 @@ then falls back to `%LOCALAPPDATA%\WARP\models`.
 
 1. On launch the app requests elevation (UAC prompt).
 2. The main window is created but kept hidden; a light-bulb system-tray icon appears.
-3. The SQLite database is opened (created if it doesn't exist) and old records are evicted from all three tables.
-4. File-system, shell, and ETW monitors start on all eligible drives. The goop path filter is active from the start, discarding file activity from 100+ system/cache/build/temp directory patterns.
-5. The app launch monitor begins polling the process table. Only user-initiated launches (passing session, name, path, and parent-process checks) are recorded.
-6. The browsing monitor begins polling the foreground window.
-7. The foreground monitor begins polling for all foreground app changes (window
-   titles, dwell time).
-8. The idle detector begins polling for user inactivity and power events.
-9. The inference engine is initialized with direct access to the SQLite database.
-   Rolling window counts are recomputed from the raw event tables.
+3. The SQLite database is opened (created if it doesn't exist), the
+   EventContext columns are added to all activity tables via idempotent
+   `ALTER TABLE`, and old records are evicted from all four tables.
+4. `ForegroundChangeBroker` and `LaunchCorrelator` are started on the UI
+   thread (both need a message pump for `SetWinEventHook`).
+5. `FileMonitor` starts: a `WARP-FileTrace` private ETW session is opened
+   against `Microsoft-Windows-Kernel-File` for fixed drives;
+   `ReadDirectoryChangesW` threads start for removable / network drives;
+   the shell-change subscription is registered. The goop filter and
+   AppData allowlist are active from the first event.
+6. `AppLaunchMonitor` opens a `WARP-ProcessTrace` private ETW session
+   against `Microsoft-Windows-Kernel-Process`. Each new PID is parked
+   with `LaunchCorrelator` and emitted with `created_window_ms` and
+   confidence after the window correlation resolves.
+7. `BrowsingMonitor` and `ForegroundMonitor` subscribe to
+   `ForegroundChangeBroker`. `BrowsingMonitor` additionally starts the
+   `UrlExtractor` worker thread.
+8. `IdleDetector` starts polling `GetLastInputInfo` every 5 seconds and
+   creates the `WM_POWERBROADCAST` listener window. Two thresholds are
+   armed (soft attenuation, hard pause).
+9. The inference engine is initialised with direct access to the SQLite
+   database. Confidence-weighted rolling counts are recomputed from the
+   raw event tables (`SUM(COALESCE(confidence, 1.0))`).
 10. The named-pipe server starts accepting connections.
-11. The topic inference engine loads the MiniLM ONNX model and vocabulary, pre-embeds
-    ~50 topic candidate labels, and begins its 5-minute inference cycle.
-12. Every detected event (file, app launch, app focus, or browsing) is inserted into
-    the appropriate database table **and** fed to the inference engine, which
-    incrementally updates per-entity scores in real time.
-13. Every 5 minutes, the topic inference engine gathers all activities from the last
-    15 minutes, embeds each with MiniLM, matches to the nearest semantic topic, and
-    stores the top 3 topics with a coverage percentage.
-14. Every 6 hours, records older than 30 days are purged from all event tables and
-    inference rolling counts are recomputed.
-15. When the user is idle >= 2 min or the PC sleeps, all monitors pause; they resume on activity/wake.
+11. The topic inference engine loads the MiniLM ONNX model and vocabulary,
+    pre-embeds ~50 topic candidate labels, and begins its 5-minute cycle.
+12. Every detected event (file, app launch, app focus, or browsing) is
+    enriched with an `EventContext` (source / foreground / parent ids,
+    `ms_since_input`, `confidence`), inserted into the appropriate
+    database table, **and** fed to the inference engine, which adds the
+    event's confidence to the per-entity rolling counters.
+13. Every 5 minutes, the topic inference engine gathers all activities
+    from the last 15 minutes, embeds each with MiniLM, matches to the
+    nearest semantic topic, and stores the top 3 topics with a coverage
+    percentage.
+14. Every 6 hours, records older than 30 days are purged from all event
+    tables and inference rolling counts are recomputed.
+15. When the user crosses the **soft** idle threshold, new events are
+    captured at attenuated confidence. When they cross the **hard**
+    threshold (or the PC sleeps), all monitors pause. On wake, all
+    monitors resume but events captured within 5 s carry a 0.2× wake-
+    boundary confidence multiplier.
 16. Right-clicking the tray icon shows **Open** / **Exit**.
-14. The built-in API test buttons can be used at any time to query the pipe and inspect results. Use the checkboxes to select which event types to include.
-15. The "Explore Precomputed Inferences" section can be used to browse the top entities by recency score (filtered by entity type) or look up the inference record for a specific file path, app path, or URL.
-16. Clearing activity history also clears the inference engine's in-memory cache.
+17. The built-in API test buttons can be used at any time to query the
+    pipe and inspect results. Use the checkboxes to select which event
+    types to include.
+18. The "Explore Precomputed Inferences" section can be used to browse
+    the top entities by recency score (filtered by entity type) or look
+    up the inference record for a specific file path, app path, or URL.
+19. Clearing activity history also clears the inference engine's
+    in-memory cache.
 
 ---
 
@@ -794,9 +1000,9 @@ inference engine. No parameters are required.
 | `last_event_ts` | `integer` | Timestamp of the most recent event of any kind. |
 | `last_open_ts` | `integer` | Timestamp of the most recent OPEN (files) or launch (apps/URLs). |
 | `last_edit_ts` | `integer` | Timestamp of the most recent MODIFY/CREATE (files only). |
-| `open_count_7d` | `integer` | Number of OPEN events in the rolling 7-day window. |
-| `open_count_30d` | `integer` | Number of OPEN events in the rolling 30-day window. |
-| `open_count_total` | `integer` | Lifetime OPEN count since WARP started tracking this entity. |
+| `open_count_7d` | `integer` | Confidence-weighted sum of OPEN events in the rolling 7-day window (rounded to integer). |
+| `open_count_30d` | `integer` | Confidence-weighted sum of OPEN events in the rolling 30-day window (rounded to integer). |
+| `open_count_total` | `integer` | Confidence-weighted lifetime sum since WARP started tracking this entity (rounded to integer). |
 | `recency_score` | `number` | Composite score (0–255) combining exponential time-decay and frequency. Higher = more recently/frequently used. |
 | `version` | `integer` | Monotonically increasing per-entity version; use as watermark for delta sync. |
 | `updated_at` | `integer` | Timestamp of the last inference update. |
@@ -1102,22 +1308,41 @@ WARP!\
 |-- framework.h                 Precompiled / common system headers
 |-- targetver.h                 Windows SDK version targeting
 |
-|-- ActivityDatabase.h          Database class interface (4 tables)
-|-- ActivityDatabase.cpp        SQLite storage implementation
+|-- ActivityDatabase.h          Database class interface (4 tables + EventContext columns)
+|-- ActivityDatabase.cpp        SQLite storage; idempotent ALTER for context columns
+|-- EventContext.h              Per-event source/foreground/parent context + confidence
+|-- EventContext.cpp            CaptureContext, wake-boundary multiplier, BindEventContext
 |-- FileMonitor.h               File/shell monitoring interface
-|-- FileMonitor.cpp             ReadDirectoryChangesW + SHChangeNotify + ETW impl
+|-- FileMonitor.cpp             ETW Microsoft-Windows-Kernel-File (private session) +
+|                                RDChangesW (rm/net only) + SHChangeNotify;
+|                                goop filter + AppData allowlist + token bucket
 |-- AppLaunchMonitor.h          App launch monitoring interface
-|-- AppLaunchMonitor.cpp        Process table polling impl
+|-- AppLaunchMonitor.cpp        ETW Microsoft-Windows-Kernel-Process (private session) +
+|                                LaunchCorrelator parking
+|-- LaunchCorrelator.h          Window-creation correlator interface
+|-- LaunchCorrelator.cpp        SetWinEventHook(EVENT_OBJECT_CREATE) on UI thread,
+|                                5s deadline -> created_window_ms + confidence
+|-- SystemProcessClassifier.h   Multi-signal system-process classifier interface
+|-- SystemProcessClassifier.cpp Parent ancestry + image path + Authenticode +
+|                                session + integrity + name-pattern voting
+|-- ForegroundChangeBroker.h    Single global EVENT_SYSTEM_FOREGROUND hook + fan-out
+|-- ForegroundChangeBroker.cpp  Subscriber registry + dispatch on UI thread
 |-- BrowsingMonitor.h           Browsing activity monitoring interface
-|-- BrowsingMonitor.cpp         Foreground window title polling impl (browsers)
+|-- BrowsingMonitor.cpp         Broker subscriber + per-PID EVENT_OBJECT_NAMECHANGE +
+|                                UrlExtractor enqueue
+|-- UrlExtractor.h              UIA-based URL extraction interface
+|-- UrlExtractor.cpp            MTA worker thread, bounded queue, Chrome/Edge/Firefox
+|                                address-bar EditControl reader
 |-- ForegroundMonitor.h         Foreground app focus monitoring interface
-|-- ForegroundMonitor.cpp       Foreground window polling impl (all apps, dwell time)
-|-- IdleDetector.h              Idle/sleep detector interface
-|-- IdleDetector.cpp            GetLastInputInfo + WM_POWERBROADCAST impl
+|-- ForegroundMonitor.cpp       Broker subscriber; emits exe + title + dwell time
+|-- IdleDetector.h              Two-tier idle/sleep detector interface
+|-- IdleDetector.cpp            GetLastInputInfo + WM_POWERBROADCAST;
+|                                soft (attenuate) + hard (pause) + wake boundary
 |-- QueryApi.h                  Named-pipe API interface
 |-- QueryApi.cpp                Pipe server and JSON serialization impl
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
-|-- InferenceEngine.cpp         Real-time scoring, QueryInferences & GetInferenceDeltas impl
+|-- InferenceEngine.cpp         Confidence-weighted REAL counters, recency score,
+|                                QueryInferences & GetInferenceDeltas impl
 |-- TopicInference.h            Semantic topic inference interface (MiniLM embedding pipeline)
 |-- TopicInference.cpp          ONNX Runtime model loading, embedding, topic deduction impl
 |-- BertTokenizer.h             Header-only BERT WordPiece tokenizer for MiniLM
