@@ -2,6 +2,7 @@
 #include "AppLaunchMonitor.h"
 #include "EventContext.h"
 #include "LaunchCorrelator.h"
+#include "SystemProcessClassifier.h"
 #include <tlhelp32.h>
 #include <algorithm>
 #include <unordered_set>
@@ -376,9 +377,18 @@ void WINAPI AppLaunchMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
         std::wstring exeLower = exeName;
         std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::towlower);
 
-        if (IsSystemProcess(exeLower))   return;
-        if (IsSystemExePath(exePath))    return;
-        if (IsSpawnedByServiceHost(pid)) return;
+        if (IsSystemProcess(exeLower))   return;            // cheap blocklist pre-filter
+        // The composite SystemProcessClassifier replaces the previous
+        // OR-of-(IsSystemExePath | IsSpawnedByServiceHost) decision with a
+        // multi-signal vote (path, parent, session, integrity, MS signature,
+        // name). It is strictly more discriminating: a process needs to fail
+        // multiple independent checks to be classified as system, so genuine
+        // user apps that happen to live in a Windows tree or are MS-signed
+        // (e.g. notepad.exe launched from cmd) are no longer falsely
+        // suppressed.
+        WARP::ClassificationResult cls =
+            WARP::SystemProcessClassifier::Instance().Classify(exePath, pid);
+        if (cls.isSystem)                return;
 
         DWORD sessionId = 0;
         if (!ProcessIdToSessionId(pid, &sessionId) || sessionId == 0) return;

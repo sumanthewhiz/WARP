@@ -223,6 +223,7 @@
     <ClInclude Include="IdleDetector.h" />
     <ClInclude Include="InferenceEngine.h" />
     <ClInclude Include="LaunchCorrelator.h" />
+    <ClInclude Include="SystemProcessClassifier.h" />
     <ClInclude Include="QueryApi.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
@@ -241,6 +242,7 @@
     <ClCompile Include="QueryApi.cpp" />
     <ClCompile Include="InferenceEngine.cpp" />
     <ClCompile Include="LaunchCorrelator.cpp" />
+    <ClCompile Include="SystemProcessClassifier.cpp" />
     <ClCompile Include="TopicInference.cpp" />
     <ClCompile Include="WARP!.cpp" />
     <ClCompile Include="sqlite3.c">
