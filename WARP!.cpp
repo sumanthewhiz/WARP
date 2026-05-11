@@ -14,6 +14,7 @@
 #include "InferenceEngine.h"
 #include "TopicInference.h"
 #include "LaunchCorrelator.h"
+#include "ForegroundChangeBroker.h"
 
 #include <string>
 #include <shlobj.h>
@@ -1058,6 +1059,11 @@ void StartSubsystems()
     // thread is up by the time the first ETW process-start arrives.
     LaunchCorrelator::Instance().Start();
 
+    // Start the foreground-change broker (single SetWinEventHook for
+    // EVENT_SYSTEM_FOREGROUND, fanned out to ForegroundMonitor and
+    // BrowsingMonitor). Replaces the old per-monitor 3s polling loops.
+    ForegroundChangeBroker::Instance().Start();
+
     // Install the system-wide window-creation hook on the main UI thread
     // so OUTOFCONTEXT notifications arrive on a thread with a message
     // pump (this same thread). We listen ONLY to EVENT_OBJECT_CREATE,
@@ -1426,6 +1432,7 @@ void StopSubsystems()
         g_hWinEventHook = nullptr;
     }
     LaunchCorrelator::Instance().Stop();
+    ForegroundChangeBroker::Instance().Stop();
 
     g_db.Close();
 }

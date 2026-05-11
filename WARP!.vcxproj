@@ -218,6 +218,7 @@
     <ClInclude Include="BrowsingMonitor.h" />
     <ClInclude Include="EventContext.h" />
     <ClInclude Include="FileMonitor.h" />
+    <ClInclude Include="ForegroundChangeBroker.h" />
     <ClInclude Include="ForegroundMonitor.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="IdleDetector.h" />
@@ -237,6 +238,7 @@
     <ClCompile Include="BrowsingMonitor.cpp" />
     <ClCompile Include="EventContext.cpp" />
     <ClCompile Include="FileMonitor.cpp" />
+    <ClCompile Include="ForegroundChangeBroker.cpp" />
     <ClCompile Include="ForegroundMonitor.cpp" />
     <ClCompile Include="IdleDetector.cpp" />
     <ClCompile Include="QueryApi.cpp" />

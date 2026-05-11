@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "ForegroundMonitor.h"
+#include "ForegroundChangeBroker.h"
 #include "EventContext.h"
 #include <algorithm>
 #include <psapi.h>
@@ -84,13 +85,11 @@ static bool GetProcessInfo(DWORD pid, std::wstring& outExeName, std::wstring& ou
 
 ForegroundMonitor::ForegroundMonitor()
 {
-    m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 }
 
 ForegroundMonitor::~ForegroundMonitor()
 {
     Stop();
-    if (m_stopEvent) CloseHandle(m_stopEvent);
 }
 
 void ForegroundMonitor::SetCallback(ForegroundCallback cb)
@@ -102,16 +101,31 @@ void ForegroundMonitor::Start()
 {
     if (m_running) return;
     m_running = true;
-    ResetEvent(m_stopEvent);
-    m_thread = std::thread(&ForegroundMonitor::MonitorLoop, this);
+    // Subscribe to the broker. The broker installs the WinEventHook lazily;
+    // we just need to be told when the foreground changes.
+    m_brokerToken = ForegroundChangeBroker::Instance().Subscribe(
+        [this](HWND hwnd, DWORD pid) { OnForegroundChanged(hwnd, pid); });
 }
 
 void ForegroundMonitor::Stop()
 {
     if (!m_running) return;
     m_running = false;
-    SetEvent(m_stopEvent);
-    if (m_thread.joinable()) m_thread.join();
+    if (m_brokerToken)
+    {
+        ForegroundChangeBroker::Instance().Unsubscribe(m_brokerToken);
+        m_brokerToken = 0;
+    }
+
+    // Emit the final session on shutdown so we don't lose the dwell time
+    // for the last-foreground app.
+    std::lock_guard<std::mutex> lk(m_stateMtx);
+    EmitPreviousLocked(GetTickCount64());
+    m_prevPid = 0;
+    m_prevExeName.clear();
+    m_prevExePath.clear();
+    m_prevTitle.clear();
+    m_prevStartTick = 0;
 }
 
 void ForegroundMonitor::Pause()
@@ -124,103 +138,68 @@ void ForegroundMonitor::Resume()
     m_paused = false;
 }
 
-void ForegroundMonitor::MonitorLoop()
+// Invoked by ForegroundChangeBroker on the main UI thread. Must do minimal
+// blocking work; everything here is constant-time apart from the user's
+// callback (which is responsible for its own performance).
+void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
 {
-    // State for the currently-tracked foreground session
-    DWORD        prevPid = 0;
-    std::wstring prevExeName;
-    std::wstring prevExePath;
-    std::wstring prevTitle;
-    ULONGLONG    prevStartTick = 0;
+    if (!m_running || m_paused) return;
+    if (!hwnd || pid == 0)      return;
 
-    while (m_running)
+    wchar_t titleBuf[1024] = {};
+    int titleLen = GetWindowTextW(hwnd, titleBuf, 1024);
+    std::wstring title(titleBuf, titleLen > 0 ? titleLen : 0);
+
+    std::wstring exeName, exePath;
+    if (!GetProcessInfo(pid, exeName, exePath))
     {
-        // Poll every 3 seconds
-        DWORD waitResult = WaitForSingleObject(m_stopEvent, 3000);
-        if (waitResult == WAIT_OBJECT_0 || !m_running)
-            break;
-
-        if (m_paused)
-            continue;
-
-        HWND hFg = GetForegroundWindow();
-        if (!hFg)
-            continue;
-
-        DWORD fgPid = 0;
-        GetWindowThreadProcessId(hFg, &fgPid);
-        if (fgPid == 0)
-            continue;
-
-        // Get window title
-        wchar_t titleBuf[1024] = {};
-        int titleLen = GetWindowTextW(hFg, titleBuf, 1024);
-        std::wstring title(titleBuf, titleLen > 0 ? titleLen : 0);
-
-        // Detect foreground change: different PID or different window title
-        bool changed = (fgPid != prevPid) || (title != prevTitle);
-
-        if (changed)
-        {
-            ULONGLONG nowTick = GetTickCount64();
-
-            // Emit the PREVIOUS session if it was valid and had meaningful duration
-            if (prevPid != 0 && !prevExeName.empty() && prevStartTick != 0)
-            {
-                int durationSecs = static_cast<int>((nowTick - prevStartTick) / 1000);
-                if (durationSecs >= 3 && m_callback)  // at least one poll interval
-                {
-                    EventContext ctx = EventContextUtil::CaptureContext(prevPid);
-                    m_callback(prevExeName, prevExePath, prevTitle, durationSecs, ctx);
-                }
-            }
-
-            // Start tracking the new foreground
-            std::wstring exeName, exePath;
-            if (GetProcessInfo(fgPid, exeName, exePath))
-            {
-                std::wstring exeLower = exeName;
-                std::transform(exeLower.begin(), exeLower.end(),
-                               exeLower.begin(), ::towlower);
-
-                if (IsSystemForeground(exeLower))
-                {
-                    // Don't track system windows; clear state
-                    prevPid = 0;
-                    prevExeName.clear();
-                    prevExePath.clear();
-                    prevTitle.clear();
-                    prevStartTick = 0;
-                }
-                else
-                {
-                    prevPid       = fgPid;
-                    prevExeName   = exeName;
-                    prevExePath   = exePath;
-                    prevTitle     = title;
-                    prevStartTick = nowTick;
-                }
-            }
-            else
-            {
-                prevPid = 0;
-                prevExeName.clear();
-                prevExePath.clear();
-                prevTitle.clear();
-                prevStartTick = 0;
-            }
-        }
+        // Can't resolve PID -- still emit the prior session so we don't
+        // accidentally extend its duration past the actual focus loss.
+        std::lock_guard<std::mutex> lk(m_stateMtx);
+        EmitPreviousLocked(GetTickCount64());
+        m_prevPid = 0;
+        m_prevExeName.clear();
+        m_prevExePath.clear();
+        m_prevTitle.clear();
+        m_prevStartTick = 0;
+        return;
     }
 
-    // Emit the final session on shutdown
-    if (prevPid != 0 && !prevExeName.empty() && prevStartTick != 0)
+    std::wstring exeLower = exeName;
+    std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::towlower);
+
+    ULONGLONG nowTick = GetTickCount64();
+    std::lock_guard<std::mutex> lk(m_stateMtx);
+
+    // Don't suppress the emission of the PREVIOUS session just because the
+    // NEW foreground is a system shell -- the user really did spend N
+    // seconds in the prior app. Always flush first.
+    EmitPreviousLocked(nowTick);
+
+    if (IsSystemForeground(exeLower))
     {
-        ULONGLONG nowTick = GetTickCount64();
-        int durationSecs = static_cast<int>((nowTick - prevStartTick) / 1000);
-        if (durationSecs >= 3 && m_callback)
-        {
-            EventContext ctx = EventContextUtil::CaptureContext(prevPid);
-            m_callback(prevExeName, prevExePath, prevTitle, durationSecs, ctx);
-        }
+        // Don't track system / shell windows as foreground sessions.
+        m_prevPid = 0;
+        m_prevExeName.clear();
+        m_prevExePath.clear();
+        m_prevTitle.clear();
+        m_prevStartTick = 0;
+        return;
     }
+
+    m_prevPid       = pid;
+    m_prevExeName   = exeName;
+    m_prevExePath   = exePath;
+    m_prevTitle     = title;
+    m_prevStartTick = nowTick;
+}
+
+void ForegroundMonitor::EmitPreviousLocked(ULONGLONG nowTick)
+{
+    if (m_prevPid == 0 || m_prevExeName.empty() || m_prevStartTick == 0)
+        return;
+    int durationSecs = static_cast<int>((nowTick - m_prevStartTick) / 1000);
+    if (durationSecs < 1 || !m_callback) return;
+    EventContext ctx = EventContextUtil::CaptureContext(m_prevPid);
+    m_callback(m_prevExeName, m_prevExePath, m_prevTitle, durationSecs, ctx);
 }
