@@ -73,4 +73,11 @@ namespace EventContextUtil
     // change so CaptureContext() doesn't have to call GetForegroundWindow()
     // itself (which is allowed only from the calling thread's desktop).
     void NotifyForegroundChanged(HWND hwnd, DWORD pid);
+
+    // IdleDetector calls this on resume from sleep / long-idle wake. All
+    // events captured before `untilTickMs` will have their confidence
+    // multiplied by 0.2 to absorb the burst of system-housekeeping
+    // activity that fires in the seconds after wake (SuperFetch,
+    // Defender, indexer, sync clients, etc).
+    void SetWakeBoundary(ULONGLONG untilTickMs);
 }

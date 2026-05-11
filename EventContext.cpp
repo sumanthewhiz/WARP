@@ -141,6 +141,16 @@ namespace EventContextUtil
         g_lastForegroundPid.store(pid,  std::memory_order_relaxed);
     }
 
+    // Tick (in GetTickCount64() units) before which all events are
+    // considered low-confidence (system housekeeping after wake).
+    // 0 means "no active wake boundary".
+    static std::atomic<ULONGLONG> g_wakeBoundaryUntilTick{ 0 };
+
+    void SetWakeBoundary(ULONGLONG untilTickMs)
+    {
+        g_wakeBoundaryUntilTick.store(untilTickMs, std::memory_order_relaxed);
+    }
+
     EventContext CaptureContext(DWORD sourcePid)
     {
         EventContext ctx;
@@ -176,6 +186,21 @@ namespace EventContextUtil
         else
         {
             ctx.msSinceInput = 0xFFFFFFFFu;
+        }
+
+        // Wake-boundary attenuation: in the seconds after a resume from
+        // sleep / long-idle, the OS unleashes a burst of housekeeping
+        // activity (SuperFetch, Defender scan, indexer catch-up, sync
+        // clients reconciling). Multiply confidence by 0.2 so these
+        // events land in the DB but don't pollute popularity counts.
+        ULONGLONG until = g_wakeBoundaryUntilTick.load(std::memory_order_relaxed);
+        if (until != 0)
+        {
+            ULONGLONG now64 = GetTickCount64();
+            if (now64 < until)
+                ctx.confidence *= 0.2;
+            else
+                g_wakeBoundaryUntilTick.store(0, std::memory_order_relaxed);
         }
 
         return ctx;
