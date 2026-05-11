@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "BrowsingMonitor.h"
 #include "ForegroundChangeBroker.h"
+#include "UrlExtractor.h"
 #include "EventContext.h"
 #include <algorithm>
 #include <psapi.h>
@@ -118,6 +119,15 @@ void BrowsingMonitor::Start()
     m_running = true;
     g_pBrowsingMonitor = this;
 
+    // The UrlExtractor worker thread does the cross-process UIA queries.
+    // Forward its output to our user callback.
+    UrlExtractor::Instance().SetEmitCallback(
+        [this](const std::wstring& browser, const std::wstring& title,
+               const std::wstring& url, const EventContext& ctx) {
+            if (m_callback) m_callback(browser, title, url, ctx);
+        });
+    UrlExtractor::Instance().Start();
+
     m_brokerToken = ForegroundChangeBroker::Instance().Subscribe(
         [this](HWND hwnd, DWORD pid) { OnForegroundChanged(hwnd, pid); });
 }
@@ -131,6 +141,7 @@ void BrowsingMonitor::Stop()
         ForegroundChangeBroker::Instance().Unsubscribe(m_brokerToken);
         m_brokerToken = 0;
     }
+    UrlExtractor::Instance().Stop();
     {
         std::lock_guard<std::mutex> lk(m_stateMtx);
         if (m_nameHook)
@@ -238,7 +249,9 @@ void CALLBACK BrowsingMonitor::NameChangeProc(
 }
 
 // Read the current title from `hwnd`, deduplicate against the previous
-// title, and emit a browsing event if it changed and is non-trivial.
+// title, and submit a request to UrlExtractor. UrlExtractor reads the
+// URL on a worker thread (UIA crosses process boundaries and can block)
+// and then invokes m_callback.
 void BrowsingMonitor::EvaluateBrowserState(HWND hwnd, DWORD pid)
 {
     if (m_paused) return;
@@ -251,7 +264,6 @@ void BrowsingMonitor::EvaluateBrowserState(HWND hwnd, DWORD pid)
     if (titleLen <= 0) return;
     std::wstring rawTitle(titleBuf, titleLen);
 
-    // Skip empty or generic titles
     if (rawTitle.empty() || rawTitle == L"New Tab" || rawTitle == L"Untitled")
         return;
 
@@ -262,10 +274,20 @@ void BrowsingMonitor::EvaluateBrowserState(HWND hwnd, DWORD pid)
         m_lastBrowser = browser;
     }
 
-    std::wstring url;
-    std::wstring pageTitle = ExtractTitleAndUrl(rawTitle, browser, url);
-    if (pageTitle.empty() || !m_callback) return;
+    // Strip "- Browser" suffixes from the title for cleaner downstream
+    // display, but do NOT try to parse a URL out of it -- UIA gives us
+    // the actual address. Keep ExtractTitleAndUrl for backward-compat
+    // title cleaning but ignore its URL output.
+    std::wstring titleUrl;
+    std::wstring pageTitle = ExtractTitleAndUrl(rawTitle, browser, titleUrl);
+    if (pageTitle.empty()) return;
 
     EventContext ctx = EventContextUtil::CaptureContext(pid);
-    m_callback(browser, pageTitle, url, ctx);
+
+    // Submit to the UrlExtractor worker thread. The worker calls
+    // m_callback (registered via UrlExtractor::SetEmitCallback in Start)
+    // once UIA returns the address-bar value. If UIA fails or times out
+    // due to a hung browser, the worker emits with url="" so we don't
+    // lose the title-only signal.
+    UrlExtractor::Instance().Submit(hwnd, browser, pageTitle, ctx);
 }

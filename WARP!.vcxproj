@@ -216,6 +216,7 @@
     <ClInclude Include="AppLaunchMonitor.h" />
     <ClInclude Include="BertTokenizer.h" />
     <ClInclude Include="BrowsingMonitor.h" />
+    <ClInclude Include="UrlExtractor.h" />
     <ClInclude Include="EventContext.h" />
     <ClInclude Include="FileMonitor.h" />
     <ClInclude Include="ForegroundChangeBroker.h" />
@@ -236,6 +237,7 @@
     <ClCompile Include="ActivityDatabase.cpp" />
     <ClCompile Include="AppLaunchMonitor.cpp" />
     <ClCompile Include="BrowsingMonitor.cpp" />
+    <ClCompile Include="UrlExtractor.cpp" />
     <ClCompile Include="EventContext.cpp" />
     <ClCompile Include="FileMonitor.cpp" />
     <ClCompile Include="ForegroundChangeBroker.cpp" />
