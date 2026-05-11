@@ -13,6 +13,7 @@
 #include "QueryApi.h"
 #include "InferenceEngine.h"
 #include "TopicInference.h"
+#include "LaunchCorrelator.h"
 
 #include <string>
 #include <shlobj.h>
@@ -1015,6 +1016,34 @@ std::wstring GetDatabasePath()
     return dir + L"\\activity.db";
 }
 
+// ---------------------------------------------------------------------------
+// SetWinEventHook plumbing for app-launch window correlation.
+//
+// SetWinEventHook with WINEVENT_OUTOFCONTEXT marshals events to the thread
+// that called SetWinEventHook -- which must have a message loop. We install
+// the hook on the main UI thread (which already runs the WARP window's
+// message pump), so EVENT_OBJECT_CREATE notifications arrive there for free.
+//
+// We forward every newly-created window into LaunchCorrelator, which decides
+// whether it matches a parked process-start.
+// ---------------------------------------------------------------------------
+static HWINEVENTHOOK g_hWinEventHook = nullptr;
+
+static void CALLBACK LaunchWinEventProc(HWINEVENTHOOK /*hHook*/,
+                                        DWORD          event,
+                                        HWND           hwnd,
+                                        LONG           idObject,
+                                        LONG           idChild,
+                                        DWORD          /*idEventThread*/,
+                                        DWORD          /*dwmsEventTime*/)
+{
+    if (event != EVENT_OBJECT_CREATE)        return;
+    if (idObject != OBJID_WINDOW)            return;
+    if (idChild  != CHILDID_SELF)            return;
+    if (!hwnd)                               return;
+    LaunchCorrelator::Instance().OnWindowCreated(hwnd);
+}
+
 void StartSubsystems()
 {
     std::wstring dbPath = GetDatabasePath();
@@ -1024,6 +1053,21 @@ void StartSubsystems()
     // Initialize inference engine with direct DB access
     g_inference.Init(g_db.DbHandle(), g_db.DbMutex());
     g_inference.RefreshRollingCounts();
+
+    // Start the launch correlator BEFORE AppLaunchMonitor, so its sweeper
+    // thread is up by the time the first ETW process-start arrives.
+    LaunchCorrelator::Instance().Start();
+
+    // Install the system-wide window-creation hook on the main UI thread
+    // so OUTOFCONTEXT notifications arrive on a thread with a message
+    // pump (this same thread). We listen ONLY to EVENT_OBJECT_CREATE,
+    // and the callback further filters to top-level windows.
+    g_hWinEventHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
+        nullptr,
+        LaunchWinEventProc,
+        0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     g_fileMonitor.SetCallback([](const std::wstring& action,
                                  const std::wstring& path,
@@ -1375,5 +1419,13 @@ void StopSubsystems()
     g_browsingMonitor.Stop();
     g_appLaunchMonitor.Stop();
     g_fileMonitor.Stop();
+
+    if (g_hWinEventHook)
+    {
+        UnhookWinEvent(g_hWinEventHook);
+        g_hWinEventHook = nullptr;
+    }
+    LaunchCorrelator::Instance().Stop();
+
     g_db.Close();
 }

@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "AppLaunchMonitor.h"
 #include "EventContext.h"
+#include "LaunchCorrelator.h"
 #include <tlhelp32.h>
 #include <algorithm>
 #include <unordered_set>
@@ -386,7 +387,19 @@ void WINAPI AppLaunchMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
         ctx.parentPid = EventContextUtil::GetParentPid(pid);
         if (ctx.parentPid != 0)
             ctx.parentExe = EventContextUtil::GetExePathByPid(ctx.parentPid);
-        self->m_callback(exeName, exePath, pid, ctx);
+
+        // Park the launch in the correlator. It will fire `m_callback`
+        // either when a top-level window appears for `pid` (confidence=1.0)
+        // or when the 5s budget elapses (confidence=0.3). The parking is
+        // strictly additive -- if the correlator isn't running yet, the
+        // event passes straight through at full confidence.
+        LaunchCorrelator::Instance().RecordPending(
+            exeName, exePath, pid, ctx,
+            [self](const std::wstring& en, const std::wstring& ep,
+                   DWORD p, const EventContext& finalCtx) {
+                if (self && self->m_callback)
+                    self->m_callback(en, ep, p, finalCtx);
+            });
     }
     else if (id == 2)
     {
