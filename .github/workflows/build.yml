@@ -1,4 +1,5 @@
 name: Build WARP
+name: Build WARP
 
 on:
   workflow_dispatch:
@@ -48,14 +49,30 @@ jobs:
         Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" -OutFile "models/minilm.onnx"
         Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
 
+    - name: Detect available VC toolset
+      id: toolset
+      shell: pwsh
+      run: |
+        $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+        $installPath = & $vsWhere -latest -property installationPath
+        $vcToolsDir = Join-Path $installPath "VC\Tools\MSVC"
+        $versions = Get-ChildItem $vcToolsDir -Directory | Sort-Object Name -Descending
+        $latestVersion = $versions[0].Name
+        # Derive platform toolset: 14.4x -> v144, 14.3x -> v143, etc.
+        $major = $latestVersion.Split('.')[0]
+        $minor = $latestVersion.Split('.')[1]
+        $toolset = "v${major}${minor}"
+        Write-Host "Detected VC tools version: $latestVersion -> PlatformToolset=$toolset"
+        echo "value=$toolset" >> $env:GITHUB_OUTPUT
+
     - name: Build ARM64
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=ARM64 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=ARM64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Build x64
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Build x86
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Stage artifacts
       shell: pwsh
