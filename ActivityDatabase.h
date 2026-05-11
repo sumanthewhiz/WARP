@@ -6,6 +6,8 @@
 #include <mutex>
 #include <cstdint>
 
+#include "EventContext.h"
+
 // --- Event type flags (bitmask for queries) ---
 static const uint32_t EVENT_TYPE_FILE       = 0x01;
 static const uint32_t EVENT_TYPE_APP_LAUNCH = 0x02;
@@ -75,7 +77,8 @@ public:
     // File activity
     bool InsertActivity(const std::wstring& action,
                         const std::wstring& path,
-                        const std::wstring& oldPath = L"");
+                        const std::wstring& oldPath = L"",
+                        const EventContext& ctx     = EventContext{});
 
     std::vector<FileActivity> QueryFiles(TimeWindow window);
     std::vector<FileActivity> QueryFilesCustomSeconds(int64_t seconds);
@@ -83,7 +86,8 @@ public:
     // App launch activity
     bool InsertAppLaunch(const std::wstring& exeName,
                          const std::wstring& exePath,
-                         DWORD pid);
+                         DWORD               pid,
+                         const EventContext& ctx = EventContext{});
 
     std::vector<AppLaunchActivity> QueryAppLaunches(TimeWindow window);
     std::vector<AppLaunchActivity> QueryAppLaunchesCustomSeconds(int64_t seconds);
@@ -91,7 +95,8 @@ public:
     // Browsing activity
     bool InsertBrowsingActivity(const std::wstring& browser,
                                 const std::wstring& title,
-                                const std::wstring& url = L"");
+                                const std::wstring& url = L"",
+                                const EventContext& ctx = EventContext{});
 
     std::vector<BrowsingActivity> QueryBrowsing(TimeWindow window);
     std::vector<BrowsingActivity> QueryBrowsingCustomSeconds(int64_t seconds);
@@ -100,7 +105,8 @@ public:
     bool InsertAppFocusActivity(const std::wstring& exeName,
                                 const std::wstring& exePath,
                                 const std::wstring& windowTitle,
-                                int durationSecs);
+                                int                 durationSecs,
+                                const EventContext& ctx = EventContext{});
 
     std::vector<AppFocusActivity> QueryAppFocus(TimeWindow window);
     std::vector<AppFocusActivity> QueryAppFocusCustomSeconds(int64_t seconds);

@@ -356,7 +356,7 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
 
     // Section: Default (empty) query
     g_hDefaultLabel = CreateWindowW(L"STATIC",
-        L"Query with Default (empty body — returns last 1 hour)",
+        L"Query with Default (empty body ï¿½ returns last 1 hour)",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         0, 0, 0, 0, hWnd, nullptr, hInstance, nullptr);
     SendMessageW(g_hDefaultLabel, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
@@ -1027,38 +1027,42 @@ void StartSubsystems()
 
     g_fileMonitor.SetCallback([](const std::wstring& action,
                                  const std::wstring& path,
-                                 const std::wstring& oldPath) {
-        g_db.InsertActivity(action, path, oldPath);
+                                 const std::wstring& oldPath,
+                                 const EventContext& ctx) {
+        g_db.InsertActivity(action, path, oldPath, ctx);
         int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnFileEvent(action, path, now);
+        g_inference.OnFileEvent(action, path, now, ctx.confidence);
     });
     g_fileMonitor.Start();
 
     g_appLaunchMonitor.SetCallback([](const std::wstring& exeName,
                                       const std::wstring& exePath,
-                                      DWORD pid) {
-        g_db.InsertAppLaunch(exeName, exePath, pid);
+                                      DWORD               pid,
+                                      const EventContext& ctx) {
+        g_db.InsertAppLaunch(exeName, exePath, pid, ctx);
         int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnAppLaunchEvent(exePath, now);
+        g_inference.OnAppLaunchEvent(exePath, now, ctx.confidence);
     });
     g_appLaunchMonitor.Start();
 
     g_browsingMonitor.SetCallback([](const std::wstring& browser,
                                      const std::wstring& title,
-                                     const std::wstring& url) {
-        g_db.InsertBrowsingActivity(browser, title, url);
+                                     const std::wstring& url,
+                                     const EventContext& ctx) {
+        g_db.InsertBrowsingActivity(browser, title, url, ctx);
         int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnBrowsingEvent(url.empty() ? title : url, now);
+        g_inference.OnBrowsingEvent(url.empty() ? title : url, now, ctx.confidence);
     });
     g_browsingMonitor.Start();
 
     g_foregroundMonitor.SetCallback([](const std::wstring& exeName,
                                        const std::wstring& exePath,
                                        const std::wstring& windowTitle,
-                                       int durationSecs) {
-        g_db.InsertAppFocusActivity(exeName, exePath, windowTitle, durationSecs);
+                                       int                 durationSecs,
+                                       const EventContext& ctx) {
+        g_db.InsertAppFocusActivity(exeName, exePath, windowTitle, durationSecs, ctx);
         int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnAppFocusEvent(exePath, now);
+        g_inference.OnAppFocusEvent(exePath, now, ctx.confidence);
     });
     g_foregroundMonitor.Start();
 

@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "ForegroundMonitor.h"
+#include "EventContext.h"
 #include <algorithm>
 #include <psapi.h>
 
@@ -169,7 +170,8 @@ void ForegroundMonitor::MonitorLoop()
                 int durationSecs = static_cast<int>((nowTick - prevStartTick) / 1000);
                 if (durationSecs >= 3 && m_callback)  // at least one poll interval
                 {
-                    m_callback(prevExeName, prevExePath, prevTitle, durationSecs);
+                    EventContext ctx = EventContextUtil::CaptureContext(prevPid);
+                    m_callback(prevExeName, prevExePath, prevTitle, durationSecs, ctx);
                 }
             }
 
@@ -217,7 +219,8 @@ void ForegroundMonitor::MonitorLoop()
         int durationSecs = static_cast<int>((nowTick - prevStartTick) / 1000);
         if (durationSecs >= 3 && m_callback)
         {
-            m_callback(prevExeName, prevExePath, prevTitle, durationSecs);
+            EventContext ctx = EventContextUtil::CaptureContext(prevPid);
+            m_callback(prevExeName, prevExePath, prevTitle, durationSecs, ctx);
         }
     }
 }

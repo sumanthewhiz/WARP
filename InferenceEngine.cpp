@@ -172,7 +172,8 @@ InferenceRecord& InferenceEngine::LoadOrCreate(const std::string& key,
 
 void InferenceEngine::OnFileEvent(const std::wstring& action,
                                    const std::wstring& path,
-                                   int64_t eventTs)
+                                   int64_t             eventTs,
+                                   double              confidence)
 {
     if (path.empty()) return;
 
@@ -184,12 +185,20 @@ void InferenceEngine::OnFileEvent(const std::wstring& action,
 
     rec.lastEventTs = eventTs;
 
-    if (actionUtf8 == "OPEN")
+    // Counters are integer-typed in the existing schema; we accumulate
+    // floor(confidence + jitter) to avoid biasing low-confidence events to
+    // always round to zero. A pending-fractional accumulator stored in the
+    // cache lets fractional confidence add up over time. Until the schema is
+    // upgraded to REAL counters in a later commit, we treat <0.5 as "do not
+    // count" and >=0.5 as "count once".
+    int countDelta = (confidence >= 0.5) ? 1 : 0;
+
+    if (actionUtf8 == "OPEN" && countDelta > 0)
     {
         rec.lastOpenTs = eventTs;
-        rec.openCount7d++;
-        rec.openCount30d++;
-        rec.openCountTotal++;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
     }
     else if (actionUtf8 == "MODIFY" || actionUtf8 == "CREATE")
     {
@@ -207,7 +216,9 @@ void InferenceEngine::OnFileEvent(const std::wstring& action,
     }
 }
 
-void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t eventTs)
+void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath,
+                                        int64_t             eventTs,
+                                        double              confidence)
 {
     if (exePath.empty()) return;
 
@@ -216,11 +227,16 @@ void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t even
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     InferenceRecord& rec = LoadOrCreate(key, "app");
 
+    int countDelta = (confidence >= 0.5) ? 1 : 0;
+
     rec.lastEventTs    = eventTs;
-    rec.lastOpenTs     = eventTs;
-    rec.openCount7d++;
-    rec.openCount30d++;
-    rec.openCountTotal++;
+    if (countDelta > 0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
     rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
     rec.version++;
     rec.updatedAt      = eventTs;
@@ -231,7 +247,9 @@ void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t even
     }
 }
 
-void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
+void InferenceEngine::OnBrowsingEvent(const std::wstring& url,
+                                       int64_t             eventTs,
+                                       double              confidence)
 {
     if (url.empty()) return;
 
@@ -240,11 +258,16 @@ void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     InferenceRecord& rec = LoadOrCreate(key, "url");
 
+    int countDelta = (confidence >= 0.5) ? 1 : 0;
+
     rec.lastEventTs    = eventTs;
-    rec.lastOpenTs     = eventTs;
-    rec.openCount7d++;
-    rec.openCount30d++;
-    rec.openCountTotal++;
+    if (countDelta > 0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
     rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
     rec.version++;
     rec.updatedAt      = eventTs;
@@ -255,7 +278,9 @@ void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
     }
 }
 
-void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath, int64_t eventTs)
+void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath,
+                                       int64_t             eventTs,
+                                       double              confidence)
 {
     if (exePath.empty()) return;
 
@@ -264,11 +289,16 @@ void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath, int64_t event
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     InferenceRecord& rec = LoadOrCreate(key, "app");
 
+    int countDelta = (confidence >= 0.5) ? 1 : 0;
+
     rec.lastEventTs    = eventTs;
-    rec.lastOpenTs     = eventTs;
-    rec.openCount7d++;
-    rec.openCount30d++;
-    rec.openCountTotal++;
+    if (countDelta > 0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
     rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
     rec.version++;
     rec.updatedAt      = eventTs;

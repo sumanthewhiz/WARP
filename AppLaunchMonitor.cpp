@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "AppLaunchMonitor.h"
+#include "EventContext.h"
 #include <tlhelp32.h>
 #include <algorithm>
 #include <unordered_set>
@@ -286,7 +287,17 @@ void AppLaunchMonitor::MonitorLoop()
                         continue;
 
                     if (m_callback)
-                        m_callback(exeName, exePath, pid);
+                    {
+                        // For a freshly-launched process the source IS the
+                        // new PID. parentPid+parentExe are stamped here so
+                        // downstream consumers can identify svchost-spawned
+                        // workers without re-walking the process tree.
+                        EventContext ctx = EventContextUtil::CaptureContext(pid);
+                        ctx.parentPid = EventContextUtil::GetParentPid(pid);
+                        if (ctx.parentPid != 0)
+                            ctx.parentExe = EventContextUtil::GetExePathByPid(ctx.parentPid);
+                        m_callback(exeName, exePath, pid, ctx);
+                    }
                 }
             } while (Process32NextW(snap, &pe));
         }

@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "BrowsingMonitor.h"
+#include "EventContext.h"
 #include <algorithm>
 #include <psapi.h>
 
@@ -188,6 +189,13 @@ void BrowsingMonitor::MonitorLoop()
         std::wstring pageTitle = ExtractTitleAndUrl(rawTitle, browser, url);
 
         if (!pageTitle.empty() && m_callback)
-            m_callback(browser, pageTitle, url);
+        {
+            // Browser navigation events are attributed to the foreground
+            // browser PID. ms-since-input is critical here -- a title change
+            // > 5s after the last user input is almost always a background
+            // refresh / SPA timer rather than human navigation.
+            EventContext ctx = EventContextUtil::CaptureContext(fgPid);
+            m_callback(browser, pageTitle, url, ctx);
+        }
     }
 }

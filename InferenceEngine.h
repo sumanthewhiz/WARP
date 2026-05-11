@@ -36,16 +36,29 @@ public:
     // Called after every raw file-activity event is written.
     // action: CREATE, OPEN, MODIFY, DELETE, RENAME
     // path: full file path (will be lowercased as entity_key)
-    void OnFileEvent(const std::wstring& action, const std::wstring& path, int64_t eventTs);
+    // confidence: producer's [0,1] estimate that this event is user-initiated.
+    //             Counters are incremented by `confidence` (REAL) so noisy
+    //             system-attributed events contribute proportionally less to
+    //             the rolling counts than user-foreground events.
+    void OnFileEvent(const std::wstring& action,
+                     const std::wstring& path,
+                     int64_t             eventTs,
+                     double              confidence = 1.0);
 
     // Called after every raw app-launch event is written.
-    void OnAppLaunchEvent(const std::wstring& exePath, int64_t eventTs);
+    void OnAppLaunchEvent(const std::wstring& exePath,
+                          int64_t             eventTs,
+                          double              confidence = 1.0);
 
     // Called after every raw browsing event is written.
-    void OnBrowsingEvent(const std::wstring& url, int64_t eventTs);
+    void OnBrowsingEvent(const std::wstring& url,
+                         int64_t             eventTs,
+                         double              confidence = 1.0);
 
     // Called after every foreground-app focus session ends.
-    void OnAppFocusEvent(const std::wstring& exePath, int64_t eventTs);
+    void OnAppFocusEvent(const std::wstring& exePath,
+                         int64_t             eventTs,
+                         double              confidence = 1.0);
 
     // Batch lookup for QueryInferences op.
     // paths: list of entity keys to look up (already UTF-8 lowercase).

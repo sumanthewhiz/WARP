@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "framework.h"
 #include "FileMonitor.h"
+#include "EventContext.h"
 #include <shlobj.h>
 #include <algorithm>
 #include <evntrace.h>
@@ -17,12 +18,12 @@ static FileMonitor* g_pFileMonitor = nullptr;
 
 static const wchar_t* WARP_ETW_SESSION_NAME = L"NT Kernel Logger";
 
-// SystemTraceControlGuid — required as Wnode.Guid for NT Kernel Logger
+// SystemTraceControlGuid ï¿½ required as Wnode.Guid for NT Kernel Logger
 // {9E814AAD-3204-11D2-9A82-006008A86939}
 static const GUID SystemTraceControlGuid =
     { 0x9E814AAD, 0x3204, 0x11D2, { 0x9A, 0x82, 0x00, 0x60, 0x08, 0xA8, 0x69, 0x39 } };
 
-// Classic FileIo GUID — events in the NT Kernel Logger use this provider GUID
+// Classic FileIo GUID ï¿½ events in the NT Kernel Logger use this provider GUID
 // {90CBDC39-4A3E-11D1-84F4-0000F80464E3}
 static const GUID FileIoGuid =
     { 0x90CBDC39, 0x4A3E, 0x11D1, { 0x84, 0xF4, 0x00, 0x00, 0xF8, 0x04, 0x64, 0xE3 } };
@@ -31,7 +32,7 @@ static const GUID FileIoGuid =
 static std::unordered_map<std::wstring, std::wstring> g_deviceToDrive;
 static std::once_flag g_deviceMapOnce;
 
-// Our own PID — used to skip self-generated file-open events
+// Our own PID ï¿½ used to skip self-generated file-open events
 static DWORD g_ownPid = 0;
 
 // Cache of PIDs already classified as user (true) or system (false)
@@ -64,7 +65,7 @@ static bool IsUserProcess(DWORD pid)
 
     bool isUser = false;
 
-    // Check session ID — session 0 is services, session >= 1 is interactive
+    // Check session ID ï¿½ session 0 is services, session >= 1 is interactive
     DWORD sessionId = 0;
     if (ProcessIdToSessionId(pid, &sessionId) && sessionId >= 1)
     {
@@ -173,7 +174,7 @@ static bool IsUserProcess(DWORD pid)
         }
         else
         {
-            // Can't open the process — likely a system process, skip it
+            // Can't open the process ï¿½ likely a system process, skip it
             isUser = false;
         }
     }
@@ -670,7 +671,7 @@ void FileMonitor::MonitorDrive(const std::wstring& root)
     HANDLE waitHandles[2] = { overlapped.hEvent, m_stopEvent };
 
     // Only watch for user-visible file operations.
-    // Excluded: ATTRIBUTES, SIZE, SECURITY — these fire constantly from
+    // Excluded: ATTRIBUTES, SIZE, SECURITY ï¿½ these fire constantly from
     // search indexing, antivirus scans, system metadata updates, etc.
     const DWORD filter =
         FILE_NOTIFY_CHANGE_FILE_NAME |
@@ -752,13 +753,16 @@ void FileMonitor::MonitorDrive(const std::wstring& root)
                 !ShouldExclude(fullPath) &&
                 (oldPath.empty() || !ShouldExclude(oldPath)))
             {
-                m_callback(action, fullPath, oldPath);
+                // RDCW gives us no PID -- producer must guess. Carry an
+                // unattributed context (sourcePid=0) plus current foreground.
+                EventContext ctx = EventContextUtil::CaptureContext(0);
+                m_callback(action, fullPath, oldPath, ctx);
             }
 
             if (info->NextEntryOffset == 0)
                 break;
 
-            // Skip ahead – but if we already consumed the next entry for a rename, skip it
+            // Skip ahead ï¿½ but if we already consumed the next entry for a rename, skip it
             if (info->Action == FILE_ACTION_RENAMED_OLD_NAME && info->NextEntryOffset != 0)
             {
                 auto* next = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(ptr + info->NextEntryOffset);
@@ -884,7 +888,11 @@ void FileMonitor::MonitorShellNotifications()
                         !ShouldExclude(path) &&
                         (oldPath.empty() || !ShouldExclude(oldPath)))
                     {
-                        m_callback(action, path, oldPath);
+                        // SHChangeNotifyRegister doesn't give us a PID either;
+                        // the shell hides the originating process behind
+                        // its broker. Capture neutral source, real foreground.
+                        EventContext ctx = EventContextUtil::CaptureContext(0);
+                        m_callback(action, path, oldPath, ctx);
                     }
 
                     SHChangeNotification_Unlock(hLock);
@@ -930,13 +938,13 @@ void FileMonitor::StartEtwTrace()
     props->Wnode.Guid = SystemTraceControlGuid;
     props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
     props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    // Enable file I/O init events — this captures every NtCreateFile / NtOpenFile call
+    // Enable file I/O init events ï¿½ this captures every NtCreateFile / NtOpenFile call
     props->EnableFlags = EVENT_TRACE_FLAG_FILE_IO_INIT;
 
     ULONG status = StartTraceW(&m_etwSessionHandle, WARP_ETW_SESSION_NAME, props);
     if (status == ERROR_ALREADY_EXISTS)
     {
-        // Session already running (possibly from a previous crash) — stop and retry
+        // Session already running (possibly from a previous crash) ï¿½ stop and retry
         StopEtwTrace();
         memset(propsBuf.data(), 0, bufSize);
         props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
@@ -1076,7 +1084,7 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
         return;
     }
 
-    // Skip bare drive roots (e.g. "C:\") — not meaningful user activity
+    // Skip bare drive roots (e.g. "C:\") ï¿½ not meaningful user activity
     if (filePath.size() <= 3)
         return;
 
@@ -1118,12 +1126,13 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
         auto it = dedup_map.find(key);
         if (it != dedup_map.end() && (now - it->second) < 2000)
         {
-            // Duplicate within 2 seconds — skip
+            // Duplicate within 2 seconds ï¿½ skip
             it->second = now;
             return;
         }
         dedup_map[key] = now;
     }
 
-    self->m_callback(L"OPEN", filePath, L"");
+    EventContext ctx = EventContextUtil::CaptureContext(pEvent->EventHeader.ProcessId);
+    self->m_callback(L"OPEN", filePath, L"", ctx);
 }

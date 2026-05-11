@@ -6,10 +6,13 @@
 #include <atomic>
 #include <functional>
 
-// Callback: exeName, exePath, pid
+#include "EventContext.h"
+
+// Callback: exeName, exePath, pid, EventContext (parentPid, foreground, etc.)
 using AppLaunchCallback = std::function<void(const std::wstring& exeName,
                                              const std::wstring& exePath,
-                                             DWORD pid)>;
+                                             DWORD                pid,
+                                             const EventContext&  ctx)>;
 
 class AppLaunchMonitor
 {

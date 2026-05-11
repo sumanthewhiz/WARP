@@ -6,11 +6,14 @@
 #include <atomic>
 #include <functional>
 
-// Callback: exeName, exePath, windowTitle, durationSecs
+#include "EventContext.h"
+
+// Callback: exeName, exePath, windowTitle, durationSecs, EventContext.
 using ForegroundCallback = std::function<void(const std::wstring& exeName,
                                               const std::wstring& exePath,
                                               const std::wstring& windowTitle,
-                                              int durationSecs)>;
+                                              int                 durationSecs,
+                                              const EventContext& ctx)>;
 
 class ForegroundMonitor
 {

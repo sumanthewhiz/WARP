@@ -6,10 +6,13 @@
 #include <atomic>
 #include <functional>
 
-// Callback: browser name, page title, url
+#include "EventContext.h"
+
+// Callback: browser name, page title, url, EventContext.
 using BrowsingCallback = std::function<void(const std::wstring& browser,
                                             const std::wstring& title,
-                                            const std::wstring& url)>;
+                                            const std::wstring& url,
+                                            const EventContext& ctx)>;
 
 class BrowsingMonitor
 {
