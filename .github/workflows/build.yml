@@ -24,7 +24,7 @@ jobs:
         else
           RAW="${{ github.ref_name }}"
         fi
-        # main/master -> releasepreview, everything else keeps its branch name
+        # main/master -> releasepreview, else keep its branch name
         if [ "$RAW" = "main" ] || [ "$RAW" = "master" ]; then
           LABEL="releasepreview"
         else
