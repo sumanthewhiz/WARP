@@ -1,4 +1,11 @@
-# WARP - Windows Activity Reasoning Platform
+# WARP — Windows Activity Reasoning Platform
+
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d6)](https://www.microsoft.com/windows/)
+[![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
+[![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
+[![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
+[![ONNX Runtime](https://img.shields.io/badge/inference-ONNX%20Runtime%201.22-005CED)](https://onnxruntime.ai/)
+[![Model](https://img.shields.io/badge/embeddings-all--MiniLM--L6--v2-yellow)](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
 
 WARP is a lightweight Windows desktop application that silently monitors file/folder
 activity, application launches, foreground app focus (with window titles and dwell
@@ -9,6 +16,27 @@ running on the same machine can programmatically retrieve activity history.
 The application starts minimized to the system tray (notification area), requires
 administrator privileges, and is designed to run continuously in the background for as
 long as the PC is actively being used.
+
+---
+
+## Table of contents
+
+- [Features](#features)
+- [Event types](#event-types)
+- [Architecture](#architecture)
+  - [System overview](#system-overview)
+  - [Event-capture pipeline](#event-capture-pipeline)
+  - [Noise-reduction & confidence pipeline](#noise-reduction--confidence-pipeline)
+  - [Component overview](#component-overview)
+- [Data model](#data-model)
+- [User interface](#user-interface)
+- [Building](#building)
+- [Tech stack](#tech-stack)
+- [Runtime behaviour](#runtime-behaviour)
+- [Query API documentation](#query-api-documentation)
+- [File layout](#file-layout)
+- [License](#license)
+- [Author](#author)
 
 ---
 
@@ -52,66 +80,191 @@ WARP captures three categories of events:
 
 ## Architecture
 
+WARP is a single-process Win32 application built around four **event producers**, a
+shared layer of **cross-cutting infrastructure** that classifies and contextualises
+every event, and a **storage + analytics** layer that persists raw events and
+maintains incrementally-updated per-entity inferences.
+
+### System overview
+
+```mermaid
+flowchart TB
+    classDef producer fill:#e1f0ff,stroke:#1a73e8,color:#000,stroke-width:1.5px
+    classDef infra    fill:#fff4e1,stroke:#f9ab00,color:#000,stroke-width:1.5px
+    classDef storage  fill:#e6f4ea,stroke:#1e8e3e,color:#000,stroke-width:1.5px
+    classDef api      fill:#fce8e6,stroke:#d93025,color:#000,stroke-width:1.5px
+    classDef ui       fill:#f3e8fd,stroke:#9334e6,color:#000,stroke-width:1.5px
+
+    subgraph App ["WARP!.cpp · Win32 entry point + UI thread"]
+        UI["Tray icon · Themed UI · Inference explorer · API test panel"]:::ui
+    end
+
+    subgraph Producers ["Event producers"]
+        FM["FileMonitor"]:::producer
+        ALM["AppLaunchMonitor"]:::producer
+        BM["BrowsingMonitor"]:::producer
+        FGM["ForegroundMonitor"]:::producer
+    end
+
+    subgraph Infra ["Cross-cutting infrastructure"]
+        FCB["ForegroundChangeBroker<br/><sub>single global hook</sub>"]:::infra
+        LC["LaunchCorrelator<br/><sub>window-create hook · 5 s window</sub>"]:::infra
+        SPC["SystemProcessClassifier<br/><sub>multi-signal voting</sub>"]:::infra
+        UE["UrlExtractor<br/><sub>UIA on MTA worker</sub>"]:::infra
+        ID["IdleDetector<br/><sub>two-tier + wake boundary</sub>"]:::infra
+    end
+
+    subgraph Storage ["Storage and analytics"]
+        EC["EventContext<br/><sub>per-event payload</sub>"]:::storage
+        DB[("ActivityDatabase<br/><sub>SQLite WAL · activity.db</sub>")]:::storage
+        IE["InferenceEngine<br/><sub>confidence-weighted REAL counters</sub>"]:::storage
+        TI["TopicInference<br/><sub>MiniLM ONNX · 5-min cycle</sub>"]:::storage
+    end
+
+    subgraph QueryLayer ["Query surface"]
+        API[/"QueryApi<br/><sub>\\\\.\\pipe\\WarpFileActivityAPI</sub>"/]:::api
+    end
+
+    UI -. starts .-> Producers
+    UI -. queries .-> API
+
+    FCB --> BM
+    FCB --> FGM
+    LC  --> ALM
+    BM  --> UE
+
+    FM  -. classifies .-> SPC
+    ALM -. classifies .-> SPC
+    BM  -. classifies .-> SPC
+    FGM -. classifies .-> SPC
+
+    ID -. attenuates .-> EC
+
+    FM  --> EC
+    ALM --> EC
+    BM  --> EC
+    FGM --> EC
+
+    EC --> DB
+    DB <--> IE
+    DB --> TI
+
+    IE --> API
+    DB --> API
+    TI --> API
 ```
-+----------------------------------------------------------------------------+
-|                              WARP!.cpp                                     |
-|                        (Win32 entry point + UI)                            |
-+----------------------------------------------------------------------------+
 
-  Producers (run on dedicated threads / ETW callbacks)
-  ----------------------------------------------------
-   FileMonitor        AppLaunchMonitor   BrowsingMonitor    ForegroundMonitor
-   --------------     ---------------    ---------------    -----------------
-   ETW Kernel-File    ETW Kernel-Process broker subscriber  broker subscriber
-   (private session,  (private session)  + per-PID NAME-    (event-driven)
-    fixed drives)     + LaunchCorrelator CHANGE hook
-   RDChangesW         (window-create     + UrlExtractor
-   (rm / net only)     hook, 5s window)   (UIA, MTA worker
-   SHChangeNotify                          thread, bounded
-                                           queue)
+### Event-capture pipeline
 
-   Each producer emits an event + a populated EventContext:
-     {sourcePid, sourceExe, foregroundPid, foregroundExe,
-      msSinceInput, parentPid, parentExe, createdWindowMs, confidence}
+A canonical file-open event traces the following path from the kernel through
+classification, context capture, and persistence to inference. The same shape
+applies to launches, focus changes, and browsing events; only the *source* and
+the producer-specific classification differ.
 
-  Cross-cutting infrastructure
-  ----------------------------
-   ForegroundChangeBroker     SystemProcessClassifier   IdleDetector
-   ----------------------     -----------------------   ------------
-   single global              multi-signal voting:      two-tier:
-   EVENT_SYSTEM_FOREGROUND    parent ancestry,          soft -> attenuate
-   hook fans out to           image path,                       confidence
-   subscribers                Authenticode subject,     hard -> pause
-                              session, integrity,       monitors
-                              name pattern              + wake boundary
-                                                        (5s, x0.2 conf)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K   as Kernel<br/>(Microsoft-Windows-Kernel-File)
+    participant ETW as WARP-FileTrace<br/>(private ETW session)
+    participant FM  as FileMonitor
+    participant SPC as SystemProcessClassifier
+    participant TB  as Token bucket<br/>(per-PID · 64 tok/s)
+    participant EC  as EventContext
+    participant DB  as ActivityDatabase
+    participant IE  as InferenceEngine
 
-  Storage + analytics
-  -------------------
-   InferenceEngine -> ActivityDatabase -> SQLite (activity.db)
-   ---------------    -----------------    ---------------------
-   counters +=        4 activity tables    %LOCALAPPDATA%\WARP\
-   confidence         + uniform Event-     activity.db (WAL mode)
-   recency =          Context columns
-   e^(-Δt/τ) + ...    + inference table
+    K->>ETW: NtCreateFile event
+    ETW->>FM: EventRecord callback (sourcePid, path, …)
+    FM->>FM: Goop filter + AppData allowlist
+    Note over FM: drops 80%+ of system noise<br/>before any classification cost
+    FM->>SPC: classify(sourcePid)
+    SPC-->>FM: isSystem? (cached 60 s)
 
-  Query surface
-  -------------
-   QueryApi -> Named pipe \\.\pipe\WarpFileActivityAPI
-   --------    -----------------------------------------
-   serves event queries, QueryInferences, GetInferenceDeltas,
-   and GetRecentContext
+    alt isSystem == true
+        FM->>EC: confidence = 0.4
+    else isSystem == false
+        FM->>TB: take(sourcePid)
+        alt bucket has tokens
+            TB-->>FM: ok
+            FM->>EC: confidence = 1.0
+        else bucket dry
+            TB-->>FM: drained
+            FM->>EC: confidence = 0.1
+        end
+    end
 
-  Semantic layer (independent)
-  ----------------------------
-   TopicInference (BertTokenizer + MiniLM ONNX)
-   ---------------------------------------------
-   every 5 min: embed last 15 min of activities -> cosine match
-   against ~50 pre-embedded topic labels -> greedy set-cover for
-   top 3 topics covering >= 90% of activities
+    FM->>EC: CaptureContext(pid)
+    Note over EC: applies wake-boundary × 0.2<br/>if within 5 s of resume
+    EC->>DB: INSERT INTO file_activity<br/>(... + 9 EventContext columns)
+    DB->>IE: OnFileEvent(path, ts, confidence)
+    IE->>IE: open_count_7d += confidence<br/>recency = 200·e^(-Δt/τ) + 5·ln(1 + open_count_7d)
 ```
+
+### Noise-reduction & confidence pipeline
+
+Every event reaches `InferenceEngine` carrying a single `confidence` value in
+`[0, 1]` that summarises *all* the signals WARP has about whether the event
+came from the user. Confidence is assigned at capture time, then optionally
+attenuated by two context modifiers before it is committed.
+
+```mermaid
+flowchart LR
+    classDef high     fill:#34a853,color:#fff,stroke:#1e8e3e,stroke-width:2px
+    classDef med      fill:#fbbc04,color:#000,stroke:#f9ab00,stroke-width:2px
+    classDef low      fill:#ea4335,color:#fff,stroke:#c5221f,stroke-width:2px
+    classDef veryLow  fill:#5f6368,color:#fff,stroke:#3c4043,stroke-width:2px
+    classDef store    fill:#e8eaed,color:#000,stroke:#5f6368,stroke-width:1.5px
+    classDef agg      fill:#e6f4ea,color:#000,stroke:#1e8e3e,stroke-width:1.5px
+
+    subgraph Capture ["Capture-time confidence"]
+        direction TB
+        CAP_USER["User-visible event<br/><sub>focus change · windowed launch · user file write</sub>"]:::high
+        CAP_SYS["Classified system process<br/><sub>SystemProcessClassifier vote</sub>"]:::med
+        CAP_HEADLESS["Process create with<br/>no window in 5 s<br/><sub>LaunchCorrelator timeout</sub>"]:::med
+        CAP_BURST["Token bucket drained<br/><sub>per-PID burst suppressor</sub>"]:::veryLow
+    end
+
+    subgraph Modify ["Context modifiers (multiplicative)"]
+        direction TB
+        WAKE["Within 5 s of wake<br/>× 0.2"]:::low
+        SOFT["Soft idle reached<br/>× attenuation factor"]:::low
+    end
+
+    EC["EventContext.confidence<br/><sub>REAL · committed to DB</sub>"]:::store
+
+    subgraph Aggregate ["Aggregation in InferenceEngine"]
+        direction TB
+        IE["open_count_7d / 30d / total<br/>+= confidence"]:::agg
+        REC["recency_score<br/>= 200 · e^(-Δt / τ) + 5 · ln(1 + open_count_7d)"]:::agg
+    end
+
+    CAP_USER     -- "1.0" --> EC
+    CAP_SYS      -- "0.4" --> EC
+    CAP_HEADLESS -- "0.3" --> EC
+    CAP_BURST    -- "0.1" --> EC
+
+    WAKE -.-> EC
+    SOFT -.-> EC
+
+    EC --> IE
+    IE --> REC
+```
+
+> **Why confidence-weighted aggregation matters:** the previous design used a
+> hard `(confidence ≥ 0.5) ? 1 : 0` threshold, which dropped low-confidence
+> events entirely. The new pipeline lets a stream of *n* events at average
+> confidence *c* contribute *n × c* to the rolling counts, so a steady trickle
+> of dim signal still surfaces in popularity ranking, just at a commensurate
+> weight. JSON output rounds to integer via `llround()` so the documented
+> integer `open_count_*` API contract still holds for clients.
 
 ### Component overview
+
+Components fall into five logical groups: an **application shell**, four
+**event producers**, the **cross-cutting infrastructure** they share, the
+**storage and analytics** layer, and a single **query surface**.
+
+> **Application shell**
 
 #### `WARP!.cpp` -- Application shell & UI
 
@@ -155,6 +308,8 @@ GDI brushes and issues a full `RedrawWindow` with `RDW_ALLCHILDREN`.
 
 Closing or minimizing the window hides it back to the tray; only **Exit** from the
 tray menu terminates the process.
+
+> **Event producers**
 
 #### `FileMonitor` (`FileMonitor.h` / `FileMonitor.cpp`)
 
@@ -298,6 +453,8 @@ required by user-context scenarios such as improving search relevance based on
 current app activity, inferring user intent from window titles, and tracking app
 usage frequency and duration patterns over time.
 
+> **Cross-cutting infrastructure**
+
 #### `IdleDetector` (`IdleDetector.h` / `IdleDetector.cpp`)
 
 A polling thread that checks `GetLastInputInfo` every 5 seconds and
@@ -417,6 +574,8 @@ indefinitely. The extractor:
 Empty / failed extractions fall back to leaving the URL field NULL so
 the title-only browsing event still records.
 
+> **Storage and analytics**
+
 #### `ActivityDatabase` (`ActivityDatabase.h` / `ActivityDatabase.cpp`)
 
 A thread-safe SQLite wrapper. The database is stored at:
@@ -425,95 +584,10 @@ A thread-safe SQLite wrapper. The database is stored at:
 %LOCALAPPDATA%\WARP\activity.db
 ```
 
-**Schema:**
-
-The four activity tables share a uniform **EventContext** suffix —
-`source_pid`, `source_exe`, `foreground_pid`, `foreground_exe`,
-`ms_since_input`, `parent_pid`, `parent_exe`, `created_window_ms`,
-`confidence` (REAL DEFAULT 1.0). On open, `ActivityDatabase` runs an
-idempotent `ALTER TABLE … ADD COLUMN` for each context column on each
-activity table, so upgrading from an older WARP install does not require
-a fresh DB (SQLite returns a duplicate-column error which is silently
-ignored). For brevity the DDL below shows the context columns only on
-`file_activity`; the other three tables carry the same nine columns.
-
-```sql
-CREATE TABLE file_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    action    TEXT    NOT NULL,        -- CREATE | OPEN | DELETE | MODIFY | RENAME
-    path      TEXT    NOT NULL,        -- full path of the affected file/folder
-    old_path  TEXT,                    -- previous path (RENAME only; NULL otherwise)
-    -- EventContext (added to every activity table via idempotent ALTER):
-    source_pid        INTEGER,
-    source_exe        TEXT,
-    foreground_pid    INTEGER,
-    foreground_exe    TEXT,
-    ms_since_input    INTEGER,
-    parent_pid        INTEGER,
-    parent_exe        TEXT,
-    created_window_ms INTEGER,
-    confidence        REAL DEFAULT 1.0
-);
-
-CREATE TABLE app_launch_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    exe_name  TEXT    NOT NULL,
-    exe_path  TEXT    NOT NULL,
-    pid       INTEGER NOT NULL
-    -- + EventContext columns
-);
-
-CREATE TABLE browsing_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    browser   TEXT    NOT NULL,
-    title     TEXT    NOT NULL,
-    url       TEXT
-    -- + EventContext columns
-);
-
-CREATE TABLE app_focus_activity (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     INTEGER NOT NULL,
-    exe_name      TEXT    NOT NULL,
-    exe_path      TEXT    NOT NULL,
-    window_title  TEXT    NOT NULL,
-    duration_secs INTEGER NOT NULL
-    -- + EventContext columns
-);
-
-CREATE INDEX idx_activity_ts      ON file_activity(timestamp);
-CREATE INDEX idx_activity_action  ON file_activity(action, timestamp);
-CREATE INDEX idx_app_ts           ON app_launch_activity(timestamp);
-CREATE INDEX idx_browse_ts        ON browsing_activity(timestamp);
-CREATE INDEX idx_focus_ts         ON app_focus_activity(timestamp);
-CREATE INDEX idx_file_src_pid     ON file_activity(source_pid);
-CREATE INDEX idx_file_conf        ON file_activity(confidence);
-
--- Inference table (precomputed per-entity analytics).
--- open_count_* columns have INTEGER affinity but store REAL values
--- (SQLite's dynamic typing accepts REAL into INTEGER-affinity columns
--- losslessly; we read them back via sqlite3_column_double). They
--- accumulate the producer's `confidence` rather than counting events.
-CREATE TABLE inference (
-    entity_key        TEXT PRIMARY KEY,
-    entity_type       TEXT,         -- 'file', 'app', or 'url'
-    last_event_ts     INTEGER,
-    last_open_ts      INTEGER,
-    last_edit_ts      INTEGER,
-    open_count_7d     INTEGER,      -- stores REAL; sum of confidence over 7 days
-    open_count_30d    INTEGER,      -- stores REAL; sum of confidence over 30 days
-    open_count_total  INTEGER,      -- stores REAL; lifetime sum of confidence
-    recency_score     REAL,         -- 0-255 composite score
-    version           INTEGER,      -- monotonic per-entity version
-    updated_at        INTEGER
-);
-
-CREATE INDEX idx_inference_updated_at ON inference(updated_at);
-CREATE INDEX idx_inference_version    ON inference(version);
-```
+**Schema:** see the canonical [Data model](#data-model) section below for the
+SQLite DDL and a corresponding ER diagram. The schema reflects four activity
+tables that share a uniform 9-column **EventContext** suffix, plus a single
+`inference` table that stores per-entity rolling counters.
 
 **Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`.
 
@@ -617,6 +691,8 @@ A header-only BERT WordPiece tokenizer implementation in C++. Loads `vocab.txt`
 This is the same tokenizer algorithm used by the Hugging Face `transformers`
 library for BERT-family models.
 
+> **Query surface**
+
 #### `QueryApi` (`QueryApi.h` / `QueryApi.cpp`)
 
 A named-pipe server listening on:
@@ -642,6 +718,192 @@ The API accepts four kinds of requests:
 Inference operations are routed to the `InferenceEngine` instance;
 `GetRecentContext` is routed to the `TopicInference` instance; event queries
 are handled by `BuildJsonResponse` which reads directly from `ActivityDatabase`.
+
+---
+
+## Data model
+
+WARP persists every observation to a single SQLite database at
+`%LOCALAPPDATA%\WARP\activity.db`. The model is intentionally narrow: four
+**activity tables** (one per producer) that each carry the same 9-column
+**EventContext** suffix, plus one **inference table** that holds rolling
+per-entity counters derived from the activity tables.
+
+```mermaid
+erDiagram
+    file_activity {
+        int       id PK
+        int       timestamp
+        string    action "CREATE OPEN DELETE MODIFY RENAME"
+        string    path
+        string    old_path "RENAME only"
+        int       source_pid "EventContext"
+        string    source_exe "EventContext"
+        int       foreground_pid "EventContext"
+        string    foreground_exe "EventContext"
+        int       ms_since_input "EventContext"
+        int       parent_pid "EventContext"
+        string    parent_exe "EventContext"
+        int       created_window_ms "EventContext"
+        real      confidence "EventContext"
+    }
+    app_launch_activity {
+        int       id PK
+        int       timestamp
+        string    exe_name
+        string    exe_path
+        int       pid
+        int       source_pid "EventContext (+8 more)"
+    }
+    browsing_activity {
+        int       id PK
+        int       timestamp
+        string    browser
+        string    title
+        string    url
+        int       source_pid "EventContext (+8 more)"
+    }
+    app_focus_activity {
+        int       id PK
+        int       timestamp
+        string    exe_name
+        string    exe_path
+        string    window_title
+        int       duration_secs
+        int       source_pid "EventContext (+8 more)"
+    }
+    inference {
+        string    entity_key PK "lowercased path or URL"
+        string    entity_type "file app url"
+        int       last_event_ts
+        int       last_open_ts
+        int       last_edit_ts
+        int       open_count_7d  "REAL stored as INTEGER"
+        int       open_count_30d "REAL stored as INTEGER"
+        int       open_count_total "REAL stored as INTEGER"
+        real      recency_score "0-255"
+        int       version "monotonic"
+        int       updated_at
+    }
+
+    file_activity       ||..o{ inference : "feeds OnFileEvent"
+    app_launch_activity ||..o{ inference : "feeds OnAppLaunchEvent"
+    browsing_activity   ||..o{ inference : "feeds OnBrowsingEvent"
+    app_focus_activity  ||..o{ inference : "feeds OnAppFocusEvent"
+```
+
+The `inference` table is **not** maintained by SQLite triggers; the dotted
+relationships above represent application-level callbacks fired by each
+producer to `InferenceEngine::OnXxxEvent(...)` immediately after the raw
+event is committed.
+
+### EventContext suffix
+
+Every activity table carries the same nine context columns, added on first
+open via idempotent `ALTER TABLE ... ADD COLUMN` (SQLite's duplicate-column
+error is silently swallowed, so upgrading from an older WARP install does
+not require a fresh DB):
+
+| Column              | Type    | Source                                        |
+| ------------------- | ------- | --------------------------------------------- |
+| `source_pid`        | INTEGER | PID that *caused* the event                   |
+| `source_exe`        | TEXT    | Resolved image name for `source_pid`          |
+| `foreground_pid`    | INTEGER | PID that owns the foreground window           |
+| `foreground_exe`    | TEXT    | Resolved image name for `foreground_pid`      |
+| `ms_since_input`    | INTEGER | `GetTickCount64() - GetLastInputInfo()`       |
+| `parent_pid`        | INTEGER | Parent process of `source_pid`                |
+| `parent_exe`        | TEXT    | Resolved image name for `parent_pid`          |
+| `created_window_ms` | INTEGER | Time-to-first-window for the source process   |
+| `confidence`        | REAL    | Per-event weight in `[0, 1]` (DEFAULT `1.0`)  |
+
+### Canonical DDL
+
+```sql
+CREATE TABLE file_activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
+    action    TEXT    NOT NULL,        -- CREATE | OPEN | DELETE | MODIFY | RENAME
+    path      TEXT    NOT NULL,        -- full path of the affected file/folder
+    old_path  TEXT,                    -- previous path (RENAME only; NULL otherwise)
+    -- EventContext (added to every activity table via idempotent ALTER):
+    source_pid        INTEGER,
+    source_exe        TEXT,
+    foreground_pid    INTEGER,
+    foreground_exe    TEXT,
+    ms_since_input    INTEGER,
+    parent_pid        INTEGER,
+    parent_exe        TEXT,
+    created_window_ms INTEGER,
+    confidence        REAL DEFAULT 1.0
+);
+
+CREATE TABLE app_launch_activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    exe_name  TEXT    NOT NULL,
+    exe_path  TEXT    NOT NULL,
+    pid       INTEGER NOT NULL
+    -- + EventContext columns
+);
+
+CREATE TABLE browsing_activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    browser   TEXT    NOT NULL,
+    title     TEXT    NOT NULL,
+    url       TEXT
+    -- + EventContext columns
+);
+
+CREATE TABLE app_focus_activity (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     INTEGER NOT NULL,
+    exe_name      TEXT    NOT NULL,
+    exe_path      TEXT    NOT NULL,
+    window_title  TEXT    NOT NULL,
+    duration_secs INTEGER NOT NULL
+    -- + EventContext columns
+);
+
+CREATE INDEX idx_activity_ts      ON file_activity(timestamp);
+CREATE INDEX idx_activity_action  ON file_activity(action, timestamp);
+CREATE INDEX idx_app_ts           ON app_launch_activity(timestamp);
+CREATE INDEX idx_browse_ts        ON browsing_activity(timestamp);
+CREATE INDEX idx_focus_ts         ON app_focus_activity(timestamp);
+CREATE INDEX idx_file_src_pid     ON file_activity(source_pid);
+CREATE INDEX idx_file_conf        ON file_activity(confidence);
+
+-- Inference table (precomputed per-entity analytics).
+-- open_count_* columns have INTEGER affinity but store REAL values
+-- (SQLite's dynamic typing accepts REAL into INTEGER-affinity columns
+-- losslessly; we read them back via sqlite3_column_double). They
+-- accumulate the producer's `confidence` rather than counting events.
+CREATE TABLE inference (
+    entity_key        TEXT PRIMARY KEY,
+    entity_type       TEXT,         -- 'file', 'app', or 'url'
+    last_event_ts     INTEGER,
+    last_open_ts      INTEGER,
+    last_edit_ts      INTEGER,
+    open_count_7d     INTEGER,      -- stores REAL; sum of confidence over 7 days
+    open_count_30d    INTEGER,      -- stores REAL; sum of confidence over 30 days
+    open_count_total  INTEGER,      -- stores REAL; lifetime sum of confidence
+    recency_score     REAL,         -- 0-255 composite score
+    version           INTEGER,      -- monotonic per-entity version
+    updated_at        INTEGER
+);
+
+CREATE INDEX idx_inference_updated_at ON inference(updated_at);
+CREATE INDEX idx_inference_version    ON inference(version);
+```
+
+### Retention
+
+Records older than **30 days** are deleted from all four activity tables on
+startup and every 6 hours via a `WM_TIMER`. The same timer runs
+`InferenceEngine::RefreshRollingCounts()`, which recomputes `open_count_7d`
+and `open_count_30d` as `SUM(COALESCE(confidence, 1.0))` over the raw event
+tables — guaranteeing the periodic resync stays in lockstep with the
+per-event update path.
 
 ---
 
@@ -734,6 +996,90 @@ The build will automatically:
 
 At runtime, the app looks for the `models/` directory next to the executable first,
 then falls back to `%LOCALAPPDATA%\WARP\models`.
+
+---
+
+## Tech stack
+
+WARP is intentionally lean: a single Win32 executable that talks directly to
+the operating system for capture, to embedded SQLite for persistence, and to
+ONNX Runtime for semantic inference. There is no service host, no background
+broker, and no managed runtime in the dependency graph.
+
+```mermaid
+flowchart TB
+    classDef app   fill:#e1f0ff,stroke:#1a73e8,color:#000,stroke-width:1.5px
+    classDef win   fill:#fff4e1,stroke:#f9ab00,color:#000,stroke-width:1.5px
+    classDef store fill:#e6f4ea,stroke:#1e8e3e,color:#000,stroke-width:1.5px
+    classDef ml    fill:#f3e8fd,stroke:#9334e6,color:#000,stroke-width:1.5px
+    classDef ipc   fill:#fce8e6,stroke:#d93025,color:#000,stroke-width:1.5px
+
+    subgraph App ["Application layer · C++17 · Visual Studio 2022 · /MT"]
+        WARP["WARP.exe<br/><sub>single elevated Win32 process</sub>"]:::app
+    end
+
+    subgraph WinAPI ["Windows APIs (kernel + user mode)"]
+        ETW["Event Tracing for Windows<br/><sub>Microsoft-Windows-Kernel-File / -Process</sub>"]:::win
+        WIN_HOOKS["SetWinEventHook<br/><sub>EVENT_SYSTEM_FOREGROUND / OBJECT_CREATE / NAMECHANGE</sub>"]:::win
+        UIA["UI Automation<br/><sub>address-bar value extraction</sub>"]:::win
+        RDC["ReadDirectoryChangesW<br/><sub>removable / network drives</sub>"]:::win
+        SHELL["SHChangeNotifyRegister<br/><sub>shell namespace fallback</sub>"]:::win
+        IDLE["GetLastInputInfo<br/><sub>two-tier idle detection</sub>"]:::win
+        TRUST["WinVerifyTrust + WinTrust<br/><sub>Authenticode subject lookup</sub>"]:::win
+        TS["WTSQuerySessionInformation<br/><sub>session / integrity</sub>"]:::win
+        PIPES["Named Pipes<br/><sub>\\\\.\\pipe\\WarpFileActivityAPI</sub>"]:::ipc
+    end
+
+    subgraph Storage ["Storage layer"]
+        SQLITE["SQLite (amalgamation)<br/><sub>WAL · synchronous=NORMAL · single file</sub>"]:::store
+        DB[("activity.db<br/><sub>%LOCALAPPDATA%\\WARP\\</sub>")]:::store
+    end
+
+    subgraph ML ["Semantic inference layer (optional)"]
+        ORT["ONNX Runtime 1.x<br/><sub>CPU execution provider</sub>"]:::ml
+        MINI["all-MiniLM-L6-v2<br/><sub>384-dim sentence embeddings</sub>"]:::ml
+        BERT["BertTokenizer<br/><sub>WordPiece · vocab.txt · header-only</sub>"]:::ml
+    end
+
+    WARP --> ETW
+    WARP --> WIN_HOOKS
+    WARP --> UIA
+    WARP --> RDC
+    WARP --> SHELL
+    WARP --> IDLE
+    WARP --> TRUST
+    WARP --> TS
+    WARP --> PIPES
+
+    WARP --> SQLITE
+    SQLITE --> DB
+
+    WARP --> ORT
+    ORT   --> MINI
+    WARP  --> BERT
+```
+
+| Layer            | Component                            | Purpose                                                                |
+| ---------------- | ------------------------------------ | ---------------------------------------------------------------------- |
+| **Application**  | C++17, Win32, Visual Studio 2022     | Single elevated process; static CRT (`/MT`); no service host           |
+| **Capture**      | ETW (`Microsoft-Windows-Kernel-*`)   | File-open and process-create events from the kernel                    |
+| **Capture**      | `SetWinEventHook`                    | Foreground changes, window-create correlation, browser tab title hooks |
+| **Capture**      | UI Automation                        | Browser address-bar URL extraction on a dedicated MTA worker thread    |
+| **Capture**      | `ReadDirectoryChangesW`              | File events on removable / network volumes (ETW excludes these)        |
+| **Capture**      | `SHChangeNotifyRegister`             | Shell namespace fallback for files ETW cannot see                      |
+| **Attribution**  | `GetLastInputInfo`                   | `ms_since_input` for soft-idle attenuation                             |
+| **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
+| **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
+| **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
+| **Semantic**     | ONNX Runtime 1.x (CPU EP)            | Runs the MiniLM sentence-embedding model                               |
+| **Semantic**     | `all-MiniLM-L6-v2` (384-dim)         | Embeds 15-minute activity windows + ~50 pre-embedded topic labels      |
+| **Semantic**     | `BertTokenizer` (header-only)        | WordPiece tokenisation against `vocab.txt`                             |
+
+> **Why no service?** WARP runs interactively in the elevated user session so
+> that `GetForegroundWindow`, `WTSGetActiveConsoleSessionId`, and UI
+> Automation are all in-scope. A Session 0 service would lose foreground
+> attribution and need an out-of-process broker to recover it — a much larger
+> failure surface than a single elevated process.
 
 ---
 
