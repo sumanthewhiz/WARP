@@ -2,12 +2,14 @@
 #include "framework.h"
 #include "FileMonitor.h"
 #include "EventContext.h"
+#include "SystemProcessClassifier.h"
 #include <shlobj.h>
 #include <algorithm>
 #include <evntrace.h>
 #include <evntcons.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
 #include <mutex>
 #include <psapi.h>
 
@@ -1330,6 +1332,77 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
     }
 
     EventContext ctx = EventContextUtil::CaptureContext(pEvent->EventHeader.ProcessId);
+
+    // -----------------------------------------------------------------
+    // Composite system-process verdict and per-PID burst suppression.
+    //
+    // (1) IsUserProcess() above only checked the session ID + a fixed
+    //     name list. The composite SystemProcessClassifier additionally
+    //     considers parent (services.exe / svchost), token integrity
+    //     (high = installer / system), Authenticode signer (Microsoft),
+    //     and image path (Windows tree). We consult it here using the
+    //     resolved exe path captured by EventContext.
+    //
+    //     If classified as system, we don't drop the event -- some
+    //     genuinely-user-driven activity flows through MS-signed
+    //     helpers (cmd.exe redirecting into a file the user wants;
+    //     Office crash recovery touching a doc). Instead we cap the
+    //     event's confidence so InferenceEngine's threshold (>= 0.5)
+    //     filters it out of popularity counts but the row still lands
+    //     in the DB for forensic queries.
+    //
+    // (2) Per-PID token-bucket: a single PID firing > 50 events / sec
+    //     is almost certainly noise (a build, a sync, an anti-virus
+    //     scan, a scripted indexer). We refill at 50 tokens/sec with a
+    //     burst capacity of 100 tokens. When the bucket runs dry, we
+    //     downgrade further events to confidence 0.1 (DB-only). LRU-
+    //     bound the bucket map at 1024 entries.
+    // -----------------------------------------------------------------
+    {
+        WARP::ClassificationResult cls =
+            WARP::SystemProcessClassifier::Instance().Classify(
+                ctx.sourceExe, pEvent->EventHeader.ProcessId);
+        if (cls.isSystem)
+            ctx.confidence = (std::min)(ctx.confidence, 0.4);
+    }
+
+    {
+        struct Bucket { ULONGLONG lastRefillTick; double tokens; };
+        constexpr double kCap        = 100.0;
+        constexpr double kRefillRate = 50.0;        // tokens / sec
+        constexpr size_t kMaxPids    = 1024;
+
+        static std::mutex                            burstMtx;
+        static std::unordered_map<DWORD, Bucket>     buckets;
+        static std::deque<DWORD>                     lru;
+
+        DWORD pid = pEvent->EventHeader.ProcessId;
+        ULONGLONG nowTick = GetTickCount64();
+
+        std::lock_guard<std::mutex> lk(burstMtx);
+        auto it = buckets.find(pid);
+        if (it == buckets.end())
+        {
+            if (buckets.size() >= kMaxPids && !lru.empty())
+            {
+                buckets.erase(lru.front());
+                lru.pop_front();
+            }
+            buckets[pid] = { nowTick, kCap };
+            lru.push_back(pid);
+            it = buckets.find(pid);
+        }
+
+        Bucket& b = it->second;
+        double elapsedSec = (nowTick - b.lastRefillTick) / 1000.0;
+        b.tokens = (std::min)(kCap, b.tokens + elapsedSec * kRefillRate);
+        b.lastRefillTick = nowTick;
+
+        if (b.tokens < 1.0)
+            ctx.confidence = (std::min)(ctx.confidence, 0.1);
+        else
+            b.tokens -= 1.0;
+    }
 
     // For RENAME the consumer expects (action="RENAME", path=NEW, oldPath=OLD).
     if (action == L"RENAME" && !newName.empty())
