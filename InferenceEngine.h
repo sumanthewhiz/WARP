@@ -16,9 +16,16 @@ struct InferenceRecord
     int64_t     lastEventTs    = 0;
     int64_t     lastOpenTs     = 0;
     int64_t     lastEditTs     = 0;
-    int         openCount7d    = 0;
-    int         openCount30d   = 0;
-    int         openCountTotal = 0;
+    // Confidence-weighted rolling counts. The schema column is INTEGER
+    // affinity but SQLite stores REAL values without lossy conversion;
+    // we read back via sqlite3_column_double. Storing as REAL lets a
+    // sequence of low-confidence events (e.g. 10 events at conf 0.1)
+    // accumulate to the same effective weight as one full-confidence
+    // event, instead of being dropped wholesale by an arbitrary
+    // 0.5 threshold.
+    double      openCount7d    = 0.0;
+    double      openCount30d   = 0.0;
+    double      openCountTotal = 0.0;
     double      recencyScore   = 0.0;
     uint32_t    version        = 0;
     int64_t     updatedAt      = 0;
@@ -83,7 +90,7 @@ private:
     std::unordered_map<std::string, InferenceRecord> m_cache;
     std::mutex m_cacheMutex;
 
-    static double ComputeRecencyScore(int64_t now, int64_t lastOpenTs, int openCount7d);
+    static double ComputeRecencyScore(int64_t now, int64_t lastOpenTs, double openCount7d);
     static std::string NormalizeKey(const std::wstring& widePath);
     static std::string WideToUtf8(const std::wstring& w);
     static std::string EscapeJson(const std::string& s);
