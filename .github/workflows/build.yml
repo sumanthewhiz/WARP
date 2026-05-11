@@ -57,10 +57,11 @@ jobs:
         $vcToolsDir = Join-Path $installPath "VC\Tools\MSVC"
         $versions = Get-ChildItem $vcToolsDir -Directory | Sort-Object Name -Descending
         $latestVersion = $versions[0].Name
-        # Derive platform toolset: 14.4x -> v144, 14.3x -> v143, etc.
-        $major = $latestVersion.Split('.')[0]
-        $minor = $latestVersion.Split('.')[1]
-        $toolset = "v${major}${minor}"
+        # Derive platform toolset: 14.43.x -> v143, 14.50.x -> v145
+        $parts = $latestVersion.Split('.')
+        $major = $parts[0]
+        $minor = $parts[1]
+        $toolset = "v${major}$($minor[0])"
         Write-Host "Detected VC tools version: $latestVersion -> PlatformToolset=$toolset"
         echo "value=$toolset" >> $env:GITHUB_OUTPUT
 
