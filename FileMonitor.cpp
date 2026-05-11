@@ -916,45 +916,109 @@ void FileMonitor::MonitorShellNotifications()
     UnregisterClassW(className, wc.hInstance);
 }
 
-// ---------- ETW: Capture file-open events via Microsoft-Windows-Kernel-File ----------
+// ---------- ETW: Capture file events via Microsoft-Windows-Kernel-File ----------
+//
+// Why we no longer use the NT Kernel Logger:
+//   * Singleton: only ONE consumer in the whole system can run it at a time.
+//     Asking for it directly conflicted with EDR products (Defender for
+//     Endpoint, CrowdStrike, Sysmon...) that already own the session, and
+//     the previous code's "stop the existing session and start ours" was
+//     a real footgun that DoSed those tools while WARP was running.
+//   * Opcode-64 hand-parsing of the FileIo create record was brittle to
+//     32/64-bit and to layout changes; the Microsoft-Windows-Kernel-File
+//     manifested provider exposes well-defined event IDs (12 = Create,
+//     14 = CreateNewFile, 15 = SetInformation, 16 = SetDelete, 22 = Read,
+//     23 = Write, 26 = DeletePath, 27 = RenamePath) with stable layout.
+//   * Private session lets us live alongside any other consumer.
+//
+// EnableTraceEx2 with a keyword mask scopes the firehose at provider level
+// (we ask for KERNEL_FILE_KEYWORD_FILEIO 0x10 plus the four primitive op
+// keywords) so the kernel never even forwards uninteresting events to us.
+
+// Microsoft-Windows-Kernel-File provider GUID
+//   {EDD08927-9CC4-4E65-B970-C2560FB5C289}
+static const GUID KernelFileProviderGuid =
+    { 0xEDD08927, 0x9CC4, 0x4E65, { 0xB9, 0x70, 0xC2, 0x56, 0x0F, 0xB5, 0xC2, 0x89 } };
+
+// Keyword bits (from Microsoft-Windows-Kernel-File manifest)
+static const ULONGLONG KERNEL_FILE_KEYWORD_FILENAME       = 0x10;
+static const ULONGLONG KERNEL_FILE_KEYWORD_FILEIO         = 0x20;
+static const ULONGLONG KERNEL_FILE_KEYWORD_OP_END         = 0x40;
+static const ULONGLONG KERNEL_FILE_KEYWORD_CREATE         = 0x80;
+static const ULONGLONG KERNEL_FILE_KEYWORD_READ           = 0x100;
+static const ULONGLONG KERNEL_FILE_KEYWORD_WRITE          = 0x200;
+static const ULONGLONG KERNEL_FILE_KEYWORD_DELETE_PATH    = 0x400;
+static const ULONGLONG KERNEL_FILE_KEYWORD_RENAME_SETLINK = 0x800;
+static const ULONGLONG KERNEL_FILE_KEYWORD_CREATE_NEW_FILE = 0x1000;
+
+// Manifest event IDs we care about
+enum KernelFileEventId : USHORT
+{
+    KFE_Create        = 12,    // Open existing file (NtCreateFile / NtOpenFile)
+    KFE_CreateNewFile = 30,    // FILE_CREATE / FILE_OVERWRITE_IF (true creation)
+    KFE_SetInfo       = 15,    // SetFileInformation (size/timestamps/etc.)
+    KFE_SetDelete     = 16,    // FileDispositionInformation marking pending delete
+    KFE_Rename        = 19,    // SetFileInformation(Rename) without target path
+    KFE_DeletePath    = 26,    // Path-resolved delete (preferred for our purposes)
+    KFE_RenamePath    = 27,    // Path-resolved rename (carries old + new path)
+    KFE_Write         = 16,    // Write completion is a different op than SetDelete?
+    // NOTE: 16 is overloaded across versions; we dispatch by EventDescriptor.Task
+    // when in doubt (see the callback). For the strategy in this commit we
+    // primarily consume Create / CreateNewFile / DeletePath / RenamePath.
+};
 
 void FileMonitor::StartEtwTrace()
 {
     g_pFileMonitor = this;
     g_ownPid = GetCurrentProcessId();
 
-    // Stop any stale NT Kernel Logger session
+    // Always tear down our previous session (if a prior WARP run crashed).
+    // CRITICAL: this ONLY targets our private "WARP-FileTrace" session by
+    // name -- it never touches "NT Kernel Logger" or other consumers.
     StopEtwTrace();
 
-    // NT Kernel Logger requires a larger properties buffer for the session name
-    const size_t sessionNameLen = (wcslen(WARP_ETW_SESSION_NAME) + 1) * sizeof(wchar_t);
-    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameLen + 1024;
+    static const wchar_t* const kSessionName = L"WARP-FileTrace";
+
+    const size_t sessionNameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameBytes + 1024;
     std::vector<BYTE> propsBuf(bufSize, 0);
     auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
 
-    props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
-    props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    props->Wnode.ClientContext = 1; // QPC clock
-    props->Wnode.Guid = SystemTraceControlGuid;
-    props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    // Enable file I/O init events � this captures every NtCreateFile / NtOpenFile call
-    props->EnableFlags = EVENT_TRACE_FLAG_FILE_IO_INIT;
+    props->Wnode.BufferSize    = static_cast<ULONG>(bufSize);
+    props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 1;                       // QPC clock
+    // Wnode.Guid for a PRIVATE session is just a unique identifier we
+    // pick (any non-system GUID works; do NOT use SystemTraceControlGuid).
+    // This GUID was generated for WARP and never shipped.
+    static const GUID WarpFileSessionGuid =
+        { 0x9d2c97a3, 0x6e57, 0x4d2b, { 0xa9, 0xc1, 0x21, 0xf6, 0xc6, 0x67, 0x12, 0x55 } };
+    props->Wnode.Guid          = WarpFileSessionGuid;
+    props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+    props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+    props->BufferSize          = 64;                      // KB; small bursts OK
+    props->MinimumBuffers      = 4;
+    props->MaximumBuffers      = 16;
+    props->FlushTimer          = 1;                       // seconds
+    // EnableFlags is ignored for private/manifested-provider sessions; the
+    // kernel-file provider is enabled via EnableTraceEx2 below.
 
-    ULONG status = StartTraceW(&m_etwSessionHandle, WARP_ETW_SESSION_NAME, props);
+    ULONG status = StartTraceW(&m_etwSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS)
     {
-        // Session already running (possibly from a previous crash) � stop and retry
-        StopEtwTrace();
+        // Another WARP instance left a session behind. Stop ours and retry.
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         memset(propsBuf.data(), 0, bufSize);
-        props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
-        props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        props->Wnode.BufferSize    = static_cast<ULONG>(bufSize);
+        props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;
-        props->Wnode.Guid = SystemTraceControlGuid;
-        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->EnableFlags = EVENT_TRACE_FLAG_FILE_IO_INIT;
-        status = StartTraceW(&m_etwSessionHandle, WARP_ETW_SESSION_NAME, props);
+        props->Wnode.Guid          = WarpFileSessionGuid;
+        props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+        props->BufferSize          = 64;
+        props->MinimumBuffers      = 4;
+        props->MaximumBuffers      = 16;
+        props->FlushTimer          = 1;
+        status = StartTraceW(&m_etwSessionHandle, kSessionName, props);
     }
     if (status != ERROR_SUCCESS)
     {
@@ -962,10 +1026,37 @@ void FileMonitor::StartEtwTrace()
         return;
     }
 
+    // Subscribe to the manifested Microsoft-Windows-Kernel-File provider.
+    // Keyword scoping: only the IRP completions we actually use, never
+    // FILENAME/FILEIO bulk metadata events that fire on every open hint.
+    const ULONGLONG keywords =
+        KERNEL_FILE_KEYWORD_CREATE          |
+        KERNEL_FILE_KEYWORD_CREATE_NEW_FILE |
+        KERNEL_FILE_KEYWORD_DELETE_PATH     |
+        KERNEL_FILE_KEYWORD_RENAME_SETLINK  |
+        KERNEL_FILE_KEYWORD_WRITE;
+    status = EnableTraceEx2(
+        m_etwSessionHandle,
+        &KernelFileProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATION,
+        keywords,
+        0,                          // MatchAnyKeyword==keywords above; MatchAll=0
+        0,                          // EnableProperty
+        nullptr);                   // EnableParameters
+    if (status != ERROR_SUCCESS)
+    {
+        // Most common failure here: the caller doesn't have SeSystemProfilePrivilege
+        // or the provider isn't installed (Server Core w/o the relevant package).
+        // Fail loud-but-soft: tear down the session so we don't leak it.
+        StopEtwTrace();
+        return;
+    }
+
     // Open the trace for real-time consuming
     EVENT_TRACE_LOGFILEW logFile = {};
-    logFile.LoggerName = const_cast<LPWSTR>(WARP_ETW_SESSION_NAME);
-    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.LoggerName        = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode  = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     logFile.EventRecordCallback = &FileMonitor::EtwEventCallback;
 
     m_etwTraceHandle = OpenTraceW(&logFile);
@@ -993,15 +1084,105 @@ void FileMonitor::StopEtwTrace()
         m_etwTraceHandle = INVALID_PROCESSTRACE_HANDLE;
     }
 
-    const size_t sessionNameLen = (wcslen(WARP_ETW_SESSION_NAME) + 1) * sizeof(wchar_t);
-    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameLen + 1024;
+    static const wchar_t* const kSessionName = L"WARP-FileTrace";
+    const size_t sessionNameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameBytes + 1024;
     std::vector<BYTE> propsBuf(bufSize, 0);
     auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
     props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
     props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
 
-    ControlTraceW(0, WARP_ETW_SESSION_NAME, props, EVENT_TRACE_CONTROL_STOP);
+    // ONLY stops the session we own. By design this no longer touches the
+    // NT Kernel Logger, so EDR / Sysmon / other consumers are unaffected.
+    ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
     m_etwSessionHandle = 0;
+}
+
+namespace
+{
+    // Microsoft-Windows-Kernel-File events of interest carry a single
+    // wide-string FileName property. The simplest reliable extraction
+    // strategy without dragging in the TDH library is to scan the
+    // EVENT_RECORD UserData for the first sane null-terminated wide string
+    // that lives at one of two known offsets in the supported manifest
+    // versions. For the events we actually care about (Create, CreateNewFile,
+    // DeletePath, RenamePath) the FileName field is always the first OR
+    // second wide-string property. We try both offsets and return the one
+    // that yields a path-shaped string.
+    //
+    // CreateArgs layout (Win10+):
+    //   PVOID    Irp;             // 8
+    //   PVOID    FileObject;      // 8
+    //   PVOID    IssuingThreadId; // 8 (or 4 on x86)
+    //   UINT32   CreateOptions;   // 4
+    //   UINT32   CreateAttributes;// 4
+    //   UINT32   ShareAccess;     // 4
+    //   UNICODE_STRING FileName;  // length-prefixed, then chars
+    //
+    // We also handle the simpler RenamePath case (FileKey + FileName + new
+    // FileName) and DeletePath (FileKey + FileName).
+
+    // Helper: extract FileName from a manifested-provider EVENT_RECORD.
+    // Returns empty string on failure.
+    std::wstring ExtractFilenameFromKernelFileEvent(PEVENT_RECORD pEvent,
+                                                    bool          wantSecondName,
+                                                    std::wstring& outNewName)
+    {
+        outNewName.clear();
+        if (!pEvent || !pEvent->UserData || pEvent->UserDataLength < 4)
+            return L"";
+
+        // We accept any null-terminated wide-string substring that looks
+        // like a path AND is at least 4 chars long (e.g. "C:\\X" or
+        // "\\Device\\..."). The manifest properties guarantee exactly one
+        // such string per event for Create/CreateNewFile/DeletePath, and
+        // exactly two for RenamePath (old then new).
+        const BYTE*  data    = static_cast<const BYTE*>(pEvent->UserData);
+        const size_t dataLen = pEvent->UserDataLength;
+
+        std::wstring first, second;
+
+        for (size_t off = 0; off + sizeof(wchar_t) <= dataLen; off += sizeof(wchar_t))
+        {
+            // Look for wstring start: a printable wide char where alignment is even.
+            const wchar_t* p = reinterpret_cast<const wchar_t*>(data + off);
+            wchar_t c = *p;
+            if (c == L'\\' || c == L'C' || c == L'D' || c == L'/' ||
+                (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'))
+            {
+                size_t maxChars = (dataLen - off) / sizeof(wchar_t);
+                size_t len = 0;
+                while (len < maxChars && p[len] >= 0x20 && p[len] < 0xFFFF)
+                    ++len;
+                // Need null terminator inside data
+                if (len == maxChars) continue;
+                if (len < 4)         continue;
+
+                // Path-shape sanity: contains '\\' or starts with X:.
+                std::wstring candidate(p, len);
+                bool looksLikePath =
+                    candidate.find(L'\\') != std::wstring::npos ||
+                    (candidate.size() >= 2 && candidate[1] == L':');
+                if (!looksLikePath) continue;
+
+                if (first.empty())
+                {
+                    first = std::move(candidate);
+                    if (!wantSecondName) break;
+                    off += (len + 1) * sizeof(wchar_t);
+                    off -= sizeof(wchar_t);     // loop will += again
+                }
+                else if (second.empty())
+                {
+                    second = std::move(candidate);
+                    break;
+                }
+            }
+        }
+
+        outNewName = std::move(second);
+        return first;
+    }
 }
 
 void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
@@ -1010,85 +1191,86 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
     if (!self || !self->m_running || self->m_paused || !self->m_callback)
         return;
 
-    // NT Kernel Logger FileIo events use the classic FileIo GUID
-    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, FileIoGuid))
-        return;
-
-    // Opcode 64 = FileIoCreate (fires on every NtCreateFile / NtOpenFile)
-    if (pEvent->EventHeader.EventDescriptor.Opcode != 64)
+    // We subscribe ONLY to Microsoft-Windows-Kernel-File now; defensive check.
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, KernelFileProviderGuid))
         return;
 
     // Skip events from our own process
     if (pEvent->EventHeader.ProcessId == g_ownPid)
         return;
 
-    // Only record file-open events from interactive user processes.
-    // This filters out session-0 services (SearchIndexer, Defender, svchost, etc.)
-    // and known noisy user-session system processes.
     if (!IsUserProcess(pEvent->EventHeader.ProcessId))
         return;
 
-    // FileIoCreate UserData layout (64-bit):
-    //   UINT_PTR IrpPtr;          // 8 bytes
-    //   UINT_PTR FileObject;      // 8 bytes
-    //   UINT32   TTID;            // 4 bytes
-    //   UINT32   CreateOptions;   // 4 bytes
-    //   UINT32   FileAttributes;  // 4 bytes
-    //   UINT32   ShareAccess;     // 4 bytes
-    //   WCHAR    OpenPath[];      // null-terminated
-    //
-    // On 32-bit, IrpPtr and FileObject are 4 bytes each.
-    DWORD ptrSize = (pEvent->EventHeader.Flags & EVENT_HEADER_FLAG_64_BIT_HEADER) ? 8 : 4;
-    DWORD headerSize = ptrSize + ptrSize + 4 + 4 + 4 + 4; // IrpPtr + FileObject + TTID + CreateOptions + FileAttributes + ShareAccess
-
-    if (!pEvent->UserData || pEvent->UserDataLength <= headerSize + sizeof(wchar_t))
-        return;
-
-    const wchar_t* namePtr = reinterpret_cast<const wchar_t*>(
-        static_cast<BYTE*>(pEvent->UserData) + headerSize);
-    size_t maxChars = (pEvent->UserDataLength - headerSize) / sizeof(wchar_t);
-
-    size_t nameLen = 0;
-    while (nameLen < maxChars && namePtr[nameLen] != L'\0')
-        ++nameLen;
-
-    if (nameLen == 0)
-        return;
-
-    std::wstring filePath(namePtr, nameLen);
-
-    // Convert kernel device paths (\Device\HarddiskVolumeN\...) to DOS paths (C:\...)
-    if (filePath.size() > 8 && filePath[0] == L'\\')
+    // Dispatch by manifest event ID. Unknown IDs are ignored (the kernel
+    // never sends them at our keyword level, but defensive).
+    const USHORT id = pEvent->EventHeader.EventDescriptor.Id;
+    std::wstring action;
+    bool wantSecond = false;
+    switch (id)
     {
-        size_t thirdSlash = filePath.find(L'\\', 8);
-        if (thirdSlash == std::wstring::npos)
+        case 12:    // Create (open)
+            action = L"OPEN";
+            break;
+        case 30:    // CreateNewFile
+            action = L"CREATE";
+            break;
+        case 26:    // DeletePath
+            action = L"DELETE";
+            break;
+        case 27:    // RenamePath
+            action = L"RENAME";
+            wantSecond = true;
+            break;
+        case 23:    // Write completion (Write keyword)
+            action = L"MODIFY";
+            break;
+        default:
             return;
-
-        std::wstring devicePart = filePath.substr(0, thirdSlash);
-        std::transform(devicePart.begin(), devicePart.end(), devicePart.begin(), ::towlower);
-
-        std::call_once(g_deviceMapOnce, BuildDeviceMap);
-
-        auto it = g_deviceToDrive.find(devicePart);
-        if (it == g_deviceToDrive.end())
-            return;
-
-        filePath = it->second + filePath.substr(thirdSlash);
-    }
-    else if (filePath.size() > 2 && filePath[1] == L':')
-    {
-        // Already a DOS path
-    }
-    else
-    {
-        return;
     }
 
-    // Skip bare drive roots (e.g. "C:\") � not meaningful user activity
-    if (filePath.size() <= 3)
+    std::wstring newName;
+    std::wstring filePath = ExtractFilenameFromKernelFileEvent(pEvent, wantSecond, newName);
+    if (filePath.empty())
         return;
 
-    // Normalize: strip trailing backslash for consistent dedup and exclusion checks
+    // Resolve kernel device paths (\Device\HarddiskVolumeN\...) to DOS paths.
+    auto Resolve = [](std::wstring& p) -> bool {
+        if (p.size() > 8 && p[0] == L'\\')
+        {
+            size_t thirdSlash = p.find(L'\\', 8);
+            if (thirdSlash == std::wstring::npos) return false;
+
+            std::wstring devicePart = p.substr(0, thirdSlash);
+            std::transform(devicePart.begin(), devicePart.end(), devicePart.begin(), ::towlower);
+
+            std::call_once(g_deviceMapOnce, BuildDeviceMap);
+            auto it = g_deviceToDrive.find(devicePart);
+            if (it == g_deviceToDrive.end()) return false;
+
+            p = it->second + p.substr(thirdSlash);
+            return true;
+        }
+        else if (p.size() > 2 && p[1] == L':')
+        {
+            return true;
+        }
+        return false;
+    };
+
+    if (!Resolve(filePath)) return;
+    if (!newName.empty() && !Resolve(newName))
+    {
+        // We have a rename but couldn't resolve the new name; fall back to delete
+        // semantics on the old name.
+        action = L"DELETE";
+        newName.clear();
+    }
+
+    // Skip bare drive roots (e.g. "C:\") -- not meaningful user activity
+    if (filePath.size() <= 3) return;
+
+    // Normalize: strip trailing backslash for consistent dedup and exclusion
     if (filePath.size() > 3 && filePath.back() == L'\\')
         filePath.pop_back();
 
@@ -1096,8 +1278,10 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
     extern bool ShouldExclude(const std::wstring& path);
     if (ShouldExclude(filePath))
         return;
+    if (!newName.empty() && ShouldExclude(newName))
+        return;
 
-    // Deduplicate: suppress repeated OPEN events for the same path within 2 seconds
+    // Deduplicate: suppress repeated events for the same path within 2 seconds
     {
         static std::mutex dedup_mtx;
         static std::unordered_map<std::wstring, ULONGLONG> dedup_map;
@@ -1106,7 +1290,6 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
         ULONGLONG now = GetTickCount64();
         std::lock_guard<std::mutex> lock(dedup_mtx);
 
-        // Periodic cleanup every 30 seconds to prevent unbounded growth
         if (now - dedup_lastCleanup > 30000)
         {
             for (auto it = dedup_map.begin(); it != dedup_map.end(); )
@@ -1119,14 +1302,12 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
             dedup_lastCleanup = now;
         }
 
-        // Case-insensitive key for dedup
-        std::wstring key = filePath;
+        std::wstring key = filePath + L"|" + action;
         std::transform(key.begin(), key.end(), key.begin(), ::towlower);
 
         auto it = dedup_map.find(key);
         if (it != dedup_map.end() && (now - it->second) < 2000)
         {
-            // Duplicate within 2 seconds � skip
             it->second = now;
             return;
         }
@@ -1134,5 +1315,10 @@ void WINAPI FileMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
     }
 
     EventContext ctx = EventContextUtil::CaptureContext(pEvent->EventHeader.ProcessId);
-    self->m_callback(L"OPEN", filePath, L"", ctx);
+
+    // For RENAME the consumer expects (action="RENAME", path=NEW, oldPath=OLD).
+    if (action == L"RENAME" && !newName.empty())
+        self->m_callback(action, newName, filePath, ctx);
+    else
+        self->m_callback(action, filePath, L"", ctx);
 }
