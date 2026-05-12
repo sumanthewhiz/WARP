@@ -201,6 +201,45 @@ static bool IsBoringExe(const std::wstring& exeLower)
     return false;
 }
 
+// True if this app's friendly name represents a *document app* — an
+// editor / viewer / authoring tool whose foreground titles are
+// dominated by document, file, or canvas names.  This is the canonical
+// source of truth for the "Documents" facet of the per-category
+// one-liner.  Browsers are intentionally excluded (they feed the
+// "Websites" facet).  Comms / chat / meeting / terminal / streaming /
+// remote-desktop / VM tools all feed the "Apps" facet.
+//
+// Anything not in this set (including unrecognized apps that get the
+// generic "Working in" fallback verb) goes to Apps.  That keeps the
+// fallback from leaking unknown apps (WhatsApp UWP variants, MAUI
+// chat apps, random user-installed utilities) into the Documents
+// facet just because they happen to share a verb substring.
+static bool IsDocumentFriendlyName(const std::string& friendlyName)
+{
+    static const std::unordered_set<std::string> kDocApps = {
+        // Code editors / IDEs
+        "visual studio", "vs code", "notepad++", "sublime text",
+        "atom", "intellij idea", "pycharm", "clion", "webstorm",
+        "goland", "rubymine", "phpstorm", "rider", "datagrip",
+        "android studio", "eclipse", "rstudio", "matlab",
+        "notepad", "wordpad",
+        // Office authoring (not Outlook — that's comms)
+        "word", "excel", "powerpoint", "onenote", "access",
+        "visio", "publisher",
+        // PDF / document viewers
+        "acrobat reader", "acrobat", "sumatra pdf", "foxit reader",
+        // Notes / knowledge bases
+        "notion", "obsidian", "evernote", "logseq",
+        // Design / authoring
+        "photoshop", "illustrator", "figma", "blender",
+        "premiere pro", "after effects",
+        // Virtual "Document" entries injected from FileMonitor
+        "document",
+    };
+    std::string lower = Utf8Lower(friendlyName);
+    return kDocApps.find(lower) != kDocApps.end();
+}
+
 // Layer-1 lookup: exact basename match.  Returns nullptr if no override.
 static const AppClass* MatchExactExe(const std::wstring& exeLower)
 {
@@ -1123,7 +1162,8 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         int              threadCount = 0;
     };
 
-    auto composeOneLinerFromBag = [&](const std::vector<AppAgg>& bag) -> OneLinerBuild {
+    auto composeOneLinerFromBag = [&](const std::vector<AppAgg>& bag,
+                                       bool categoryMode = false) -> OneLinerBuild {
         OneLinerBuild out;
         if (bag.empty()) return out;
 
@@ -1135,7 +1175,31 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         int                              bagTotalFocus = 0;
         for (const auto& a : bag) bagTotalFocus += (std::max)(0, a.totalFocusSecs);
 
-        if (m_modelReady && bag.size() >= 2)
+        if (categoryMode)
+        {
+            // Per-category bags (Documents / Websites / Apps) tend to be
+            // small (2-16 entries) and topic-diverse.  MiniLM clustering
+            // on such a bag produces mostly singleton clusters whose
+            // themes degrade to brand-name-only token sets — yielding
+            // verbatim-title soup once the per-cluster fallback to
+            // `phraseFor` kicks in.  Force every entry into ONE virtual
+            // cluster instead: this pools content tokens across all
+            // titles so `themeFor` has enough material to distill 1-2
+            // genuinely semantic tokens, and gives `clusterPhrase` a
+            // multi-member cluster (so it adds the "across X & Y"
+            // suffix instead of falling back to verbatim).
+            centroids.push_back({});
+            clTotalFocus.push_back(bagTotalFocus);
+            std::vector<size_t> members;
+            members.reserve(bag.size());
+            for (size_t i = 0; i < bag.size(); ++i)
+            {
+                members.push_back(i);
+                clOf[i] = 0;
+            }
+            clMembers.push_back(std::move(members));
+        }
+        else if (m_modelReady && bag.size() >= 2)
         {
             const size_t embedLimit = (std::min)(bag.size(), static_cast<size_t>(8));
             std::vector<std::vector<float>> embs(bag.size());
@@ -1390,7 +1454,31 @@ ContextSnapshot ContextInference::ComposeSnapshot()
             std::string theme = themeFor(cl);
             std::string p;
             if (theme.empty())
-                p = phraseFor(bag[cl.repIdx]);
+            {
+                if (categoryMode)
+                {
+                    // Category-mode fallback: NEVER quote a verbatim
+                    // title (that's how the old "verbatim mish-mash"
+                    // regression happened).  Use the dominant verb of
+                    // the representative entry plus the friendlyName
+                    // (or, for the virtual "Document" / "Browser"
+                    // friendly names, a more natural phrase).
+                    const AppAgg& rep = bag[cl.repIdx];
+                    std::string verb = rep.verb.empty() ? std::string("Using") : rep.verb;
+                    if (!verb.empty() && verb[0] >= 'a' && verb[0] <= 'z')
+                        verb[0] = char(verb[0] - 32);
+                    if (rep.friendlyName == "Document")
+                        p = "Working on documents";
+                    else if (rep.friendlyName == "Browser")
+                        p = "Browsing the web";
+                    else
+                        p = verb + " " + rep.friendlyName;
+                }
+                else
+                {
+                    p = phraseFor(bag[cl.repIdx]);
+                }
+            }
             else
             {
                 std::string verb = verbFor(cl, theme);
@@ -1399,26 +1487,41 @@ ContextSnapshot ContextInference::ComposeSnapshot()
 
             if (cl.members.size() >= 2)
             {
-                std::string suffix;
-                size_t shown = 0;
-                for (size_t j = 0; j < cl.members.size() && shown < 3; ++j, ++shown)
+                // Build a deduped friendlyName list for the "(across …)"
+                // suffix.  Without dedup the Websites bag — where every
+                // virtual AppAgg has friendlyName="Browser" — would
+                // render as "(across Browser, Browser & Browser)" and
+                // the Documents bag (where file-virt entries also share
+                // friendlyName="Document") would do the same.
+                std::vector<std::string> uniqueNames;
+                uniqueNames.reserve(cl.members.size());
+                for (size_t mi : cl.members)
                 {
-                    if (shown == 0)
-                        suffix = " (across " + bag[cl.members[j]].friendlyName;
-                    else if (shown + 1 == (std::min)(cl.members.size(), size_t{3}))
-                        suffix += " & " + bag[cl.members[j]].friendlyName;
-                    else
-                        suffix += ", " + bag[cl.members[j]].friendlyName;
+                    const std::string& fn = bag[mi].friendlyName;
+                    bool seen = false;
+                    for (const auto& s : uniqueNames)
+                        if (s == fn) { seen = true; break; }
+                    if (!seen) uniqueNames.push_back(fn);
                 }
-                size_t hidden = cl.members.size() - shown;
-                if (hidden > 0)
+                if (uniqueNames.size() >= 2)
                 {
-                    std::ostringstream o;
-                    o << " + " << hidden << " more";
-                    suffix += o.str();
+                    std::string suffix = " (across ";
+                    size_t shown = (std::min)(uniqueNames.size(), size_t{3});
+                    for (size_t j = 0; j < shown; ++j)
+                    {
+                        if (j == 0) suffix += uniqueNames[j];
+                        else if (j + 1 == shown) suffix += " & " + uniqueNames[j];
+                        else                     suffix += ", " + uniqueNames[j];
+                    }
+                    if (uniqueNames.size() > shown)
+                    {
+                        std::ostringstream o;
+                        o << " + " << (uniqueNames.size() - shown) << " more";
+                        suffix += o.str();
+                    }
+                    suffix += ")";
+                    p += suffix;
                 }
-                suffix += ")";
-                p += suffix;
             }
             return p;
         };
@@ -1534,20 +1637,16 @@ ContextSnapshot ContextInference::ComposeSnapshot()
     // Documents/Websites/Apps therefore form a strict partition of
     // ranked; an app that is in one is never in another.
     // -----------------------------------------------------------------
+    // Categorize ranked entries into Documents vs Apps.  Browsers feed
+    // Websites only.  Documents is an explicit whitelist of editor /
+    // viewer / authoring app friendly names (see `IsDocumentFriendlyName`
+    // near the top of the file) — *not* a verb-pattern match, because
+    // the catch-all fallback verb for unrecognized apps is "Working
+    // in" which would otherwise sweep WhatsApp UWP, MAUI chat apps,
+    // and any other unknown app into Documents.
     auto isDocumentApp = [](const AppAgg& a) -> bool {
         if (a.isBrowser) return false;
-        std::string v = AsciiLower(a.verb);
-        if (v.find("editing")        != std::string::npos) return true;
-        if (v.find("drafting")       != std::string::npos) return true;
-        if (v.find("taking notes")   != std::string::npos) return true;
-        if (v.find("reading pdf")    != std::string::npos) return true;
-        if (v.find("designing")      != std::string::npos) return true;
-        if (v.find("modeling")       != std::string::npos) return true;
-        if (v.find("compositing")    != std::string::npos) return true;
-        if (v.find("diagramming")    != std::string::npos) return true;
-        if (v.find("working on")     != std::string::npos) return true; // Excel
-        if (v.find("working in")     != std::string::npos) return true; // MATLAB / Access
-        return false;
+        return IsDocumentFriendlyName(a.friendlyName);
     };
 
     std::vector<AppAgg> rankedDocs;
@@ -1660,9 +1759,9 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    snap.oneLinerDocuments = composeOneLinerFromBag(rankedDocs).text;
-    snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb).text;
-    snap.oneLinerApps      = composeOneLinerFromBag(rankedApps).text;
+    snap.oneLinerDocuments = composeOneLinerFromBag(rankedDocs, /*categoryMode=*/true).text;
+    snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb,  /*categoryMode=*/true).text;
+    snap.oneLinerApps      = composeOneLinerFromBag(rankedApps, /*categoryMode=*/true).text;
 
     // ---- Confidence -----------------------------------------------
     // Heuristic: 0 if no focus, ~0.3 with a small amount of focus, up
