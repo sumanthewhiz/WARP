@@ -223,36 +223,101 @@ bool ShouldExclude(const std::wstring& path)
     std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
 
     // =====================================================================
-    // 0. AppData allowlist -- re-admit user-meaningful files that live
-    //    under AppData and would otherwise be lost to the blanket
-    //    \appdata\ exclusion below. These represent first-class user
-    //    documents (OneNote notebooks, Sticky Notes, VS auto-recovered
-    //    files, draft Word docs) that happen to live under a system
-    //    profile directory by application convention.
+    // 0. AppData re-admit allowlist -- re-admit user-meaningful files
+    //    that live under AppData and would otherwise be lost to the
+    //    blanket \appdata\ exclusion below.
     //
-    //    Order matters: we check this BEFORE any goop pattern fires,
-    //    so anything matching here bypasses the rest of ShouldExclude.
+    //    DESIGN: each entry is (directory-substring, allowed-extensions).
+    //    The allowlist is **extension-gated**: only files whose extension
+    //    matches the per-app allowed list are short-circuited (admitted)
+    //    here. Anything else inside the directory falls through to the
+    //    rest of ShouldExclude and is normally caught by the \appdata\
+    //    goop dir, the excludedExts list, the ~prefix temp filter, etc.
+    //
+    //    Why extension-gated? The previous version short-circuited on
+    //    bare directory match, which let through Outlook's transient
+    //    artefacts (e.g. `~mailbox.ost.tmp`, `mailbox.nst` Quick Search
+    //    Database) even though they hit excluded extensions / temp-
+    //    prefix rules. Gating on extension keeps the canonical user
+    //    files (`.pst` / `.ost` mail stores, `.one` notebook sections,
+    //    Sticky Notes `.sqlite`) admitted while the noise gets caught
+    //    by the normal pipeline.
+    //
+    //    Use anyExts (`{ nullptr }`) when the directory itself is so
+    //    narrow that we trust everything inside it (Office UnsavedFiles
+    //    is literally one folder for AutoRecover drafts).
     // =====================================================================
-    static const wchar_t* const appdataAllowlist[] = {
-        // OneNote -- notebook section files (.one, .onetoc2 cache)
-        L"\\microsoft\\onenote\\",
-        // Outlook -- mail stores (PST/OST). Already noisy but they're the
-        // canonical "user opened mail" signal so we admit and let the
-        // file-extension filter and per-PID burst limit cap volume.
-        L"\\microsoft\\outlook\\",
-        // Sticky Notes (legacy desktop and modern Plumsail)
-        L"\\microsoft\\sticky notes\\",
-        L"\\microsoft\\windows\\stickynotes\\",
-        // Visual Studio recoverable backups (an "edited and never saved"
-        // file lives here until close)
-        L"\\microsoft\\visualstudio\\",
-        // Office unsaved drafts (Word/Excel/PPT AutoRecover destination)
-        L"\\microsoft\\office\\unsavedfiles\\",
-        // Notepad++ session backups
-        L"\\notepad++\\backup\\",
+    static const wchar_t* const onenoteExts[] = { L".one", nullptr };
+    static const wchar_t* const outlookExts[] = { L".pst", L".ost", nullptr };
+    static const wchar_t* const stickyExts[]  = { L".sqlite", nullptr };
+    static const wchar_t* const anyExts[]     = { nullptr };
+
+    struct AppDataReadmit {
+        const wchar_t*        dirSubstring;
+        // Optional additional substring that must also be present
+        // (in addition to dirSubstring). Use nullptr for "no extra
+        // requirement". Lets us narrow VS to its versioned Backup
+        // Files subtree without enumerating every version.
+        const wchar_t*        alsoRequired;
+        const wchar_t* const* allowedExts; // nullptr-terminated
     };
-    for (const auto* w : appdataAllowlist)
-        if (lp.find(w) != std::wstring::npos) return false;
+
+    static const AppDataReadmit appdataAllowlist[] = {
+        // OneNote -- notebook section files only. .onetoc2 is a
+        // regenerable table-of-contents cache, not user content.
+        { L"\\microsoft\\onenote\\",              nullptr,                onenoteExts },
+        // Outlook -- mail stores only. Excludes the Quick Search
+        // Database (.nst), Offline Address Book (.oab), QuickAccess
+        // Toolbar (.qat), and the entire family of *.ost.tmp / temp
+        // sync artefacts -- all of which used to leak through.
+        { L"\\microsoft\\outlook\\",              nullptr,                outlookExts },
+        // Sticky Notes (legacy desktop store + modern Plumsail).
+        // Only the SQLite content file; the -wal / -shm journals
+        // remain filtered as low-value noise.
+        { L"\\microsoft\\sticky notes\\",         nullptr,                stickyExts  },
+        { L"\\microsoft\\windows\\stickynotes\\", nullptr,                stickyExts  },
+        // Visual Studio recoverable backups -- narrowed from the
+        // entire VS profile dir to the Backup Files subtree, which
+        // is the actual AutoRecover destination. The path is
+        //   \Microsoft\VisualStudio\<version>_<id>\Backup Files\
+        // with a versioned intermediate dir, so we require BOTH
+        // substrings instead of trying to enumerate versions.
+        { L"\\microsoft\\visualstudio\\",         L"\\backup files\\",    anyExts     },
+        // Office unsaved drafts (Word/Excel/PPT AutoRecover).
+        { L"\\microsoft\\office\\unsavedfiles\\", nullptr,                anyExts     },
+        // Notepad++ session backups.
+        { L"\\notepad++\\backup\\",               nullptr,                anyExts     },
+    };
+
+    for (const auto& aw : appdataAllowlist)
+    {
+        if (lp.find(aw.dirSubstring) == std::wstring::npos)
+            continue;
+        if (aw.alsoRequired && lp.find(aw.alsoRequired) == std::wstring::npos)
+            continue;
+
+        // anyExts: directory is narrow enough to trust unconditionally.
+        if (aw.allowedExts[0] == nullptr)
+            return false;
+
+        // Extension-specific: extract extension and compare.
+        size_t dotPos = lp.rfind(L'.');
+        if (dotPos != std::wstring::npos)
+        {
+            std::wstring ext = lp.substr(dotPos);
+            for (const wchar_t* const* p = aw.allowedExts; *p; ++p)
+            {
+                if (ext == *p)
+                    return false;
+            }
+        }
+
+        // Inside an allowlisted dir but extension didn't match -- fall
+        // through to the rest of ShouldExclude so \appdata\ goop /
+        // excludedExts / ~prefix can do their job. Stop iterating; the
+        // dirs do not overlap.
+        break;
+    }
 
     // =====================================================================
     // 1. Directory-substring matching (goop Categories 1-9)
@@ -637,6 +702,14 @@ bool ShouldExclude(const std::wstring& path)
         // .NET diagnostic tool outputs (dotnet-trace, dotnet-gcdump,
         // dotnet-counters with --output --format nettrace, etc.).
         L".nettrace", L".gcdump", L".netperf",
+
+        // Outlook ancillary files (NOT mail content):
+        //   .nst -- Outlook Quick Search Database (search index)
+        //   .oab -- Offline Address Book (auto-synced)
+        // These live under \AppData\Local\Microsoft\Outlook\ where the
+        // extension-gated allowlist now refuses to admit them, but we
+        // exclude by extension too as defense-in-depth.
+        L".nst", L".oab",
     };
 
     size_t dotPos = lp.rfind(L'.');
