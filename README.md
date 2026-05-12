@@ -300,7 +300,14 @@ tray) with a modern themed layout:
 Each query button spawns a background thread that connects to
 `\\.\pipe\WarpFileActivityAPI`, sends the appropriate JSON request, reads and
 pretty-prints the response, then marshals it back to the UI thread via a custom
-`WM_USER` message -- so the interface never freezes.
+`WM_USER` message -- so the interface never freezes. After pretty-printing,
+`AnnotateTimestamps()` walks the result line by line and appends a
+`// YYYY-MM-DD HH:MM:SS` comment to any line that declares a known epoch-
+seconds field (`timestamp`, `last_event_ts`, `last_open_ts`, `last_edit_ts`,
+`updated_at`, `first_seen_ts`, `window_start`, `window_end`,
+`created_window_ms`). Implausible values (zero, version numbers, recency
+scores) are left untouched, and conversion uses `localtime_s` so the displayed
+time matches the user's wall clock.
 
 The UI supports two themes (**light** and **dark**) switchable at runtime via the
 toggle button. All colors are defined in a `Theme` struct; switching recreates the
@@ -362,11 +369,26 @@ implements 12 categories:
 | **10. NTFS metadata** | `$MFT`, `$MFTMirr`, `$LogFile`, `$Bitmap`, `$Boot`, `$BadClus`, `$Secure`, `$UpCase`, `$AttrDef`, `$Extend` |
 | **11. Container / WSL backing stores** | `\docker-desktop-data\`, `\wsl\…\ext4.vhdx`, `\Hyper-V\Virtual Machines\`, `\Containers\BaseImages\` |
 | **12. Cloud-sync staging dirs** | `\OneDrive\…\.849C9593-…`, `\Dropbox\.dropbox.cache\`, `\Box\…\.box\`, `\Google\DriveFS\`, `\iCloudDrive\…\.icloud` |
+| **13. PowerShell module discovery** | `\WindowsPowerShell\Modules\`, `\PowerShell\Modules\` (catches third-party `.psd1` / `.psm1` enumeration on shell startup, including OneDrive-synced user profiles such as `\Users\<u>\OneDrive - Org\Documents\WindowsPowerShell\Modules\…`) |
 
-Additional file-level exclusions: 49+ file extensions (`.exe`, `.dll`, `.sys`,
-`.tmp`, `.log`, `.pdb`, `.dat`, etc.), system filenames (`pagefile.sys`,
-`hiberfil.sys`, `NTUSER.DAT*`, `bootmgr`, etc.), Office lock files (`~$...`), and
-temp-file prefixes (`~...`).
+Additional file-level exclusions:
+
+- **~70 file extensions** including `.exe`, `.dll`, `.sys`, `.tmp`, `.log`,
+  `.pdb`, `.dat`, build artifacts, VM disk images, plus PowerShell framework
+  files (`.psd1`, `.ps1xml`, `.psc1`, `.cdxml`, `.psrc`, `.pssc`) and .NET
+  diagnostic outputs (`.nettrace`, `.gcdump`, `.netperf`).
+- **System filenames** (`pagefile.sys`, `hiberfil.sys`, `NTUSER.DAT*`,
+  `bootmgr`, etc.), Office lock files (`~$...`), and temp-file prefixes
+  (`~...`).
+- **.NET diagnostic tool prefixes**: `dotnet-diagnostic-{pid}`,
+  `dotnet-trace-…`, `dotnet-dump-…`, `dotnet-counters-…`, `dotnet-gcdump-…`,
+  `dotnet-stack-…`, `dotnet-monitor-…`, `dotnet-symbol-…`, `dotnet-sos-…`.
+  These are emitted by .NET diagnostic IPC and CLI tooling, never by the
+  user.
+- **Generic diagnostic dump suffixes**: `*_diagnostics.json`,
+  `*-diagnostics.json`, `*.diagnostics.json` — catches OpenTelemetry .NET
+  auto-instrumentation drops (`OTEL_DIAGNOSTICS.json`), Azure SDK fault
+  markers, and similar SDK-emitted dumps that land at the user profile root.
 
 > **Note:** The goop exclusion applies **only to file activities**. App launch and
 > browsing monitors are not affected by these path filters.

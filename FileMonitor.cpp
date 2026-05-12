@@ -421,6 +421,21 @@ bool ShouldExclude(const std::wstring& path)
         L"\\googledriveFS\\",
         L"\\box\\",                     // matches Box.com sync directory
         L"\\sharepoint\\",
+
+        // PowerShell module discovery: PowerShell auto-loads modules on
+        // shell startup and on first command, enumerating every .psd1 /
+        // .psm1 / .ps1xml under PSModulePath. None of this is user-
+        // initiated. The substrings below catch:
+        //   * System: \Program Files\WindowsPowerShell\Modules\,
+        //             \Program Files\PowerShell\7\Modules\
+        //             (already filtered by \program files\, but kept for
+        //              robustness against custom install roots)
+        //   * User:   \Users\<u>\Documents\WindowsPowerShell\Modules\
+        //             \Users\<u>\Documents\PowerShell\Modules\
+        //   * OneDrive-synced user profile (the case the user reported):
+        //             \Users\<u>\OneDrive - Org\Documents\WindowsPowerShell\Modules
+        L"\\windowspowershell\\modules\\",
+        L"\\powershell\\modules\\",
     };
 
     for (const auto* dir : goopDirs)
@@ -606,6 +621,22 @@ bool ShouldExclude(const std::wstring& path)
         L".swo", L".swp",          // Vim swap
         // ETW / profiler outputs
         L".btr", L".vsp", L".vspx",
+
+        // PowerShell framework files. These are declarative (manifests,
+        // type/format definitions, console / session / role config) and
+        // are written by module-author tooling such as
+        // New-ModuleManifest -- not by interactive editing. They surface
+        // here only because PowerShell's auto-load enumerates every
+        // module on PSModulePath at shell startup. .psm1 (script module)
+        // is intentionally NOT excluded by extension because authored
+        // module work would touch them; the \windowspowershell\modules\
+        // path filter above suppresses .psm1 noise from third-party
+        // modules without dropping legitimate authoring activity.
+        L".psd1", L".ps1xml", L".psc1", L".cdxml", L".psrc", L".pssc",
+
+        // .NET diagnostic tool outputs (dotnet-trace, dotnet-gcdump,
+        // dotnet-counters with --output --format nettrace, etc.).
+        L".nettrace", L".gcdump", L".netperf",
     };
 
     size_t dotPos = lp.rfind(L'.');
@@ -672,6 +703,50 @@ bool ShouldExclude(const std::wstring& path)
         // Generic temp files (e.g. ~DF1234.tmp, ~WRS{...}.tmp)
         if (!filename.empty() && filename[0] == L'~')
             return true;
+
+        // .NET diagnostic tool outputs that land at the user profile
+        // root (or any working dir): dotnet-diagnostic-{pid} marker
+        // files, dotnet-trace / dotnet-dump / dotnet-counters /
+        // dotnet-gcdump / dotnet-stack / dotnet-monitor / dotnet-symbol
+        // / dotnet-sos artifact files. These are emitted by SDK
+        // diagnostic IPC and command-line tooling, never by the user.
+        static const wchar_t* const dotnetDiagPrefixes[] = {
+            L"dotnet-diagnostic-",
+            L"dotnet-counters-",
+            L"dotnet-trace-",
+            L"dotnet-dump-",
+            L"dotnet-gcdump-",
+            L"dotnet-stack-",
+            L"dotnet-monitor-",
+            L"dotnet-symbol-",
+            L"dotnet-sos-",
+        };
+        for (const auto* p : dotnetDiagPrefixes)
+        {
+            size_t pl = wcslen(p);
+            if (filename.size() >= pl &&
+                filename.compare(0, pl, p) == 0)
+                return true;
+        }
+
+        // Generic diagnostic / telemetry dump suffix.
+        // Catches OTEL_DIAGNOSTICS.json (OpenTelemetry .NET auto-
+        // instrumentation), Azure SDK *_diagnostics.json drops, and
+        // similar SDK-emitted diagnostic markers. These are auto-
+        // generated when an SDK detects a startup or runtime fault,
+        // not authored content.
+        static const wchar_t* const diagSuffixes[] = {
+            L"_diagnostics.json",
+            L"-diagnostics.json",
+            L".diagnostics.json",
+        };
+        for (const auto* sfx : diagSuffixes)
+        {
+            size_t sl = wcslen(sfx);
+            if (filename.size() >= sl &&
+                filename.compare(filename.size() - sl, sl, sfx) == 0)
+                return true;
+        }
     }
 
     return false;

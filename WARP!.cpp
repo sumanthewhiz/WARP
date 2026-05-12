@@ -604,6 +604,100 @@ void LayoutControls(HWND hWnd)
 // ---------- Pipe query (runs on background thread, posts result back) ----------
 static const UINT WM_QUERY_RESULT = WM_USER + 50;
 
+// Walks a pretty-printed JSON string line by line and, on any line that
+// declares a known epoch-seconds timestamp field, appends a JS-style
+// "// YYYY-MM-DD HH:MM:SS" annotation. The output is intended for the
+// API Response edit control only -- it is not strictly valid JSON
+// after annotation, but it is human-readable and round-trips through
+// any JSON-tolerant viewer that ignores // comments.
+//
+// Annotation rules:
+//   * Only lines containing one of TS_KEYS get annotated.
+//   * The first decimal-integer value after the ":" is interpreted as
+//     a Unix epoch in seconds.
+//   * Values outside [1e9, 1e11] are skipped (filters out 0, recency
+//     scores, version numbers, and millisecond timestamps that would
+//     blow past the year 5138 if treated as seconds).
+//   * Conversion uses localtime_s so the displayed time matches the
+//     user's wall clock.
+static std::string AnnotateTimestamps(const std::string& s)
+{
+    static const char* const TS_KEYS[] = {
+        "\"timestamp\"",
+        "\"last_event_ts\"",
+        "\"last_open_ts\"",
+        "\"last_edit_ts\"",
+        "\"updated_at\"",
+        "\"first_seen_ts\"",
+        "\"window_start\"",
+        "\"window_end\"",
+        "\"created_window_ms\"", // also epoch-like in some payloads
+    };
+
+    std::string out;
+    out.reserve(s.size() + 256);
+
+    size_t lineStart = 0;
+    for (size_t i = 0; i <= s.size(); ++i)
+    {
+        bool atEnd = (i == s.size());
+        bool atNewline = !atEnd && s[i] == '\n';
+        if (!atEnd && !atNewline) continue;
+
+        std::string line = s.substr(lineStart, i - lineStart);
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+
+        for (const char* k : TS_KEYS)
+        {
+            size_t kp = line.find(k);
+            if (kp == std::string::npos) continue;
+            size_t cp = line.find(':', kp);
+            if (cp == std::string::npos) continue;
+
+            size_t vp = cp + 1;
+            while (vp < line.size() && (line[vp] == ' ' || line[vp] == '\t'))
+                ++vp;
+
+            size_t ve = vp;
+            while (ve < line.size() && line[ve] >= '0' && line[ve] <= '9')
+                ++ve;
+            if (ve == vp) break; // no integer to annotate
+
+            int64_t epoch = _strtoi64(line.c_str() + vp, nullptr, 10);
+            if (epoch < 1000000000LL || epoch > 99999999999LL)
+                break; // implausible as Unix-seconds; leave alone
+
+            time_t t = static_cast<time_t>(epoch);
+            struct tm tmBuf;
+            if (localtime_s(&tmBuf, &t) != 0) break;
+
+            char ts[64];
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
+
+            // Append the annotation. A trailing comma may already be
+            // present after the integer (",\r\n") -- preserve it by
+            // splicing in just before the first non-numeric char that
+            // is also non-comma.
+            size_t insertAt = ve;
+            if (insertAt < line.size() && line[insertAt] == ',')
+                ++insertAt;
+
+            std::string annotation = "  // ";
+            annotation += ts;
+            line.insert(insertAt, annotation);
+            break; // one annotation per line is enough
+        }
+
+        out += line;
+        if (atNewline)
+        {
+            out += "\r\n";
+            lineStart = i + 1;
+        }
+    }
+    return out;
+}
+
 void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
 {
     // Show "Querying..." immediately
@@ -701,7 +795,7 @@ void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
                     }
                     pretty += c;
                 }
-                response = pretty;
+                response = AnnotateTimestamps(pretty);
             }
             else
             {
