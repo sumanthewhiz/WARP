@@ -464,6 +464,269 @@ struct AppAgg
     bool         isBrowser      = false;
 };
 
+// =====================================================================
+//  Semantic theme extraction.  Given the cleaned per-app titles in a
+//  cluster, distill 1-2 *content* tokens that describe what the user is
+//  doing -- not the verbatim title text.  No fixed taxonomy: the theme
+//  emerges from the actual titles.  MiniLM is used (when available) to
+//  weight tokens by semantic centrality to the cluster.
+// =====================================================================
+
+// Stop-words: function words, generic UI / app verbs, anything that
+// describes form rather than subject matter.  Lowercased.
+static const std::unordered_set<std::string>& StopWords()
+{
+    static const std::unordered_set<std::string> s = {
+        // articles, prepositions, conjunctions, pronouns
+        "the","a","an","and","or","but","if","then","else","of","to","in",
+        "on","at","by","for","with","from","up","out","over","under","into",
+        "is","are","was","were","be","been","being","do","does","did","done",
+        "have","has","had","this","that","these","those","my","your","his","her",
+        "its","our","their","you","he","she","it","we","they","them","what",
+        "which","who","whom","whose","when","where","why","how","all","any",
+        "both","each","few","more","most","other","some","such","no","nor",
+        "not","only","own","same","so","than","too","very","can","will","just",
+        "should","now","also","i","me","mine","ours","yours","us","one","two",
+        "three","four","five","six","seven","eight","nine","ten",
+        // common low-information verbs / nouns that pollute themes
+        "use","used","using","get","gets","got","getting","make","makes","made",
+        "making","take","takes","took","taking","give","gave","given","giving",
+        "want","wants","wanted","need","needs","needed","needing","like","likes",
+        "liked","know","knows","knew","known","think","thinks","thought","see",
+        "sees","saw","seen","feel","feels","felt","look","looks","looked","come",
+        "comes","came","coming","going","gone","went","say","says","said","tell",
+        "tells","told","ask","asks","asked","way","ways","time","times","day",
+        "days","year","years","week","weeks","month","months","case","cases",
+        "thing","things","good","bad","best","worst","great","nice","right",
+        "wrong","first","last","next","prev","previous","old","new","big","small",
+        "long","short","high","low","much","many","fast","slow","sure","real",
+        "true","false","yes","another","still","yet","ever","never","always",
+        "often","sometimes","maybe","really","actually","probably","perhaps",
+        // url / web noise
+        "com","net","org","io","co","www","http","https","html","htm",
+        "page","pages","tab","window","url","link","links","site","sites","web",
+        // file / document noise
+        "file","files","new","untitled","draft","copy","backup","temp","tmp",
+        "folder","folders","item","items","entry","entries",
+        // generic action / category words
+        "open","opened","close","closed","save","saved","print","share",
+        "add","added","delete","remove","removed","update","updated",
+        "view","viewing","read","reading","write","writing","edit","editing",
+        "work","working","run","running","start","started","stop","stopped",
+        "search","searching","find","finding","show","hide","help","about",
+        "settings","menu","home","main","general","default","misc","other",
+        "less","preview","details","intro","welcome","overview","summary",
+        // months / days
+        "jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec",
+        "january","february","march","april","june","july","august","september",
+        "october","november","december","mon","tue","wed","thu","fri","sat","sun",
+        "monday","tuesday","wednesday","thursday","friday","saturday","sunday"
+    };
+    return s;
+}
+
+// File extensions / format names -- never useful as theme tokens.
+static const std::unordered_set<std::string>& FileExts()
+{
+    static const std::unordered_set<std::string> s = {
+        "cpp","hpp","cxx","cc","c","h","cs","java","kt","scala","go","rs",
+        "py","rb","php","pl","sh","bash","ps1","bat","cmd",
+        "js","jsx","ts","tsx","mjs","cjs","vue","svelte","html","htm","css",
+        "scss","sass","less","yaml","yml","toml","ini","cfg","conf","json","xml",
+        "md","markdown","txt","log","csv","tsv","tab","docx","doc","xlsx","xls",
+        "pptx","ppt","pdf","png","jpg","jpeg","gif","bmp","ico","svg","webp",
+        "mp4","mov","avi","mkv","mp3","wav","flac","zip","tar","gz","7z","rar",
+        "exe","dll","msi","sys","obj","pdb","bin","dat","cache","lock"
+    };
+    return s;
+}
+
+// Brand / product / app names -- they describe the *vehicle*, not the
+// *subject*, so they shouldn't appear in the semantic theme phrase.
+static const std::unordered_set<std::string>& BrandNoise()
+{
+    static const std::unordered_set<std::string> s = {
+        // Browsers + search / Q&A platforms
+        "edge","chrome","firefox","safari","brave","opera","vivaldi",
+        "mozilla","google","bing","yahoo","duckduckgo","ddg",
+        "stackoverflow","stack","overflow","quora","reddit","wikipedia","wiki",
+        // Microsoft ecosystem
+        "microsoft","windows","msft","ms","office","outlook","teams","onedrive",
+        "sharepoint","onenote","copilot","azure","msn",
+        "word","excel","powerpoint","visio","project","loop",
+        // Dev platforms
+        "github","gitlab","bitbucket","azuredevops","ado","jira","confluence",
+        "notion","atlassian",
+        // Editors / IDEs
+        "visual","studio","vscode","insiders","jetbrains","intellij","pycharm",
+        "webstorm","clion","rider","goland","datagrip","resharper",
+        "sublime","atom","emacs","vim","neovim","notepad","notepad++","npp",
+        "explorer","terminal","powershell","cmd","wsl","cygwin","gitbash",
+        // Comms
+        "slack","zoom","skype","discord","whatsapp","telegram","signal","webex",
+        // Streaming / media (rarely user "context", usually background)
+        "youtube","spotify","netflix","disney","hulu","prime","amazon","ebay",
+        "facebook","instagram","linkedin","twitter","x","tiktok","threads",
+        "twitch","vimeo","soundcloud",
+        // Misc ubiquitous
+        "app","application","apps","desktop","mobile","beta","alpha","preview",
+        "release","stable","portable","setup","installer","login","signin",
+        "signup","sign","register","account","profile","user","admin"
+    };
+    return s;
+}
+
+// Lowercase ASCII (UTF-8 multibyte preserved as-is).
+static std::string AsciiLower(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        out.push_back((c >= 'A' && c <= 'Z') ? char(c + 32) : char(c));
+    return out;
+}
+
+// Capitalize the first ASCII letter of each word.
+static std::string TitleCase(const std::string& s)
+{
+    std::string out = s;
+    bool atStart = true;
+    for (char& c : out)
+    {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u <= ' ' || u == '-' || u == '_' || u == '/')
+            atStart = true;
+        else
+        {
+            if (atStart && u >= 'a' && u <= 'z')
+                c = char(u - 32);
+            atStart = false;
+        }
+    }
+    return out;
+}
+
+// Split a raw token on camelCase / snake_case / digit boundaries and
+// emit lowercase sub-tokens.
+static void SplitWord(const std::string& w, std::vector<std::string>& out)
+{
+    std::string cur;
+    auto flush = [&]() {
+        if (cur.size() >= 3) out.push_back(AsciiLower(cur));
+        cur.clear();
+    };
+    for (size_t i = 0; i < w.size(); ++i)
+    {
+        unsigned char c = static_cast<unsigned char>(w[i]);
+        if (c == '_' || c == '.' || c == '-' || c == '/' || c == '\\' ||
+            c == ' ' || c == '\t' || c == '(' || c == ')' || c == '[' ||
+            c == ']' || c == '{' || c == '}' || c == ':' || c == ';' ||
+            c == '|' || c == '&' || c == '*' || c == '+' || c == '"' ||
+            c == '\'' || c == ',' || c == '?' || c == '!' || c == '#' ||
+            c == '@' || c == '<' || c == '>')
+        {
+            flush();
+        }
+        else if (cur.empty())
+        {
+            cur.push_back(char(c));
+        }
+        else
+        {
+            // camelCase boundary: prev lower -> cur upper
+            unsigned char prev = static_cast<unsigned char>(cur.back());
+            bool prevLower = (prev >= 'a' && prev <= 'z');
+            bool curUpper  = (c    >= 'A' && c    <= 'Z');
+            bool prevAlpha = (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z');
+            bool curDigit  = (c >= '0' && c <= '9');
+            bool prevDigit = (prev >= '0' && prev <= '9');
+            if ((prevLower && curUpper) || (prevAlpha && curDigit) || (prevDigit && !curDigit))
+                flush();
+            cur.push_back(char(c));
+        }
+    }
+    flush();
+}
+
+// Tokenize a cleaned title into (lowercased, surface-form) pairs of
+// content tokens.  Keeps a parallel "surface" form so the most common
+// original casing can be recovered for display.
+struct ContentTok
+{
+    std::string lower;
+    std::string surface; // original casing of one occurrence
+};
+
+static std::vector<ContentTok>
+ExtractContentTokens(const std::string& title)
+{
+    std::vector<ContentTok> out;
+    if (title.empty()) return out;
+
+    // First pass: split on whitespace + punctuation into "raw words"
+    // (keeps original casing for surface form).
+    std::vector<std::string> raw;
+    std::string cur;
+    for (size_t i = 0; i < title.size(); ++i)
+    {
+        unsigned char c = static_cast<unsigned char>(title[i]);
+        // High-bit bytes (UTF-8 continuation/lead) may belong to non-ASCII
+        // tokens like " · ".  Treat them as separators so we don't pollute.
+        if (c >= 0x80 || c <= ' ' || c == '-' || c == '_' || c == '.' ||
+            c == '/' || c == '\\' || c == '(' || c == ')' || c == '[' ||
+            c == ']' || c == '{' || c == '}' || c == ':' || c == ';' ||
+            c == '|' || c == '&' || c == '*' || c == '+' || c == '"' ||
+            c == '\'' || c == ',' || c == '?' || c == '!' || c == '#' ||
+            c == '@' || c == '<' || c == '>')
+        {
+            if (!cur.empty()) { raw.push_back(cur); cur.clear(); }
+        }
+        else
+        {
+            cur.push_back(char(c));
+        }
+    }
+    if (!cur.empty()) raw.push_back(cur);
+
+    // Second pass: camelCase / digit splits + filter.
+    const auto& stops  = StopWords();
+    const auto& exts   = FileExts();
+    const auto& brands = BrandNoise();
+
+    for (const std::string& w : raw)
+    {
+        // Brand-aware: if the *whole* raw word matches a brand/stopword/
+        // file-ext (case-insensitive), skip it entirely so we don't
+        // produce sub-tokens like "Power Shell" from "PowerShell" or
+        // "Tube" from "YouTube".
+        std::string wLower = AsciiLower(w);
+        if (brands.count(wLower) || stops.count(wLower) || exts.count(wLower))
+            continue;
+
+        std::vector<std::string> subs;
+        SplitWord(w, subs);
+        for (const std::string& lc : subs)
+        {
+            if (lc.size() < 3) continue;
+            // Reject all-digits.
+            bool allDigits = true;
+            for (char ch : lc) if (ch < '0' || ch > '9') { allDigits = false; break; }
+            if (allDigits) continue;
+            if (stops.count(lc) || exts.count(lc) || brands.count(lc)) continue;
+
+            // Recover an original-cased surface from `w` if possible
+            // (case-insensitive substring match).
+            std::string surface = lc;
+            size_t pos = wLower.find(lc);
+            if (pos != std::string::npos)
+                surface = w.substr(pos, lc.size());
+
+            out.push_back({ lc, surface });
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 // =====================================================================
@@ -1002,19 +1265,232 @@ ContextSnapshot ContextInference::ComposeSnapshot()
                   return a.totalFocus > b.totalFocus;
               });
 
+    // ---- Semantic theme extraction (per cluster) ------------------
+    // For each cluster: gather content tokens from the cleaned titles
+    // of its members, score them (frequency * (1 + cosine-to-clean-
+    // centroid) when MiniLM is loaded, frequency-only otherwise), and
+    // pick the top 1-2 as the cluster's *theme phrase*.  This produces
+    // a semantic 1-liner -- "Working on authentication", not "Editing
+    // \"auth.cpp - WARP\" in Visual Studio".  Fallback to verbatim
+    // title when no usable content tokens remain.
+    auto themeFor = [&](const Cluster& cl) -> std::string {
+        // Bag of tokens across this cluster's member titles.
+        std::unordered_map<std::string, int>          freq;
+        std::unordered_map<std::string, std::string>  bestSurface; // case-pretty form
+        std::vector<std::string>                      orderedLowers;
+
+        for (size_t mi : cl.members)
+        {
+            auto toks = ExtractContentTokens(ranked[mi].bestTitle);
+            for (const auto& t : toks)
+            {
+                if (freq.find(t.lower) == freq.end())
+                    orderedLowers.push_back(t.lower);
+                freq[t.lower] += 1;
+                // Prefer the title-cased / mixed-case original spelling
+                // (e.g. "Authentication" beats "authentication").
+                auto& s = bestSurface[t.lower];
+                if (s.empty() ||
+                   (s.size() == t.surface.size() && t.surface > s)) // crude tiebreak
+                    s = t.surface;
+            }
+        }
+        if (orderedLowers.empty()) return std::string();
+
+        struct ScoredTok { std::string lower; double score; size_t firstIdx; };
+        std::vector<ScoredTok> scored;
+        scored.reserve(orderedLowers.size());
+
+        // Build a "clean centroid" from the joined content tokens of
+        // this cluster's titles.  Only used when MiniLM is loaded.
+        std::vector<float> cleanCentroid;
+        if (m_modelReady)
+        {
+            std::string joined;
+            for (const auto& lc : orderedLowers)
+            {
+                if (!joined.empty()) joined.push_back(' ');
+                // Use the surface form so casing can help the encoder.
+                joined += bestSurface[lc].empty() ? lc : bestSurface[lc];
+            }
+            cleanCentroid = Embed(joined);
+        }
+
+        // Cap embedded candidates to top 8 by raw frequency to keep
+        // ONNX cost bounded.  Ties broken by first-seen order.
+        std::vector<std::string> candidates = orderedLowers;
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](const std::string& a, const std::string& b){
+                      if (freq[a] != freq[b]) return freq[a] > freq[b];
+                      return a < b;
+                  });
+        if (candidates.size() > 8) candidates.resize(8);
+
+        for (size_t ci = 0; ci < candidates.size(); ++ci)
+        {
+            const std::string& lc = candidates[ci];
+            double s = static_cast<double>(freq[lc]);
+            if (m_modelReady && !cleanCentroid.empty())
+            {
+                std::vector<float> v = Embed(bestSurface[lc].empty() ? lc : bestSurface[lc]);
+                if (!v.empty())
+                {
+                    float cs = CosineSim(v, cleanCentroid);
+                    // Keep cosine bounded to [0,1]+ so the multiplier
+                    // never goes negative; semantically irrelevant
+                    // tokens get score >= freq, central ones get more.
+                    if (cs < 0.0f) cs = 0.0f;
+                    s *= (1.0 + static_cast<double>(cs));
+                }
+            }
+            // First-seen index (lower = appears earlier in titles).
+            size_t firstIdx = 0;
+            for (size_t k = 0; k < orderedLowers.size(); ++k)
+                if (orderedLowers[k] == lc) { firstIdx = k; break; }
+            scored.push_back({ lc, s, firstIdx });
+        }
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const ScoredTok& a, const ScoredTok& b){
+                      if (a.score != b.score) return a.score > b.score;
+                      return a.firstIdx < b.firstIdx;
+                  });
+
+        // Pick top 1-2 tokens; drop the second if it's much weaker
+        // (< 60 % of the top score) or duplicates the first as a prefix.
+        std::vector<std::string> picks;
+        picks.push_back(bestSurface[scored[0].lower].empty()
+                           ? scored[0].lower
+                           : bestSurface[scored[0].lower]);
+        if (scored.size() >= 2 && scored[1].score >= scored[0].score * 0.6)
+        {
+            const std::string& w1 = scored[0].lower;
+            const std::string& w2 = scored[1].lower;
+            if (w1.find(w2) == std::string::npos &&
+                w2.find(w1) == std::string::npos)
+            {
+                picks.push_back(bestSurface[scored[1].lower].empty()
+                                   ? scored[1].lower
+                                   : bestSurface[scored[1].lower]);
+            }
+        }
+
+        // Order the picks by the position they first appeared in titles
+        // so the phrase reads naturally ("Context Inference" not
+        // "Inference Context").
+        if (picks.size() == 2)
+        {
+            size_t p0 = 0, p1 = 0;
+            for (size_t k = 0; k < orderedLowers.size(); ++k)
+            {
+                if (orderedLowers[k] == scored[0].lower) p0 = k;
+                if (orderedLowers[k] == scored[1].lower) p1 = k;
+            }
+            if (p1 < p0) std::swap(picks[0], picks[1]);
+        }
+
+        std::string out;
+        for (const auto& p : picks) { if (!out.empty()) out += " "; out += p; }
+        return TitleCase(out);
+    };
+
+    // Pick a semantic verb based on the rep app's verb + the dominant
+    // content tokens in the cluster.  Keeps the verb set small so the
+    // one-liner stays uniform.
+    auto verbFor = [&](const Cluster& cl, const std::string& theme) -> std::string {
+        const AppAgg& rep = ranked[cl.repIdx];
+        std::string repVerb = AsciiLower(rep.verb);
+        std::string lowerTheme = AsciiLower(theme);
+
+        auto themeHas = [&](const char* kw) -> bool {
+            return lowerTheme.find(kw) != std::string::npos;
+        };
+        // Look across ALL member titles for keyword hints (cleaned form).
+        auto anyTitleHas = [&](const char* kw) -> bool {
+            for (size_t mi : cl.members)
+            {
+                std::string lo = AsciiLower(ranked[mi].bestTitle);
+                if (lo.find(kw) != std::string::npos) return true;
+            }
+            return false;
+        };
+
+        if (rep.isBrowser)
+        {
+            if (anyTitleHas("pull request") || anyTitleHas("pr #") ||
+                anyTitleHas("merge request") || anyTitleHas("commit") ||
+                anyTitleHas("diff") || anyTitleHas("review") ||
+                anyTitleHas("issue #") || anyTitleHas("/pull/") ||
+                themeHas("review") || themeHas("commit"))
+                return "Reviewing";
+            if (anyTitleHas("docs") || anyTitleHas("documentation") ||
+                anyTitleHas("api reference") || anyTitleHas("tutorial") ||
+                anyTitleHas("guide") || anyTitleHas("how to") ||
+                anyTitleHas("learn") || anyTitleHas("manual"))
+                return "Reading about";
+            return "Researching";
+        }
+        if (repVerb.find("editing") != std::string::npos ||
+            repVerb.find("coding")  != std::string::npos ||
+            repVerb.find("writing") != std::string::npos)
+            return "Working on";
+        if (repVerb.find("messaging") != std::string::npos ||
+            repVerb.find("chatting")  != std::string::npos ||
+            repVerb.find("meeting")   != std::string::npos ||
+            repVerb.find("calling")   != std::string::npos ||
+            repVerb.find("emailing")  != std::string::npos ||
+            repVerb.find("discussing")!= std::string::npos)
+            return "Discussing";
+        if (repVerb.find("designing") != std::string::npos ||
+            repVerb.find("drawing")   != std::string::npos)
+            return "Designing";
+        if (repVerb.find("watching") != std::string::npos ||
+            repVerb.find("playing")  != std::string::npos ||
+            repVerb.find("listening")!= std::string::npos)
+            return "Watching";
+        if (repVerb.find("reading") != std::string::npos)
+            return "Reading";
+        if (repVerb.find("terminal") != std::string::npos ||
+            repVerb.find("shell")    != std::string::npos)
+            return "Working on";
+        // Fallback: keep the rep's verb but normalise capitalization.
+        if (rep.verb.empty()) return "Working on";
+        std::string v = rep.verb;
+        if (!v.empty() && v[0] >= 'a' && v[0] <= 'z') v[0] = char(v[0] - 32);
+        return v;
+    };
+
     auto clusterPhrase = [&](const Cluster& cl) -> std::string {
-        std::string p = phraseFor(ranked[cl.repIdx]);
+        std::string theme = themeFor(cl);
+        std::string p;
+        if (theme.empty())
+        {
+            // No usable content tokens -- fall back to the verbatim
+            // per-app phrase to avoid emitting a context-free verb.
+            p = phraseFor(ranked[cl.repIdx]);
+        }
+        else
+        {
+            std::string verb = verbFor(cl, theme);
+            p = verb + " " + theme;
+        }
+
+        // Append app-context tail when this cluster spans 2+ apps so
+        // the user can still see *where* the work is happening.
         if (cl.members.size() >= 2)
         {
-            // List up to 2 secondary apps inline; cap the rest with " + N more".
-            std::string suffix = " (with ";
+            std::string suffix;
             size_t shown = 0;
-            for (size_t j = 1; j < cl.members.size() && shown < 2; ++j, ++shown)
+            for (size_t j = 0; j < cl.members.size() && shown < 3; ++j, ++shown)
             {
-                if (shown > 0) suffix += " & ";
-                suffix += ranked[cl.members[j]].friendlyName;
+                if (shown == 0)
+                    suffix = " (across " + ranked[cl.members[j]].friendlyName;
+                else if (shown + 1 == (std::min)(cl.members.size(), size_t{3}))
+                    suffix += " & " + ranked[cl.members[j]].friendlyName;
+                else
+                    suffix += ", " + ranked[cl.members[j]].friendlyName;
             }
-            size_t hidden = cl.members.size() - 1 - shown;
+            size_t hidden = cl.members.size() - shown;
             if (hidden > 0)
             {
                 std::ostringstream o;

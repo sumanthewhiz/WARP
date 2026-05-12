@@ -60,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Editing "ContextInference.cpp - WARP" in Visual Studio (with Edge & GitHub Desktop) · Reading "Slack - WARP channel" in Slack · + 1 other thread`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that strips noisy app suffixes, separator glyphs, and unsaved-doc markers. When the optional **MiniLM (`all-MiniLM-L6-v2`) ONNX model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. Without the model the engine degrades gracefully to per-app composition. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"all-MiniLM-L6-v2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown with per-item `thread_id`. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext`; the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner. When the optional **MiniLM (`all-MiniLM-L6-v2`) ONNX model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `frequency × (1 + cosine-to-clean-cluster-centroid)`; the top 1–2 tokens become the cluster's theme phrase. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"all-MiniLM-L6-v2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown (verbatim titles preserved) with per-item `thread_id`. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext`; the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -713,14 +713,41 @@ pre-defined topic buckets.
      centroid is updated as a running mean. There are **no pre-defined topic
      labels** — the threads of work emerge from whatever the user is actually
      doing in the rolling 15-minute window.
-   - **One-liner composition (cluster-aware).** Clusters are sorted by total
-     focus seconds. Each cluster's representative phrase (highest-focus member)
-     is emitted as `<verb> "<title>" in <friendlyName>`; if the cluster has
-     additional members, ` (with App1 & App2 + N more)` is appended. Reps are
-     joined by ` · ` with **adaptive top-N**: keep adding until 80 % of focus
-     time is covered or the 180-character budget is reached, then append
-     `+ N other thread(s)`. Without the model the engine treats each app as its
-     own cluster, producing the prior per-app behaviour.
+   - **Semantic theme extraction (per cluster).** For each cluster the
+     cleaned member titles are tokenized into *content tokens* — split on
+     whitespace, punctuation, **and camelCase** (`ContextInference` →
+     `context` + `inference`); then filtered against a **stop-word** list
+     (articles, low-information verbs / nouns, dates, generic UI words),
+     a **file-extension** list (`cpp`, `docx`, `pdf`, …), and a **brand**
+     list (`Visual Studio`, `Edge`, `GitHub`, `YouTube`, `PowerShell`, …
+     — also matched on the *un-split* form so `YouTube` doesn't leak as
+     `Tube`). Each surviving token is scored by
+     `frequency × (1 + cosine(token-embedding, clean-cluster-centroid))`,
+     where the *clean cluster centroid* is the MiniLM embedding of the
+     joined content-token bag. The top **1–2** tokens (the second is
+     dropped if its score is < 60 % of the first or if one is a prefix of
+     the other) become the cluster's **theme phrase**, ordered by their
+     first appearance and Title-Cased.
+   - **Activity verb selection.** A small, fixed verb vocabulary —
+     `Working on`, `Reviewing`, `Reading about`, `Researching`,
+     `Discussing`, `Watching`, `Designing`, `Reading` — is chosen per
+     cluster from the representative app type combined with content
+     keywords (e.g. browser + `pull request` / `commit` / `diff` →
+     `Reviewing`; browser + `tutorial` / `documentation` →
+     `Reading about`).
+   - **One-liner composition (semantic).** Each cluster contributes
+     `<verb> <Theme Phrase>` (no quoted titles, no app names by
+     default); when a cluster spans 2+ apps, a tail
+     `(across App1, App2 & App3 + N more)` is appended so the
+     consumer can still see *where* the work is happening. Clusters are
+     joined by ` · ` with **adaptive top-N**: keep adding until 80 % of
+     focus time is covered or the 180-character budget is reached, then
+     append `+ N other thread(s)`. **Fallback:** if a cluster's title
+     bag yields zero usable content tokens (all stop-words / brands),
+     that cluster falls back to the prior verbatim format
+     `<verb> "<title>" in <friendlyName>` so a context-free verb is
+     never emitted. Without MiniLM the same theme extraction runs on
+     frequency alone (no cosine weighting).
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
      capped at 0.99.
@@ -1394,7 +1421,7 @@ summarizer. No parameters are required.
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
-    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · Reading \"Slack - WARP channel\" in Slack · + 1 other thread",
+    "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -1451,7 +1478,7 @@ wants short-term memory of what the user has been doing.
 ```json
 {
   "recent_contexts": [
-    { "timestamp": 1750012345, "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · + 2 other threads", "confidence": 0.84, "model": "all-MiniLM-L6-v2", "thread_count": 3, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012345, "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads", "confidence": 0.84, "model": "all-MiniLM-L6-v2", "thread_count": 3, "/* …full snapshot fields… */": null },
     { "timestamp": 1750012045, "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "model": "all-MiniLM-L6-v2", "thread_count": 2, "/* … */": null }
   ],
   "returned": 2,
@@ -1817,8 +1844,10 @@ WARP!\
 |                                QueryInferences & GetInferenceDeltas impl
 |-- ContextInference.h          MiniLM-clustered context summarizer interface
 |-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + Embed/CosineSim
-|                                + greedy clustering + cluster-aware ComposeOneLiner;
-|                                60-sec rolling 15-min summarizer with material-change dedup
+|                                + greedy clustering + semantic theme distillation
+|                                (token bag + stop/brand/ext filter + cosine-weighted
+|                                scoring + verb selector); 60-sec rolling 15-min
+|                                summarizer with material-change dedup
 |-- BertTokenizer.h             Header-only WordPiece tokenizer for MiniLM
 |
 |-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.22.0)

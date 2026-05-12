@@ -97,7 +97,7 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 | Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
 | Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
-| Dynamic context awareness | Use `GetRecentContext` for the latest one-liner of what the user is doing right now (e.g., *"Editing \"main.cpp - WARP\" in Visual Studio · Reading \"GitHub PR\" in Edge"*); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
+| Dynamic context awareness | Use `GetRecentContext` for the latest one-liner of what the user is doing right now (e.g., *"Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks"*); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
 
 ---
 
@@ -545,7 +545,7 @@ Each section has:
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
-    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · Reading \"Slack - WARP channel\" in Slack · + 1 other thread",
+    "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -603,7 +603,7 @@ Each section has:
       "timestamp": 1750012345,
       "window_start": 1750011445,
       "window_end": 1750012345,
-      "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · + 2 other threads",
+      "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads",
       "activity_count": 47,
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
@@ -617,7 +617,7 @@ Each section has:
       "timestamp": 1750012045,
       "window_start": 1750011145,
       "window_end": 1750012045,
-      "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio",
+      "one_liner": "Researching React Hooks · Reading about API Reference",
       "activity_count": 31,
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
@@ -838,16 +838,22 @@ suggestions, search results, or UI adaptations:
 {"op": "GetRecentContext"}
 ```
 
-The response gives you a single human-readable line naming the actual
-documents, browser tabs, and apps the user is engaged with right now (e.g.
-*"Editing \"main.cpp - WARP\" in Visual Studio · Reading \"GitHub PR\" in Edge ·
-+ 2 other apps"*), plus a structured `items[]` breakdown for programmatic use
-and a confidence score. Use this to:
+The response gives you a single human-readable line that names the
+**semantic theme** of what the user is doing right now (e.g.
+*"Working on Context Inference (across Visual Studio & Edge) ·
+Discussing Daily Standup (across Outlook & Teams) · Researching React
+Hooks"*) — the cluster theme is distilled from the actual document/tab/
+app titles by tokenizing, stripping stop-words / brand names / file
+extensions, and ranking the remaining content tokens by frequency
+weighted by their cosine similarity to the cluster centroid. The
+response also includes a structured `items[]` breakdown (which **does**
+preserve the verbatim per-app titles for programmatic consumers) and a
+confidence score. Use this to:
 
-- **Search ranking** -- boost results related to the user's current docs, tabs,
-  or app set.
-- **Smart suggestions** -- recommend tools, files, or actions relevant to the
-  detected activity.
+- **Search ranking** -- boost results related to the user's current
+  themes, docs, tabs, or app set.
+- **Smart suggestions** -- recommend tools, files, or actions relevant
+  to the detected activity.
 - **Dashboard widgets** -- show a "Currently working on" summary.
 
 For short-term memory or context drift over time, call:
@@ -860,13 +866,20 @@ Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
 The composer uses MiniLM (`all-MiniLM-L6-v2`) for **dynamic semantic
-clustering** — *not* mapping to a fixed taxonomy. Two activities are merged
-into one *thread of work* iff their embeddings are similar to each other
-(cosine ≥ 0.65), so the answer always names *what* the user is on (the
-literal document/tab/app title), and the breakdown reveals which activities
-actually belong together. If the model files are missing the engine still
-runs and reports `"model": "deterministic"` — the one-liner format is
-identical.
+clustering** *and* **theme distillation** — *not* mapping to a fixed
+taxonomy. Two activities are merged into one *thread of work* iff their
+embeddings are similar to each other (cosine ≥ 0.65), and within each
+thread the dominant content tokens (after stripping stop-words, file
+extensions, and brand/app names) are scored by `frequency × (1 +
+cosine-to-cluster-centroid)` — the top 1-2 are emitted as the theme
+phrase. The verb is selected from a small fixed set (`Working on`,
+`Reviewing`, `Researching`, `Reading about`, `Discussing`, …) based on
+the dominant app type and content keywords. The verbatim per-app titles
+remain available in `items[]` for consumers that want them. If the
+model files are missing the engine still runs and reports
+`"model": "deterministic"` — themes are extracted by frequency alone,
+and clusters that yield no usable content tokens fall back to the
+prior verbatim format `<verb> "<title>" in <app>`.
 
 ---
 
@@ -1624,7 +1637,31 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.1.*
+*This documentation describes WARP API version 5.2.*
+
+*Changes from v5.1:*
+- *The `one_liner` is now a **semantic description** of what the user
+  is doing, not a verbatim concatenation of document / tab / app
+  titles. Each cluster's titles are tokenized into content tokens
+  (whitespace + punctuation + camelCase split), filtered against
+  stop-word, file-extension, and brand/app-name lists (also matched
+  on the un-split form, so `YouTube` doesn't leak as `Tube`), and the
+  top 1-2 surviving tokens — scored by `frequency × (1 + cosine-to-
+  cluster-centroid)` when MiniLM is loaded — become the cluster's
+  **theme phrase**. The activity verb is chosen from a small fixed
+  vocabulary (`Working on`, `Reviewing`, `Reading about`,
+  `Researching`, `Discussing`, `Watching`, `Designing`, `Reading`)
+  based on the dominant app type and content keywords. Multi-app
+  clusters get an `(across App1, App2 & App3)` tail so consumers can
+  still see *where* the work is happening.*
+- *No response-shape change. The `items[]` breakdown still returns the
+  **verbatim cleaned per-app title** for programmatic use; only the
+  `one_liner` string is now semantic. `model`, `thread_count`, and
+  per-item `thread_id` are unchanged from v5.1.*
+- *Fallback: clusters whose titles yield zero usable content tokens
+  (after stop-word / brand / extension filtering) revert to the prior
+  verbatim format `<verb> "<title>" in <friendlyName>`, so no
+  context-free verb is ever emitted.*
 
 *Changes from v5.0:*
 - ***Additive:*** *`GetRecentContext` response gains three fields:
