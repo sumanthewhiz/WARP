@@ -1,7 +1,7 @@
 #include "framework.h"
 #include "QueryApi.h"
 #include "InferenceEngine.h"
-#include "TopicInference.h"
+#include "ContextInference.h"
 #include <sstream>
 #include <string>
 #include <vector>
@@ -18,12 +18,12 @@ QueryApi::~QueryApi()
     if (m_stopEvent) CloseHandle(m_stopEvent);
 }
 
-void QueryApi::Start(ActivityDatabase* db, InferenceEngine* inference, TopicInference* topicInf)
+void QueryApi::Start(ActivityDatabase* db, InferenceEngine* inference, ContextInference* ctxInf)
 {
     if (m_running) return;
     m_db = db;
     m_inference = inference;
-    m_topicInf = topicInf;
+    m_ctxInf = ctxInf;
     m_running = true;
     ResetEvent(m_stopEvent);
     m_thread = std::thread(&QueryApi::Run, this);
@@ -176,9 +176,22 @@ void QueryApi::HandleClient(HANDLE hPipe)
         return;
     }
 
-    if (opVal == "GetRecentContext" && m_topicInf)
+    if (opVal == "GetRecentContext" && m_ctxInf)
     {
-        std::string json = m_topicInf->GetRecentContext();
+        std::string json = m_ctxInf->GetRecentContext();
+        DWORD written = 0;
+        WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
+        FlushFileBuffers(hPipe);
+        return;
+    }
+
+    if (opVal == "GetRecentContexts" && m_ctxInf)
+    {
+        std::string countStr = findValue("count");
+        int count = 10;
+        if (!countStr.empty())
+            count = static_cast<int>(strtol(countStr.c_str(), nullptr, 10));
+        std::string json = m_ctxInf->GetRecentContexts(count);
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);

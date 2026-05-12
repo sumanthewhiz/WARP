@@ -59,8 +59,9 @@
 #define IDC_EDIT_INFER_TOPN		438
 #define IDC_INFER_TOPN_LABEL	439
 
-// Topic context inference
-#define IDB_TOPIC_CONTEXT		440
+// Recent context inference (dynamic 1-liner summarization)
+#define IDB_RECENT_CONTEXT		440
+#define IDB_CONTEXT_HISTORY		441
 #define IDT_TOPIC_TIMER			302
 
 #ifndef IDC_STATIC

@@ -4,8 +4,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
 [![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
-[![ONNX Runtime](https://img.shields.io/badge/inference-ONNX%20Runtime%201.22-005CED)](https://onnxruntime.ai/)
-[![Model](https://img.shields.io/badge/embeddings-all--MiniLM--L6--v2-yellow)](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+[![Inference](https://img.shields.io/badge/inference-deterministic%20%C2%B7%20no%20model-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
 
 WARP is a lightweight Windows desktop application that silently monitors file/folder
 activity, application launches, foreground app focus (with window titles and dwell
@@ -61,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Semantic topic inference** | Every 5 minutes, all activities from the last 15-minute window are gathered, and a local **all-MiniLM-L6-v2** sentence-embedding model (run via ONNX Runtime) computes 384-dimensional vector embeddings for each activity's descriptive text. Each embedding is matched to the closest topic from ~50 pre-embedded candidate labels via cosine similarity. A greedy set-cover then selects the **top 3 semantic topics** that collectively explain ≥ 90 % of recent activities. Results are stored with timestamps and retrievable via the **Show Recent Context** button or the `GetRecentContext` API operation. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A deterministic, model-free summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Editing "ContextInference.cpp - WARP" in Visual Studio · Reading "GitHub - dev branch" in Edge · + 2 other apps`. The composer uses a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that strips noisy app suffixes, separator glyphs, and unsaved-doc markers. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, and a structured `items[]` breakdown. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext`; the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -118,7 +117,7 @@ flowchart TB
         EC["EventContext<br/><sub>per-event payload</sub>"]:::storage
         DB[("ActivityDatabase<br/><sub>SQLite WAL · activity.db</sub>")]:::storage
         IE["InferenceEngine<br/><sub>confidence-weighted REAL counters</sub>"]:::storage
-        TI["TopicInference<br/><sub>MiniLM ONNX · 5-min cycle</sub>"]:::storage
+        TI["ContextInference<br/><sub>deterministic · 60-sec cycle</sub>"]:::storage
     end
 
     subgraph QueryLayer ["Query surface"]
@@ -662,56 +661,73 @@ Two query operations are exposed through the named pipe (see the
 Clearing the activity history (`ClearAll`) also clears the inference in-memory
 cache via `ClearCache()`.
 
-#### `TopicInference` (`TopicInference.h` / `TopicInference.cpp`)
+#### `ContextInference` (`ContextInference.h` / `ContextInference.cpp`)
 
-A semantic topic-deduction engine that uses a local **all-MiniLM-L6-v2**
-sentence-transformer model (via ONNX Runtime) to understand what the user has been
-working on.
+A **deterministic, model-free** context summarizer that reads recent activity
+directly from SQLite and composes a single human-readable **one-liner** describing
+what the user is actively doing — using the actual document names, browser tab
+titles, and application titles observed, not a fixed list of pre-defined buckets.
 
 **Lifecycle:**
 
-1. `Init(modelsDir)` -- loads `vocab.txt` into the `BertTokenizer`, creates an ONNX
-   Runtime session for `minilm.onnx`, and pre-embeds ~50 candidate topic labels
-   (e.g. *"C and C++ software development and programming"*, *"Email reading and
-   writing correspondence"*, *"Debugging and troubleshooting software issues"*).
-2. `Start(db)` / `Stop()` -- manages a background timer thread.
-3. Every **5 minutes**, `DeduceTopics()` runs:
-   - Gathers all file, app launch, browsing, and focus activities from the last
-     **15 minutes** via `ActivityDatabase`.
-   - Composes a natural-language description for each activity (e.g.
-     *"Working in devenv.exe: WARP!.cpp - Visual Studio"*).
-   - Embeds each description into a **384-dimensional vector** using the MiniLM
-     model with mean pooling and L2 normalisation.
-   - Matches each activity embedding to the **nearest topic candidate** via cosine
-     similarity (dot product on normalised vectors).
-   - A **greedy set-cover** selects the top 3 topics that collectively cover
-     ≥ 90 % of activities.
-4. Results (`TopicResult`: timestamp, 3 topic strings, coverage %, activity count)
-   are stored in a rolling buffer (up to 288 entries = 24 hours).
+1. `Init()` -- no model files, no NuGet dependency. Just initializes in-memory
+   state (the rolling history buffer and recompute timer).
+2. `Start(db, foregroundMonitor)` / `Stop()` -- manages a background timer thread.
+3. Every **60 seconds**, `RunOnce()` runs:
+   - Pulls all file, app-launch, browsing, and **app-focus** activities from the
+     last **15 minutes** via `ActivityDatabase`.
+   - Overlays the user's **currently-active** foreground window via
+     `ForegroundMonitor::GetCurrentSession()` — counted as a virtual focus row
+     starting at `max(session_start, window_start)`. This fixes the blind spot
+     where a user parked >15 minutes in one window would otherwise produce zero
+     focus rows in the query.
+   - Buckets activity per executable. For each exe, runs a **3-layer classifier**:
+     1. **Exact match** against `kAppClasses[]` (~80 entries: Visual Studio, VS
+        Code, Notepad++, JetBrains IDEs, Office apps, Outlook, Teams, Slack,
+        browsers, PDF readers, notes apps, terminals, design tools, media
+        players).
+     2. **Path heuristic** for vendor folders (`\jetbrains\`, `\toolbox\apps\`,
+        `\microsoft visual studio\`, `\code - insiders\`, `\microsoft office\`,
+        `\microsoft\edge`, `\google\chrome`).
+     3. **Fallback** — exe basename minus `.exe`, with the verb *"Working in"*.
+   - Picks the **most recent / longest-dwell title** for each exe and runs it
+     through `CleanTitle()`: normalises UTF-8 em-dash, en-dash, bullet, and `|`
+     to ` - ` separators; strips leading status glyphs (●, `* `); pops trailing
+     and leading segments matching the app's friendly name or the `kStripSuffixes`
+     list (~50 noisy suffixes); and length-caps at 80 characters with a UTF-8
+     ellipsis.
+   - For browsers, the *cleaned active tab title* (from `BrowsingActivity`) takes
+     precedence over the window title.
+   - Composes the final one-liner by emitting `<verb> "<title>" in <friendlyName>`
+     for the dominant apps, joined by ` · `, with **adaptive top-N**: keep adding
+     apps until 80 % of focus time is covered or the 180-character budget is
+     reached, then append `+ N other app(s)` if any are left.
+   - Computes a heuristic **confidence** score:
+     `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
+     capped at 0.99.
+4. Snapshots (`ContextSnapshot`: timestamp, window bounds, one-liner,
+   activity count, focus seconds, confidence, dominant percentage, signal types,
+   top-5 `items[]`) are stored in a rolling history buffer (up to 1 440 entries =
+   ~24 hours at 60-sec cadence).
+5. **Material-change dedup**: a new snapshot is appended to history only when (a)
+   the one-liner string differs from the last appended, **or** (b) the dominant
+   exe changes, **or** (c) at least 5 minutes have elapsed since the last append.
+   The "latest snapshot" pointer is refreshed unconditionally on every cycle.
 
-The `GetRecentContext()` method returns the latest result as JSON (see the
-[GetRecentContext API](#getrecentcontext) section below).
+The `GetRecentContext()` method returns the latest snapshot as JSON; the new
+`GetRecentContexts(count)` method returns the last *N* snapshots, newest-first
+(default 10, hard-capped at 200 to stay safely under the 64 KB pipe buffer). See
+the [GetRecentContext](#getrecentcontext) and
+[GetRecentContexts](#getrecentcontexts) API sections below.
 
-Because the model computes **dense semantic embeddings**, it genuinely understands
-meaning: *"reviewing John's changes to the auth module"* matches *"Code review and
-pull request review"* even with zero keyword overlap -- both map to nearby points in
-the 384-dimensional semantic space.
-
-#### `BertTokenizer` (`BertTokenizer.h`)
-
-A header-only BERT WordPiece tokenizer implementation in C++. Loads `vocab.txt`
-(~30 000 tokens), then:
-
-1. **Basic tokenization** -- lowercases the input and splits on whitespace and
-   punctuation.
-2. **WordPiece sub-word tokenization** -- for each word, performs greedy
-   longest-match lookup against the vocabulary, using `##` prefixed sub-tokens for
-   continuation pieces.
-3. **Framing** -- wraps the token sequence with `[CLS]` ... `[SEP]` and pads to
-   the configured maximum sequence length (128 tokens).
-
-This is the same tokenizer algorithm used by the Hugging Face `transformers`
-library for BERT-family models.
+> **Why deterministic instead of an embedding model?** The previous design used a
+> local MiniLM ONNX model to map activity strings to one of ~50 pre-defined topic
+> buckets via cosine similarity. In practice this (a) hard-coded the user's
+> possible contexts to a fixed taxonomy, (b) lost the actual document/tab/app
+> name in the result, (c) added an ~80 MB model file plus an ONNX Runtime DLL to
+> the build, and (d) consumed ~120 MB of RAM at idle. The new path produces a
+> *richer* answer — the literal name of the document or tab the user is working
+> on — at zero RAM cost and with no model to ship.
 
 > **Query surface**
 
@@ -734,12 +750,15 @@ The API accepts four kinds of requests:
 2. **`QueryInferences`** — batch lookup of precomputed inference records.
 3. **`GetInferenceDeltas`** — incremental sync of inference records since a version
    watermark.
-4. **`GetRecentContext`** — retrieve the most recently deduced semantic topics from
-   the MiniLM topic inference engine.
+4. **`GetRecentContext`** — retrieve the latest one-liner snapshot from the
+   `ContextInference` summarizer.
+5. **`GetRecentContexts`** — retrieve the last *N* snapshots (newest first) from
+   the `ContextInference` rolling history buffer.
 
 Inference operations are routed to the `InferenceEngine` instance;
-`GetRecentContext` is routed to the `TopicInference` instance; event queries
-are handled by `BuildJsonResponse` which reads directly from `ActivityDatabase`.
+`GetRecentContext` and `GetRecentContexts` are routed to the `ContextInference`
+instance; event queries are handled by `BuildJsonResponse` which reads directly
+from `ActivityDatabase`.
 
 ---
 
@@ -996,37 +1015,26 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
 - C++14 standard
 
 The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
-and uses **Microsoft.ML.OnnxRuntime** (NuGet, v1.22.0) for running the MiniLM
-semantic model.
+and has **no external runtime dependencies** — context inference is fully
+deterministic and ships in-binary.
 
 **Steps:**
 
 1. Open `WARP!.sln` in Visual Studio 2022.
-2. NuGet restore will automatically fetch `Microsoft.ML.OnnxRuntime` into the
-   `packages/` directory.
-3. Download the MiniLM model files into the `models/` directory:
-   - `minilm.onnx` (~86 MB) from
-     [Hugging Face](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx)
-   - `vocab.txt` (~220 KB) from
-     [Hugging Face](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt)
-4. Build any configuration (Debug/Release × Win32/x64/ARM64).
+2. Build any configuration (Debug/Release × Win32/x64/ARM64).
 
-The build will automatically:
-- Copy `onnxruntime.dll` to the output directory.
-- Copy `models/minilm.onnx` and `models/vocab.txt` to `$(OutDir)models/` if they
-  exist in the project directory.
-
-At runtime, the app looks for the `models/` directory next to the executable first,
-then falls back to `%LOCALAPPDATA%\WARP\models`.
+That's it — there are no NuGet model downloads, no external `.dll` copies, and
+no `models/` folder to provision.
 
 ---
 
 ## Tech stack
 
 WARP is intentionally lean: a single Win32 executable that talks directly to
-the operating system for capture, to embedded SQLite for persistence, and to
-ONNX Runtime for semantic inference. There is no service host, no background
-broker, and no managed runtime in the dependency graph.
+the operating system for capture, to embedded SQLite for persistence, and uses
+a deterministic in-process summarizer for context inference. There is no
+service host, no background broker, no managed runtime, and no ML model in the
+dependency graph.
 
 ```mermaid
 flowchart TB
@@ -1057,10 +1065,10 @@ flowchart TB
         DB[("activity.db<br/><sub>%LOCALAPPDATA%\\WARP\\</sub>")]:::store
     end
 
-    subgraph ML ["Semantic inference layer (optional)"]
-        ORT["ONNX Runtime 1.x<br/><sub>CPU execution provider</sub>"]:::ml
-        MINI["all-MiniLM-L6-v2<br/><sub>384-dim sentence embeddings</sub>"]:::ml
-        BERT["BertTokenizer<br/><sub>WordPiece · vocab.txt · header-only</sub>"]:::ml
+    subgraph CTX ["Context inference layer"]
+        CI["ContextInference<br/><sub>deterministic summarizer · in-process</sub>"]:::ml
+        CLS["kAppClasses + path heuristics<br/><sub>~80 entries · 3-layer classifier</sub>"]:::ml
+        TC["CleanTitle + ComposeOneLiner<br/><sub>UTF-8 normaliser · adaptive top-N</sub>"]:::ml
     end
 
     WARP --> ETW
@@ -1076,9 +1084,9 @@ flowchart TB
     WARP --> SQLITE
     SQLITE --> DB
 
-    WARP --> ORT
-    ORT   --> MINI
-    WARP  --> BERT
+    WARP --> CI
+    CI   --> CLS
+    CI   --> TC
 ```
 
 | Layer            | Component                            | Purpose                                                                |
@@ -1093,9 +1101,9 @@ flowchart TB
 | **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
 | **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
 | **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
-| **Semantic**     | ONNX Runtime 1.x (CPU EP)            | Runs the MiniLM sentence-embedding model                               |
-| **Semantic**     | `all-MiniLM-L6-v2` (384-dim)         | Embeds 15-minute activity windows + ~50 pre-embedded topic labels      |
-| **Semantic**     | `BertTokenizer` (header-only)        | WordPiece tokenisation against `vocab.txt`                             |
+| **Context**      | `ContextInference` (deterministic)   | 60-sec rolling 15-min summarizer; emits a one-liner + `items[]`        |
+| **Context**      | `kAppClasses` + path heuristics      | 3-layer exe classifier (~80 known apps + JetBrains/Office/browsers)    |
+| **Context**      | `CleanTitle` + `ComposeOneLiner`     | UTF-8 separator normaliser, suffix stripper, adaptive top-N composer   |
 
 > **Why no service?** WARP runs interactively in the elevated user session so
 > that `GetForegroundWindow`, `WTSGetActiveConsoleSessionId`, and UI
@@ -1133,17 +1141,19 @@ flowchart TB
    database. Confidence-weighted rolling counts are recomputed from the
    raw event tables (`SUM(COALESCE(confidence, 1.0))`).
 10. The named-pipe server starts accepting connections.
-11. The topic inference engine loads the MiniLM ONNX model and vocabulary,
-    pre-embeds ~50 topic candidate labels, and begins its 5-minute cycle.
+11. The context inference engine starts (no model load — just an in-memory
+    timer) and begins its 60-second cycle.
 12. Every detected event (file, app launch, app focus, or browsing) is
     enriched with an `EventContext` (source / foreground / parent ids,
     `ms_since_input`, `confidence`), inserted into the appropriate
     database table, **and** fed to the inference engine, which adds the
     event's confidence to the per-entity rolling counters.
-13. Every 5 minutes, the topic inference engine gathers all activities
-    from the last 15 minutes, embeds each with MiniLM, matches to the
-    nearest semantic topic, and stores the top 3 topics with a coverage
-    percentage.
+13. Every 60 seconds, the context inference engine gathers all activities
+    from the last 15 minutes (overlaying the currently-active foreground
+    window as a virtual focus row), classifies and cleans them, and
+    composes a one-liner snapshot. The snapshot is appended to the
+    rolling history only on material change (different one-liner,
+    different dominant app, or a 5-minute heartbeat).
 14. Every 6 hours, records older than 30 days are purged from all event
     tables and inference rolling counts are recomputed.
 15. When the user crosses the **soft** idle threshold, new events are
@@ -1322,8 +1332,8 @@ Returns up to 5 000 records per call, ordered by ascending `version`.
 
 ##### GetRecentContext
 
-Retrieve the most recently deduced semantic topics from the MiniLM-powered topic
-inference engine. No parameters are required.
+Retrieve the **latest** one-liner snapshot from the deterministic
+`ContextInference` summarizer. No parameters are required.
 
 ```json
 {
@@ -1337,27 +1347,71 @@ inference engine. No parameters are required.
 {
   "recent_context": {
     "timestamp": 1750012345,
+    "window_start": 1750011445,
+    "window_end": 1750012345,
+    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · Reading \"GitHub - dev branch\" in Edge · + 2 other apps",
     "activity_count": 47,
-    "coverage_pct": 93.6,
-    "topics": [
-      "C and C++ software development and programming",
-      "Source control and Git version management",
-      "Technical research and documentation reading"
+    "focus_seconds": 812,
+    "dominant_focus_pct": 61.4,
+    "confidence": 0.84,
+    "signal_types": ["focus", "file", "browsing"],
+    "items": [
+      { "app": "Visual Studio", "exe": "devenv.exe", "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4 },
+      { "app": "Edge",          "exe": "msedge.exe", "title": "GitHub - dev branch",        "focus_seconds": 184, "pct": 22.7 },
+      { "app": "Outlook",       "exe": "OUTLOOK.EXE","title": "Inbox - Suman Ghosh",        "focus_seconds":  78, "pct":  9.6 },
+      { "app": "Teams",         "exe": "ms-teams.exe","title": "Daily Standup",             "focus_seconds":  52, "pct":  6.4 }
     ],
-    "history_count": 12,
-    "model": "all-MiniLM-L6-v2"
+    "history_count": 12
   }
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | `integer` | When this inference was produced (Unix epoch seconds). |
-| `activity_count` | `integer` | Total activities examined in the 15-minute window. |
-| `coverage_pct` | `number` | Percentage of activities covered by the top 3 topics. |
-| `topics` | `string[]` | Up to 3 semantic topic labels, ordered by coverage. |
-| `history_count` | `integer` | Number of stored inference snapshots (max 288 = 24 h). |
-| `model` | `string` | The embedding model used (`"all-MiniLM-L6-v2"`). |
+| `timestamp` | `integer` | When this snapshot was produced (Unix epoch seconds). |
+| `window_start` / `window_end` | `integer` | Bounds of the 15-minute lookback window (Unix epoch seconds). |
+| `one_liner` | `string` | Human-readable summary of what the user is actively doing. |
+| `activity_count` | `integer` | Total activities examined in the window. |
+| `focus_seconds` | `integer` | Total foreground dwell time accounted for. |
+| `dominant_focus_pct` | `number` | Percentage of focus time held by the top app. |
+| `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). |
+| `signal_types` | `string[]` | Which event categories contributed (`focus`, `file`, `app`, `browsing`). |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `app`, `exe`, `title`, `focus_seconds`, `pct`. |
+| `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 h). |
+
+##### GetRecentContexts
+
+Retrieve the last *N* snapshots from the rolling history buffer, **newest
+first**. Useful for charting context drift over time or for an LLM agent that
+wants short-term memory of what the user has been doing.
+
+```json
+{
+  "op": "GetRecentContexts",
+  "count": 10
+}
+```
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `count` | `integer` | `10` | Hard-capped at 200 to keep responses under the 64 KB pipe buffer. |
+
+**Response:**
+
+```json
+{
+  "recent_contexts": [
+    { "timestamp": 1750012345, "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · + 3 other apps", "confidence": 0.84, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012045, "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "/* … */": null }
+  ],
+  "returned": 2,
+  "history_count": 12,
+  "requested": 10
+}
+```
+
+Each entry has the same shape as the `recent_context` object documented under
+[GetRecentContext](#getrecentcontext).
 
 ##### Inference record fields
 
@@ -1711,14 +1765,11 @@ WARP!\
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
 |-- InferenceEngine.cpp         Confidence-weighted REAL counters, recency score,
 |                                QueryInferences & GetInferenceDeltas impl
-|-- TopicInference.h            Semantic topic inference interface (MiniLM embedding pipeline)
-|-- TopicInference.cpp          ONNX Runtime model loading, embedding, topic deduction impl
-|-- BertTokenizer.h             Header-only BERT WordPiece tokenizer for MiniLM
+|-- ContextInference.h          Deterministic context summarizer interface
+|-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + ComposeOneLiner;
+|                                60-sec rolling 15-min summarizer with material-change dedup
 |
-|-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime)
-|-- models/                     MiniLM model files (not checked in — see Building)
-|   |-- minilm.onnx             all-MiniLM-L6-v2 ONNX model (~86 MB)
-|   +-- vocab.txt               BERT WordPiece vocabulary (~220 KB)
+|-- packages.config             NuGet package references (currently empty)
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)
 +-- sqlite3.h                   SQLite public header

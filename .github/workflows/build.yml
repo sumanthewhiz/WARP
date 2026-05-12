@@ -41,13 +41,6 @@ jobs:
       run: |
         nuget restore "WARP!.sln" -PackagesDirectory ../packages
 
-    - name: Download MiniLM model files
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Path "models" -Force | Out-Null
-        Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" -OutFile "models/minilm.onnx"
-        Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
-
     - name: Detect available VC toolset
       id: toolset
       shell: pwsh
@@ -86,11 +79,7 @@ jobs:
         foreach ($p in $platforms) {
           $staging = "artifacts/$($p.arch)/WARP"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
-          Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
-          Copy-Item "$($p.src)/models/minilm.onnx" "$staging/models/minilm.onnx" -Force
-          Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Write-Host "Staged $($p.arch): $staging"
         }

@@ -3,6 +3,7 @@
 #include "ForegroundChangeBroker.h"
 #include "EventContext.h"
 #include <algorithm>
+#include <ctime>
 #include <psapi.h>
 
 // Returns true if the process is a system/shell process whose foreground
@@ -125,7 +126,8 @@ void ForegroundMonitor::Stop()
     m_prevExeName.clear();
     m_prevExePath.clear();
     m_prevTitle.clear();
-    m_prevStartTick = 0;
+    m_prevStartTick    = 0;
+    m_prevStartUtcSecs = 0;
 }
 
 void ForegroundMonitor::Pause()
@@ -161,7 +163,8 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
         m_prevExeName.clear();
         m_prevExePath.clear();
         m_prevTitle.clear();
-        m_prevStartTick = 0;
+        m_prevStartTick    = 0;
+        m_prevStartUtcSecs = 0;
         return;
     }
 
@@ -183,15 +186,17 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
         m_prevExeName.clear();
         m_prevExePath.clear();
         m_prevTitle.clear();
-        m_prevStartTick = 0;
+        m_prevStartTick    = 0;
+        m_prevStartUtcSecs = 0;
         return;
     }
 
-    m_prevPid       = pid;
-    m_prevExeName   = exeName;
-    m_prevExePath   = exePath;
-    m_prevTitle     = title;
-    m_prevStartTick = nowTick;
+    m_prevPid          = pid;
+    m_prevExeName      = exeName;
+    m_prevExePath      = exePath;
+    m_prevTitle        = title;
+    m_prevStartTick    = nowTick;
+    m_prevStartUtcSecs = static_cast<int64_t>(std::time(nullptr));
 }
 
 void ForegroundMonitor::EmitPreviousLocked(ULONGLONG nowTick)
@@ -202,4 +207,19 @@ void ForegroundMonitor::EmitPreviousLocked(ULONGLONG nowTick)
     if (durationSecs < 1 || !m_callback) return;
     EventContext ctx = EventContextUtil::CaptureContext(m_prevPid);
     m_callback(m_prevExeName, m_prevExePath, m_prevTitle, durationSecs, ctx);
+}
+
+bool ForegroundMonitor::GetCurrentSession(ActiveSession& out) const
+{
+    std::lock_guard<std::mutex> lk(m_stateMtx);
+    if (m_prevPid == 0 || m_prevExeName.empty() || m_prevStartTick == 0)
+        return false;
+
+    out.exeName          = m_prevExeName;
+    out.exePath          = m_prevExePath;
+    out.windowTitle      = m_prevTitle;
+    out.startedAtUtcSecs = m_prevStartUtcSecs;
+    out.durationSoFarSecs =
+        static_cast<int>((GetTickCount64() - m_prevStartTick) / 1000);
+    return true;
 }

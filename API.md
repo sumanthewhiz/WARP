@@ -30,6 +30,7 @@ timestamps) to make better-informed decisions in their own workflows.
     - [QueryInferences](#queryinferences)
     - [GetInferenceDeltas](#getinferencedeltas)
     - [GetRecentContext](#getrecentcontext)
+    - [GetRecentContexts](#getrecentcontexts)
 - [Response Format](#response-format)
   - [Top-Level Structure](#top-level-structure)
   - [File Activity Fields](#file-activity-fields)
@@ -40,6 +41,7 @@ timestamps) to make better-informed decisions in their own workflows.
   - [QueryInferences Response](#queryinferences-response)
   - [GetInferenceDeltas Response](#getinferencedeltas-response)
   - [GetRecentContext Response](#getrecentcontext-response)
+  - [GetRecentContexts Response](#getrecentcontexts-response)
   - [Inference Record Fields](#inference-record-fields)
 - [Error Handling](#error-handling)
 - [Data Retention & Limits](#data-retention--limits)
@@ -95,7 +97,7 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 | Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
 | Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
-| Semantic context awareness | Use `GetRecentContext` to get the top 3 semantic topics the user is currently working on, inferred by a local MiniLM embedding model |
+| Dynamic context awareness | Use `GetRecentContext` for the latest one-liner of what the user is doing right now (e.g., *"Editing \"main.cpp - WARP\" in Visual Studio · Reading \"GitHub PR\" in Edge"*); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
 
 ---
 
@@ -277,14 +279,15 @@ you received in the previous response to get only new/updated records.
 
 #### GetRecentContext
 
-Retrieve the most recently deduced **semantic topics** from the MiniLM-powered
-topic inference engine. This operation has no parameters.
+Retrieve the **latest** one-liner snapshot from the deterministic
+`ContextInference` summarizer. This operation has no parameters.
 
-Every 5 minutes, WARP gathers all activities from the last 15-minute window,
-embeds each activity's descriptive text with a local **all-MiniLM-L6-v2** sentence
-transformer (384-dimensional embeddings via ONNX Runtime), matches each embedding
-to the nearest topic from ~50 pre-embedded candidate labels via cosine similarity,
-and selects the top 3 topics that collectively cover >= 90 % of activities.
+Every 60 seconds, WARP gathers all activities from the last 15-minute window
+(overlaying the user's currently-active foreground window as a virtual focus
+row), classifies each app via a layered classifier (~80-entry exact-match table
+→ vendor-path heuristics → exe-name fallback), and composes a single
+human-readable one-liner that names the actual documents, browser tabs, and
+apps the user is working with — not a fixed bucket label.
 
 ```json
 {
@@ -292,11 +295,31 @@ and selects the top 3 topics that collectively cover >= 90 % of activities.
 }
 ```
 
-The response provides a snapshot of what the user is currently working on, based
-on genuine semantic understanding (not keyword matching). For example, a window
-title *"Reviewing John's changes to the auth module"* will match the topic *"Code
-review and pull request review"* even without any keyword overlap, because both
-occupy nearby points in the model's embedding space.
+The response is grounded in observed window titles and tab names, so it stays
+accurate as the user moves between projects, customers, or topics — there is
+no fixed taxonomy to fall out of.
+
+#### GetRecentContexts
+
+Retrieve the last *N* snapshots from the rolling history buffer, **newest
+first**. Useful for charting context drift over time, building a short-term
+memory for an LLM agent, or rendering a "what was I doing" timeline.
+
+```json
+{
+  "op": "GetRecentContexts",
+  "count": 10
+}
+```
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `count` | `integer` | `10` | Hard-capped at 200 to keep responses under the 64 KB pipe buffer. Negative or zero values are treated as the default. |
+
+History entries are de-duplicated on append: a new snapshot is recorded only on
+**material change** — different one-liner, different dominant app, or a
+5-minute heartbeat — so the returned list reflects context *transitions*
+rather than 60-second polling artifacts.
 
 ---
 
@@ -520,37 +543,91 @@ Each section has:
 {
   "recent_context": {
     "timestamp": 1750012345,
+    "window_start": 1750011445,
+    "window_end": 1750012345,
+    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · Reading \"GitHub - dev branch\" in Edge · + 2 other apps",
     "activity_count": 47,
-    "coverage_pct": 93.6,
-    "topics": [
-      "C and C++ software development and programming",
-      "Source control and Git version management",
-      "Technical research and documentation reading"
+    "focus_seconds": 812,
+    "dominant_focus_pct": 61.4,
+    "confidence": 0.84,
+    "signal_types": ["focus", "file", "browsing"],
+    "items": [
+      { "app": "Visual Studio", "exe": "devenv.exe",  "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4 },
+      { "app": "Edge",          "exe": "msedge.exe",  "title": "GitHub - dev branch",         "focus_seconds": 184, "pct": 22.7 },
+      { "app": "Outlook",       "exe": "OUTLOOK.EXE", "title": "Inbox - Suman Ghosh",         "focus_seconds":  78, "pct":  9.6 },
+      { "app": "Teams",         "exe": "ms-teams.exe","title": "Daily Standup",               "focus_seconds":  52, "pct":  6.4 }
     ],
-    "history_count": 12,
-    "model": "all-MiniLM-L6-v2"
+    "history_count": 12
   }
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | `integer` | Unix epoch seconds (UTC) when this inference was produced. |
-| `activity_count` | `integer` | Total number of activities examined in the 15-minute window. |
-| `coverage_pct` | `number` | Percentage of activities covered by the top 3 topics (target >= 90 %). |
-| `topics` | `string[]` | Up to 3 semantic topic labels, ordered by coverage. Empty array if no activities or model not loaded. |
-| `history_count` | `integer` | Number of stored inference snapshots (max 288 = 24 hours at 5-min intervals). |
-| `model` | `string` | The embedding model used (`"all-MiniLM-L6-v2"`). |
+| `timestamp` | `integer` | Unix epoch seconds (UTC) when this snapshot was produced. |
+| `window_start` / `window_end` | `integer` | Bounds of the 15-minute lookback window (Unix epoch seconds, UTC). |
+| `one_liner` | `string` | Human-readable summary of what the user is actively doing. |
+| `activity_count` | `integer` | Total activities examined in the window. |
+| `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
+| `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
+| `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
+| `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct }`. |
+| `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
-- If the MiniLM model was not loaded (missing model files), `topics` will be empty
-  and `activity_count` will be 0.
-- If no activities occurred in the 15-minute window, `topics` will contain
-  `["(no recent activity)"]`.
-- The inference runs every 5 minutes. Calling `GetRecentContext` between runs
-  returns the result from the most recent completed cycle.
-- Results are stored in memory (not persisted to disk). Restarting WARP clears
-  the history.
+- If no activities occurred in the 15-minute window, `one_liner` will be
+  `"User appears to be idle"` and `items[]` will be empty.
+- The summarizer runs every 60 seconds. Calling `GetRecentContext` between
+  runs returns the result from the most recent completed cycle.
+- Snapshots are stored in memory (not persisted to disk). Restarting WARP
+  clears the history.
+- The composer is **fully deterministic** — no ML model, no NuGet package, no
+  external dependency. The build ships ~80 MB lighter than v3.x and uses no
+  embedding-runtime memory.
+
+### GetRecentContexts Response
+
+```json
+{
+  "recent_contexts": [
+    {
+      "timestamp": 1750012345,
+      "window_start": 1750011445,
+      "window_end": 1750012345,
+      "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · + 3 other apps",
+      "activity_count": 47,
+      "focus_seconds": 812,
+      "dominant_focus_pct": 61.4,
+      "confidence": 0.84,
+      "signal_types": ["focus", "file", "browsing"],
+      "items": [ /* … same shape as GetRecentContext … */ ]
+    },
+    {
+      "timestamp": 1750012045,
+      "window_start": 1750011145,
+      "window_end": 1750012045,
+      "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio",
+      "activity_count": 31,
+      "focus_seconds": 712,
+      "dominant_focus_pct": 48.9,
+      "confidence": 0.71,
+      "signal_types": ["focus", "browsing"],
+      "items": [ /* … */ ]
+    }
+  ],
+  "returned": 2,
+  "history_count": 12,
+  "requested": 10
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `recent_contexts` | `object[]` | Snapshots ordered **newest first**. Each entry has the same shape as the `recent_context` object documented above. |
+| `returned` | `integer` | Actual number of snapshots in `recent_contexts` (≤ `requested`, ≤ `history_count`). |
+| `history_count` | `integer` | Total snapshots currently in the rolling history. |
+| `requested` | `integer` | The effective `count` after defaulting (10) and capping (200). |
 
 ### Inference Record Fields
 
@@ -564,7 +641,7 @@ Each section has:
 | `open_count_7d` | `integer` | Rolling count of OPEN events in the last 7 days. |
 | `open_count_30d` | `integer` | Rolling count of OPEN events in the last 30 days. |
 | `open_count_total` | `integer` | Lifetime OPEN count since WARP started tracking this entity. |
-| `recency_score` | `number` | Composite score (0�255) combining exponential time-decay and 7-day frequency. Higher values indicate more recently and frequently accessed entities. Formula: `200 � e^(??t / 172800) + 5 � ln(1 + open_count_7d)`. |
+| `recency_score` | `number` | Composite score (0�255) combining exponential time-decay and 7-day frequency. Higher values indicate more recently and frequently accessed entities. Formula: `200 � e^(??t / 172800) + 5 � ln(1 + open_count_7d)`. |
 | `version` | `integer` | Monotonically increasing per-entity counter. Bumped on every event. Use as a watermark for `GetInferenceDeltas`. |
 | `updated_at` | `integer` | Unix epoch seconds of the last inference record update. |
 
@@ -583,7 +660,8 @@ Each section has:
 | Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
 | `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
 | `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
-| `GetRecentContext` returns empty topics | The MiniLM model files are missing, or no activities occurred in the last 15 minutes, or WARP was just started and the first inference cycle hasn't completed yet. |
+| `GetRecentContext` returns an empty `one_liner` and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
+| `GetRecentContexts` returns `"recent_contexts": []` | History is empty (just started, or `ClearAll` was called). `history_count` will also be `0`. |
 | Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
 
 ### Checking if WARP is Available
@@ -739,7 +817,7 @@ Only records updated after version 1042 are returned. Repeat until `"deltas"` is
 empty. This is ideal for dashboard widgets or IDE extensions that need near-real-time
 insight without re-querying the full dataset.
 
-### 10. Semantic Context Awareness
+### 10. Dynamic Context Awareness
 
 Understand what the user is currently working on to provide contextually relevant
 suggestions, search results, or UI adaptations:
@@ -748,20 +826,30 @@ suggestions, search results, or UI adaptations:
 {"op": "GetRecentContext"}
 ```
 
-The response tells you the user's top 3 semantic themes (e.g., *"C and C++ software
-development"*, *"Debugging and troubleshooting"*, *"Technical research and
-documentation reading"*). Use this to:
+The response gives you a single human-readable line naming the actual
+documents, browser tabs, and apps the user is engaged with right now (e.g.
+*"Editing \"main.cpp - WARP\" in Visual Studio · Reading \"GitHub PR\" in Edge ·
++ 2 other apps"*), plus a structured `items[]` breakdown for programmatic use
+and a confidence score. Use this to:
 
-- **Search ranking** -- boost results related to the user's current context.
+- **Search ranking** -- boost results related to the user's current docs, tabs,
+  or app set.
 - **Smart suggestions** -- recommend tools, files, or actions relevant to the
-  detected activity theme.
+  detected activity.
 - **Dashboard widgets** -- show a "Currently working on" summary.
-- **Focus analytics** -- track topic distribution over time by polling every
-  5 minutes and logging the results.
 
-The topics are derived from a local MiniLM sentence-embedding model that genuinely
-understands meaning -- not keyword matching -- so they remain accurate even when
-activity descriptions use synonyms, paraphrases, or domain-specific jargon.
+For short-term memory or context drift over time, call:
+
+```json
+{"op": "GetRecentContexts", "count": 20}
+```
+
+Snapshots are returned newest-first with material-change dedup, so the list
+reflects context *transitions* rather than 60-second polling artifacts.
+
+The composer is fully deterministic (no ML model, no embedding runtime) and
+works directly off the literal window/tab/app titles — so the answer always
+names *what* the user is on, not just *what category* it belongs to.
 
 ---
 
@@ -815,7 +903,7 @@ int main()
 int main()
 {
     HANDLE hPipe = CreateFileW(
-        L"\\\\.\\.\\pipe\\WarpFileActivityAPI",
+        L"\\\\.\\pipe\\WarpFileActivityAPI",
         GENERIC_READ | GENERIC_WRITE,
         0, nullptr, OPEN_EXISTING, 0, nullptr);
 
@@ -827,16 +915,23 @@ int main()
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
 
-    // Get current semantic context
-    const char* request = R"({"op":"GetRecentContext"})";
+    // Latest one-liner snapshot
+    const char* req1 = R"({"op":"GetRecentContext"})";
     DWORD written = 0;
-    WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
+    WriteFile(hPipe, req1, (DWORD)strlen(req1), &written, nullptr);
 
     char buffer[65536] = {};
     DWORD bytesRead = 0;
     ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
+    printf("Current context:\n%s\n\n", buffer);
 
-    printf("Current context:\n%s\n", buffer);
+    // Last 20 snapshots (newest first)
+    const char* req2 = R"({"op":"GetRecentContexts","count":20})";
+    WriteFile(hPipe, req2, (DWORD)strlen(req2), &written, nullptr);
+    bytesRead = 0;
+    memset(buffer, 0, sizeof(buffer));
+    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
+    printf("Recent context history:\n%s\n", buffer);
 
     CloseHandle(hPipe);
     return 0;
@@ -1064,13 +1159,20 @@ data = query_warp({"window": "2h", "types": ["browsing"]})
 for e in data.get("browsing_activities", {}).get("events", []):
     print(f"  [{e['browser']}] {e['title']}")
 
-# --- Example: GetRecentContext (semantic topic understanding) ---
+# --- Example: GetRecentContext (latest one-liner) ---
 context = query_warp({"op": "GetRecentContext"})
 rc = context.get("recent_context", {})
-print(f"\nCurrent context ({rc.get('activity_count', 0)} activities, "
-      f"{rc.get('coverage_pct', 0):.1f}% coverage):")
-for topic in rc.get("topics", []):
-    print(f"  - {topic}")
+print(f"\nCurrent context (confidence {rc.get('confidence', 0):.2f}, "
+      f"{rc.get('activity_count', 0)} activities):")
+print(f"  {rc.get('one_liner', '(none)')}")
+for item in rc.get("items", []):
+    print(f"    - {item['app']}: {item['title']}  ({item['pct']:.0f}%)")
+
+# --- Example: GetRecentContexts (last 20 snapshots, newest first) ---
+hist = query_warp({"op": "GetRecentContexts", "count": 20})
+print(f"\nLast {hist.get('returned', 0)} context snapshots:")
+for snap in hist.get("recent_contexts", []):
+    print(f"  [{snap['timestamp']}] {snap['one_liner']}")
 
 # --- Example: QueryInferences for specific files ---
 inference = query_warp({
@@ -1146,12 +1248,20 @@ $browse.browsing_activities.events |
     Select-Object timestamp, browser, title |
     Format-Table -AutoSize
 
-# GetRecentContext -- what is the user working on?
+# GetRecentContext -- what is the user working on right now?
 $context = Query-Warp '{"op":"GetRecentContext"}'
 $rc = $context.recent_context
-Write-Host "`nCurrent context ($($rc.activity_count) activities, $($rc.coverage_pct)% coverage):"
-foreach ($topic in $rc.topics) {
-    Write-Host "  - $topic"
+Write-Host "`nCurrent context (confidence $([math]::Round($rc.confidence,2)), $($rc.activity_count) activities):"
+Write-Host "  $($rc.one_liner)"
+foreach ($item in $rc.items) {
+    Write-Host "    - $($item.app): $($item.title)  ($([math]::Round($item.pct,0))%)"
+}
+
+# GetRecentContexts -- short-term memory of recent contexts (newest first)
+$hist = Query-Warp '{"op":"GetRecentContexts","count":20}'
+Write-Host "`nLast $($hist.returned) context snapshots:"
+foreach ($snap in $hist.recent_contexts) {
+    Write-Host "  [$($snap.timestamp)] $($snap.one_liner)"
 }
 
 # QueryInferences for specific files
@@ -1246,12 +1356,20 @@ function queryWarp(request) {
             }
         }
 
-        // GetRecentContext -- what is the user working on?
+        // GetRecentContext -- what is the user working on right now?
         const context = await queryWarp({ op: 'GetRecentContext' });
         const rc = context.recent_context || {};
-        console.log(`\nCurrent context (${rc.activity_count} activities, ${rc.coverage_pct}% coverage):`);
-        for (const topic of (rc.topics || [])) {
-            console.log(`  - ${topic}`);
+        console.log(`\nCurrent context (confidence ${(rc.confidence || 0).toFixed(2)}, ${rc.activity_count || 0} activities):`);
+        console.log(`  ${rc.one_liner || '(none)'}`);
+        for (const item of (rc.items || [])) {
+            console.log(`    - ${item.app}: ${item.title}  (${item.pct.toFixed(0)}%)`);
+        }
+
+        // GetRecentContexts -- short-term memory of recent contexts (newest first)
+        const hist = await queryWarp({ op: 'GetRecentContexts', count: 20 });
+        console.log(`\nLast ${hist.returned || 0} context snapshots:`);
+        for (const snap of (hist.recent_contexts || [])) {
+            console.log(`  [${snap.timestamp}] ${snap.one_liner}`);
         }
 
         // QueryInferences -- get recency scores for specific files
@@ -1354,16 +1472,27 @@ transfer and parsing overhead.
 ### 10. Use `GetRecentContext` for Contextual Awareness
 
 Poll `GetRecentContext` periodically to adapt your application to what the user
-is currently working on. The inference runs every 5 minutes, so polling more
+is currently working on. The summarizer runs every 60 seconds, so polling more
 frequently than that will return the same result.
 
 ```json
 {"op": "GetRecentContext"}
 ```
 
-The `coverage_pct` field indicates confidence -- values above 90 % mean the
-topics strongly represent recent activity. Lower values suggest the user is
-context-switching across many unrelated tasks.
+The `confidence` field (0.0 – 0.99) indicates how strongly the snapshot
+represents recent activity — values above ~0.7 mean a clear focus pattern, while
+lower values suggest the user is context-switching across many apps. The
+`dominant_focus_pct` field tells you how concentrated the user is on the top app.
+
+For short-term memory of *how* context evolved (newest first), use:
+
+```json
+{"op": "GetRecentContexts", "count": 20}
+```
+
+The returned snapshots are de-duplicated on append (material-change + 5-minute
+heartbeat), so each entry represents an actual context transition rather than a
+60-second polling tick.
 
 ---
 
@@ -1478,14 +1607,34 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 4.0.*
+*This documentation describes WARP API version 5.0.*
+
+*Changes from v4.0:*
+- ***Breaking:*** *`GetRecentContext` response shape replaced. The previous fields
+  (`topics[]`, `coverage_pct`, `model`) are gone. The new payload returns
+  `one_liner` (a single human-readable summary naming the actual documents/tabs/
+  apps the user is engaged with), `confidence`, `dominant_focus_pct`,
+  `signal_types[]`, `items[]` (per-app breakdown with `app`, `exe`, `title`,
+  `focus_seconds`, `pct`), and the `window_start` / `window_end` window bounds.*
+- *New `"op": "GetRecentContexts"` request that returns the last `count` snapshots
+  (newest first; default 10, hard-capped at 200) for short-term memory and context-
+  drift charting.*
+- *The summarizer is now fully deterministic — no ONNX Runtime, no embedding
+  model, no NuGet dependency. The build ships ~80 MB lighter and uses no
+  embedding-runtime memory.*
+- *Recompute cycle changed from 5 minutes → 60 seconds. History buffer grew from
+  288 → 1 440 entries (~24 hours at 60-sec cadence). New entries are appended
+  only on material change (different one-liner, different dominant app, or a
+  5-minute heartbeat).*
+- *The summarizer overlays the user's currently-active foreground window as a
+  virtual focus row, so a single 15-minute deep-work session is now correctly
+  represented even though `AppFocusActivity` rows are only persisted on focus
+  change.*
 
 *Changes from v3.0:*
-- *New `"op": "GetRecentContext"` request that returns the top 3 semantic topics
-  the user is currently working on, inferred by a local all-MiniLM-L6-v2 sentence-
-  embedding model via ONNX Runtime. The model embeds each activity's descriptive
-  text and matches it to the nearest topic candidate via cosine similarity.*
-- *All existing operations are unchanged and fully backward compatible.*
+- *New `"op": "GetRecentContext"` request that returns a snapshot of what the
+  user is currently working on. (See v5.0 notes for the current response shape.)*
+- *All other operations are unchanged and fully backward compatible.*
 
 *Changes from v2.0:*
 - *New `"op": "QueryInferences"` request for batch lookup of precomputed per-entity

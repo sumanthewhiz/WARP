@@ -54,7 +54,7 @@
     <ClInclude Include="ForegroundMonitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="TopicInference.h">
+    <ClInclude Include="ContextInference.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -89,7 +89,7 @@
     <ClCompile Include="ForegroundMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="TopicInference.cpp">
+    <ClCompile Include="ContextInference.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

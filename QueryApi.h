@@ -7,7 +7,7 @@
 #include "ActivityDatabase.h"
 
 class InferenceEngine;
-class TopicInference;
+class ContextInference;
 
 // Named pipe server
 // Pipe name: \\.\pipe\WarpFileActivityAPI
@@ -19,6 +19,7 @@ class TopicInference;
 //   Request:  { "op": "QueryInferences", "paths": [...], "fields": [...] }
 //   Request:  { "op": "GetInferenceDeltas", "since_version": 100 }
 //   Request:  { "op": "GetRecentContext" }
+//   Request:  { "op": "GetRecentContexts", "count": 10 }
 //   Response: JSON with segregated event types or inference results
 class QueryApi
 {
@@ -26,13 +27,13 @@ public:
     QueryApi();
     ~QueryApi();
 
-    void Start(ActivityDatabase* db, InferenceEngine* inference, TopicInference* topicInf = nullptr);
+    void Start(ActivityDatabase* db, InferenceEngine* inference, ContextInference* ctxInf = nullptr);
     void Stop();
 
 private:
     ActivityDatabase*  m_db        = nullptr;
     InferenceEngine*   m_inference = nullptr;
-    TopicInference*    m_topicInf  = nullptr;
+    ContextInference*  m_ctxInf    = nullptr;
     std::thread m_thread;
     std::atomic<bool> m_running{ false };
     HANDLE m_stopEvent = nullptr;
