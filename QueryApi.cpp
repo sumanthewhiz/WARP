@@ -178,7 +178,8 @@ void QueryApi::HandleClient(HANDLE hPipe)
 
     if (opVal == "GetRecentContext" && m_ctxInf)
     {
-        std::string json = m_ctxInf->GetRecentContext();
+        std::string category = findValue("category");
+        std::string json = m_ctxInf->GetRecentContext(category);
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);
@@ -191,7 +192,8 @@ void QueryApi::HandleClient(HANDLE hPipe)
         int count = 10;
         if (!countStr.empty())
             count = static_cast<int>(strtol(countStr.c_str(), nullptr, 10));
-        std::string json = m_ctxInf->GetRecentContexts(count);
+        std::string category = findValue("category");
+        std::string json = m_ctxInf->GetRecentContexts(count, category);
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);

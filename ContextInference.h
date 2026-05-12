@@ -43,7 +43,26 @@ struct ContextSnapshot
     int64_t       timestamp      = 0;   // When this snapshot was generated (epoch s).
     int64_t       windowStartTs  = 0;   // Inclusive start of the 15-min window (epoch s).
     int64_t       windowEndTs    = 0;   // Inclusive end of the 15-min window (epoch s).
-    std::string   oneLiner;             // Human-readable 1-line summary.
+    std::string   oneLiner;             // Combined "All" one-liner summary.
+    // Category-specific one-liners.  Each is composed independently from a
+    // *projection* of the same 15-min activity window so a consumer can ask
+    // "what documents has the user been in?", "what websites?", or "what
+    // apps?" without having to mentally separate them out of the combined
+    // line.  All three use the same MiniLM-clustering + theme-distillation
+    // pipeline as the combined one -- only the input bag of titles differs.
+    //   * Documents -- non-browser content-editor apps (code editors, IDEs,
+    //                  Office apps, PDF readers, note-taking apps) +
+    //                  recently-opened file basenames from FileMonitor.
+    //   * Websites  -- per-tab aggregation of BrowsingMonitor records.
+    //   * Apps      -- non-document, non-browser foreground apps (comms,
+    //                  terminals, media players, remote desktop, design
+    //                  tools, system tools).  Strictly disjoint from
+    //                  Documents and Websites.
+    // An empty string here means the category had no usable activity in the
+    // window.
+    std::string   oneLinerDocuments;
+    std::string   oneLinerWebsites;
+    std::string   oneLinerApps;
     int           activityCount  = 0;   // Number of raw signals considered.
     int           focusSeconds   = 0;   // Total foreground time in the window.
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
@@ -87,9 +106,15 @@ struct ContextSnapshot
 //   * Stop()     -- joins the thread.
 //
 // Query API
-//   * GetRecentContext()        -- JSON: {"recent_context": <latest snapshot>}
-//   * GetRecentContexts(int n)  -- JSON: {"recent_contexts":[...]} newest first.
-//   * ClearHistory()            -- empties history (called on user "Clear").
+//   * GetRecentContext(category)         -- JSON: {"recent_context": <latest snapshot>}
+//   * GetRecentContexts(n, category)     -- JSON: {"recent_contexts":[...]} newest first.
+//   * ClearHistory()                     -- empties history (called on user "Clear").
+//
+// `category` is one of "all" (default), "documents", "websites", "apps".
+// When supplied (and not "all") the response's top-level `one_liner` field
+// is replaced with the matching per-category one-liner, and the three
+// `one_liner_documents` / `one_liner_websites` / `one_liner_apps` fields
+// are still emitted for callers that want the full breakdown.
 //
 // History cap is 1440 (24 h at one snapshot per minute, with material-
 // change dedup the actual count is usually much smaller).
@@ -106,8 +131,8 @@ public:
     void Stop();
 
     void RunOnce();
-    std::string GetRecentContext();
-    std::string GetRecentContexts(int count);
+    std::string GetRecentContext(const std::string& category = "all");
+    std::string GetRecentContexts(int count, const std::string& category = "all");
     void ClearHistory();
 
 private:
@@ -146,7 +171,8 @@ private:
     // of duplicates for a user who is doing one thing for an hour.
     bool ShouldAppendToHistory(const ContextSnapshot& snap) const;
 
-    static std::string SnapshotToJsonObject(const ContextSnapshot& s);
+    static std::string SnapshotToJsonObject(const ContextSnapshot& s,
+                                            const std::string& category = "all");
     static std::string WideToUtf8(const std::wstring& w);
     static std::string EscapeJson(const std::string& s);
 };

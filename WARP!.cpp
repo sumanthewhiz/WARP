@@ -143,9 +143,10 @@ static HWND g_hBtnInferLookup = nullptr;
 static HWND g_hEditInferTopN  = nullptr;
 static HWND g_hInferTopNLabel = nullptr;
 
-// Recent context buttons
+// Recent context buttons + category selector
 static HWND g_hBtnRecentContext  = nullptr;
 static HWND g_hBtnContextHistory = nullptr;
+static HWND g_hCtxCategoryCombo  = nullptr;
 
 // Forward declarations
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -494,6 +495,20 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDB_CONTEXT_HISTORY, hInstance, nullptr);
     SendMessageW(g_hBtnContextHistory, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
+    // Category drop-down: narrows the context one-liner returned by the
+    // two buttons above to a single facet (Documents / Websites / Apps)
+    // or shows the combined view (All).  Default = All.
+    g_hCtxCategoryCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+        CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CTX_CATEGORY, hInstance, nullptr);
+    SendMessageW(g_hCtxCategoryCombo, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"All");
+    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Documents");
+    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Websites");
+    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Apps");
+    SendMessageW(g_hCtxCategoryCombo, CB_SETCURSEL, 0, 0); // default "All"
+
     LayoutControls(hWnd);
 }
 
@@ -593,11 +608,16 @@ void LayoutControls(HWND hWnd)
     MoveWindow(g_hBtnInferLookup, pad + editW + gap, y, lookupBtnW, 26, TRUE);
     y += 34;
 
-    // Recent context buttons
-    int ctxBtnW = 200;
-    int ctxBtnW2 = 250;
-    MoveWindow(g_hBtnRecentContext, pad, y, ctxBtnW, 30, TRUE);
-    MoveWindow(g_hBtnContextHistory, pad + ctxBtnW + gap, y, ctxBtnW2, 30, TRUE);
+    // Recent context buttons + category selector
+    int ctxBtnW    = 200;
+    int ctxBtnW2   = 250;
+    int ctxComboW  = 130;
+    MoveWindow(g_hBtnRecentContext,  pad,                                  y, ctxBtnW,   30, TRUE);
+    MoveWindow(g_hBtnContextHistory, pad + ctxBtnW + gap,                  y, ctxBtnW2,  30, TRUE);
+    // ComboBox visible height = field + drop-list; CB_DROPDOWNLIST uses
+    // the height parameter as the *combined* drop-list height.  Give it
+    // 6 lines so all four items fit without scrolling.
+    MoveWindow(g_hCtxCategoryCombo,  pad + ctxBtnW + gap + ctxBtnW2 + gap, y, ctxComboW, 30 + 6 * 20, TRUE);
     y += 38;
 
     // Response label
@@ -909,9 +929,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         else if (wmId == IDB_INFER_TOP || wmId == IDB_INFER_LOOKUP)
             OnInferenceButton(hWnd, wmId);
         else if (wmId == IDB_RECENT_CONTEXT)
-            SendApiQuery(hWnd, "{\"op\":\"GetRecentContext\"}");
+        {
+            // Read current category from the dropdown and forward it
+            // to ContextInference; default is "all".
+            int sel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
+            const char* cat = "all";
+            if (sel == 1) cat = "documents";
+            else if (sel == 2) cat = "websites";
+            else if (sel == 3) cat = "apps";
+            std::string req = std::string("{\"op\":\"GetRecentContext\",\"category\":\"") + cat + "\"}";
+            SendApiQuery(hWnd, req);
+        }
         else if (wmId == IDB_CONTEXT_HISTORY)
-            SendApiQuery(hWnd, "{\"op\":\"GetRecentContexts\",\"count\":10}");
+        {
+            int sel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
+            const char* cat = "all";
+            if (sel == 1) cat = "documents";
+            else if (sel == 2) cat = "websites";
+            else if (sel == 3) cat = "apps";
+            std::string req = std::string("{\"op\":\"GetRecentContexts\",\"count\":10,\"category\":\"") + cat + "\"}";
+            SendApiQuery(hWnd, req);
+        }
         else
             return DefWindowProc(hWnd, message, wParam, lParam);
     }

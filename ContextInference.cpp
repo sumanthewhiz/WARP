@@ -937,8 +937,12 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
     if (snap.timestamp - prev.timestamp >= HISTORY_HEARTBEAT_SECS)
         return true;
 
-    // Append on material change: different one-liner OR different dominant app.
-    if (snap.oneLiner != prev.oneLiner) return true;
+    // Append on material change: different one-liner (combined or any of
+    // the per-category lines) OR different dominant app.
+    if (snap.oneLiner          != prev.oneLiner)          return true;
+    if (snap.oneLinerDocuments != prev.oneLinerDocuments) return true;
+    if (snap.oneLinerWebsites  != prev.oneLinerWebsites)  return true;
+    if (snap.oneLinerApps      != prev.oneLinerApps)      return true;
     if (!snap.items.empty() && !prev.items.empty()
      && snap.items.front().exe != prev.items.front().exe)
         return true;
@@ -1098,96 +1102,367 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         return std::string(a.verb) + " \"" + a.bestTitle + "\" in " + a.friendlyName;
     };
 
-    // ---- Dynamic semantic clustering (MiniLM) ---------------------
-    // For each ranked app, embed its candidate phrase and run greedy
-    // clustering with cosine similarity >= CLUSTER_COS_THRESHOLD.  Apps
-    // whose embeddings are close get merged into one "thread".  This
-    // surfaces, e.g., editing `auth.cpp` and viewing the auth PR as a
-    // single thread instead of two unrelated lines.
+    // -----------------------------------------------------------------
+    // Composable one-liner builder.  Takes a bag of AppAgg entries (any
+    // projection of the activity stream -- the full ranked list, the
+    // doc-editor subset, the per-tab browsing list, etc.) and produces
+    // the same `<verb> <Theme>` one-liner using the existing MiniLM
+    // clustering + theme-distillation pipeline.  Used four times below
+    // to build the combined one-liner plus the three per-category ones
+    // (Documents / Websites / Apps).
     //
-    // If the model is not loaded, every app becomes its own cluster
-    // (== the previous per-app composition).
-    std::vector<int>                 clusterOf(ranked.size(), -1);
-    std::vector<std::vector<float>>  clusterCentroid; // 384-dim each
-    std::vector<int>                 clusterTotalFocus;
-    std::vector<std::vector<size_t>> clusterMembers;  // indices into `ranked`
-
-    if (m_modelReady && ranked.size() >= 2)
+    // Returns the rendered text PLUS the per-entry cluster assignments
+    // and the cluster count, so the caller can use them to populate
+    // items[].threadId for the "All" projection (the only projection
+    // surfaced through items[]).
+    // -----------------------------------------------------------------
+    struct OneLinerBuild
     {
-        // Cap embedding work at top 8 to bound CPU on hyper-noisy users.
-        const size_t embedLimit = (std::min)(ranked.size(), static_cast<size_t>(8));
-        std::vector<std::vector<float>> appEmb(ranked.size());
-        for (size_t i = 0; i < embedLimit; ++i)
-            appEmb[i] = Embed(phraseFor(ranked[i]));
+        std::string      text;
+        std::vector<int> clusterOf;     // per-bag-entry cluster id, 0-based
+        int              threadCount = 0;
+    };
 
-        for (size_t i = 0; i < ranked.size(); ++i)
+    auto composeOneLinerFromBag = [&](const std::vector<AppAgg>& bag) -> OneLinerBuild {
+        OneLinerBuild out;
+        if (bag.empty()) return out;
+
+        // ---- Cluster the bag -----------------------------------------
+        std::vector<int>                 clOf(bag.size(), -1);
+        std::vector<std::vector<float>>  centroids;
+        std::vector<int>                 clTotalFocus;
+        std::vector<std::vector<size_t>> clMembers;
+        int                              bagTotalFocus = 0;
+        for (const auto& a : bag) bagTotalFocus += (std::max)(0, a.totalFocusSecs);
+
+        if (m_modelReady && bag.size() >= 2)
         {
-            if (i >= embedLimit || appEmb[i].empty())
+            const size_t embedLimit = (std::min)(bag.size(), static_cast<size_t>(8));
+            std::vector<std::vector<float>> embs(bag.size());
+            for (size_t i = 0; i < embedLimit; ++i)
+                embs[i] = Embed(phraseFor(bag[i]));
+
+            for (size_t i = 0; i < bag.size(); ++i)
             {
-                // No embedding available -- give it its own cluster.
-                int cid = static_cast<int>(clusterCentroid.size());
-                clusterCentroid.push_back({});
-                clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
-                clusterMembers.push_back({ i });
-                clusterOf[i] = cid;
-                continue;
-            }
-            int bestC = -1;
-            float bestSim = CLUSTER_COS_THRESHOLD;
-            for (size_t c = 0; c < clusterCentroid.size(); ++c)
-            {
-                if (clusterCentroid[c].empty()) continue;
-                float s = CosineSim(appEmb[i], clusterCentroid[c]);
-                if (s > bestSim)
+                if (i >= embedLimit || embs[i].empty())
                 {
-                    bestSim = s;
-                    bestC = static_cast<int>(c);
+                    int cid = static_cast<int>(centroids.size());
+                    centroids.push_back({});
+                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clMembers.push_back({ i });
+                    clOf[i] = cid;
+                    continue;
+                }
+                int   bestC   = -1;
+                float bestSim = CLUSTER_COS_THRESHOLD;
+                for (size_t c = 0; c < centroids.size(); ++c)
+                {
+                    if (centroids[c].empty()) continue;
+                    float s = CosineSim(embs[i], centroids[c]);
+                    if (s > bestSim) { bestSim = s; bestC = static_cast<int>(c); }
+                }
+                if (bestC < 0)
+                {
+                    int cid = static_cast<int>(centroids.size());
+                    centroids.push_back(embs[i]);
+                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clMembers.push_back({ i });
+                    clOf[i] = cid;
+                }
+                else
+                {
+                    std::vector<float>& c = centroids[bestC];
+                    size_t n = clMembers[bestC].size();
+                    for (int d = 0; d < EMBED_DIM; ++d)
+                        c[d] = (c[d] * static_cast<float>(n) + embs[i][d])
+                               / static_cast<float>(n + 1);
+                    float norm = 0.0f;
+                    for (int d = 0; d < EMBED_DIM; ++d) norm += c[d] * c[d];
+                    norm = std::sqrt(norm);
+                    if (norm > 1e-9f)
+                        for (int d = 0; d < EMBED_DIM; ++d) c[d] /= norm;
+                    clMembers[bestC].push_back(i);
+                    clTotalFocus[bestC] += bag[i].totalFocusSecs;
+                    clOf[i] = bestC;
                 }
             }
-            if (bestC < 0)
+        }
+        else
+        {
+            for (size_t i = 0; i < bag.size(); ++i)
             {
-                int cid = static_cast<int>(clusterCentroid.size());
-                clusterCentroid.push_back(appEmb[i]);
-                clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
-                clusterMembers.push_back({ i });
-                clusterOf[i] = cid;
+                centroids.push_back({});
+                clTotalFocus.push_back(bag[i].totalFocusSecs);
+                clMembers.push_back({ i });
+                clOf[i] = static_cast<int>(i);
             }
+        }
+
+        // ---- Sort clusters by total focus ----------------------------
+        struct Cluster
+        {
+            int                  totalFocus;
+            size_t               repIdx;
+            std::vector<size_t>  members;
+        };
+        std::vector<Cluster> clusters;
+        clusters.reserve(clMembers.size());
+        for (size_t c = 0; c < clMembers.size(); ++c)
+        {
+            Cluster cl;
+            cl.totalFocus = clTotalFocus[c];
+            cl.members    = clMembers[c];
+            cl.repIdx     = clMembers[c].front();
+            clusters.push_back(std::move(cl));
+        }
+        std::sort(clusters.begin(), clusters.end(),
+                  [](const Cluster& a, const Cluster& b){
+                      return a.totalFocus > b.totalFocus;
+                  });
+
+        // ---- Per-cluster theme extraction ----------------------------
+        auto themeFor = [&](const Cluster& cl) -> std::string {
+            std::unordered_map<std::string, int>          freq;
+            std::unordered_map<std::string, std::string>  bestSurface;
+            std::vector<std::string>                      orderedLowers;
+
+            for (size_t mi : cl.members)
+            {
+                auto toks = ExtractContentTokens(bag[mi].bestTitle);
+                for (const auto& t : toks)
+                {
+                    if (freq.find(t.lower) == freq.end())
+                        orderedLowers.push_back(t.lower);
+                    freq[t.lower] += 1;
+                    auto& s = bestSurface[t.lower];
+                    if (s.empty() ||
+                       (s.size() == t.surface.size() && t.surface > s))
+                        s = t.surface;
+                }
+            }
+            if (orderedLowers.empty()) return std::string();
+
+            struct ScoredTok { std::string lower; double score; size_t firstIdx; };
+            std::vector<ScoredTok> scored;
+            scored.reserve(orderedLowers.size());
+
+            std::vector<float> cleanCentroid;
+            if (m_modelReady)
+            {
+                std::string joined;
+                for (const auto& lc : orderedLowers)
+                {
+                    if (!joined.empty()) joined.push_back(' ');
+                    joined += bestSurface[lc].empty() ? lc : bestSurface[lc];
+                }
+                cleanCentroid = Embed(joined);
+            }
+
+            std::vector<std::string> candidates = orderedLowers;
+            std::sort(candidates.begin(), candidates.end(),
+                      [&](const std::string& a, const std::string& b){
+                          if (freq[a] != freq[b]) return freq[a] > freq[b];
+                          return a < b;
+                      });
+            if (candidates.size() > 8) candidates.resize(8);
+
+            for (size_t ci = 0; ci < candidates.size(); ++ci)
+            {
+                const std::string& lc = candidates[ci];
+                double s = static_cast<double>(freq[lc]);
+                if (m_modelReady && !cleanCentroid.empty())
+                {
+                    std::vector<float> v = Embed(bestSurface[lc].empty() ? lc : bestSurface[lc]);
+                    if (!v.empty())
+                    {
+                        float cs = CosineSim(v, cleanCentroid);
+                        if (cs < 0.0f) cs = 0.0f;
+                        s *= (1.0 + static_cast<double>(cs));
+                    }
+                }
+                size_t firstIdx = 0;
+                for (size_t k = 0; k < orderedLowers.size(); ++k)
+                    if (orderedLowers[k] == lc) { firstIdx = k; break; }
+                scored.push_back({ lc, s, firstIdx });
+            }
+
+            std::sort(scored.begin(), scored.end(),
+                      [](const ScoredTok& a, const ScoredTok& b){
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.firstIdx < b.firstIdx;
+                      });
+
+            std::vector<std::string> picks;
+            picks.push_back(bestSurface[scored[0].lower].empty()
+                               ? scored[0].lower
+                               : bestSurface[scored[0].lower]);
+            if (scored.size() >= 2 && scored[1].score >= scored[0].score * 0.6)
+            {
+                const std::string& w1 = scored[0].lower;
+                const std::string& w2 = scored[1].lower;
+                if (w1.find(w2) == std::string::npos &&
+                    w2.find(w1) == std::string::npos)
+                {
+                    picks.push_back(bestSurface[scored[1].lower].empty()
+                                       ? scored[1].lower
+                                       : bestSurface[scored[1].lower]);
+                }
+            }
+
+            if (picks.size() == 2)
+            {
+                size_t p0 = 0, p1 = 0;
+                for (size_t k = 0; k < orderedLowers.size(); ++k)
+                {
+                    if (orderedLowers[k] == scored[0].lower) p0 = k;
+                    if (orderedLowers[k] == scored[1].lower) p1 = k;
+                }
+                if (p1 < p0) std::swap(picks[0], picks[1]);
+            }
+
+            std::string outStr;
+            for (const auto& p : picks) { if (!outStr.empty()) outStr += " "; outStr += p; }
+            return TitleCase(outStr);
+        };
+
+        auto verbFor = [&](const Cluster& cl, const std::string& theme) -> std::string {
+            const AppAgg& rep = bag[cl.repIdx];
+            std::string repVerb    = AsciiLower(rep.verb);
+            std::string lowerTheme = AsciiLower(theme);
+
+            auto themeHas = [&](const char* kw) -> bool {
+                return lowerTheme.find(kw) != std::string::npos;
+            };
+            auto anyTitleHas = [&](const char* kw) -> bool {
+                for (size_t mi : cl.members)
+                {
+                    std::string lo = AsciiLower(bag[mi].bestTitle);
+                    if (lo.find(kw) != std::string::npos) return true;
+                }
+                return false;
+            };
+
+            if (rep.isBrowser)
+            {
+                if (anyTitleHas("pull request") || anyTitleHas("pr #") ||
+                    anyTitleHas("merge request") || anyTitleHas("commit") ||
+                    anyTitleHas("diff") || anyTitleHas("review") ||
+                    anyTitleHas("issue #") || anyTitleHas("/pull/") ||
+                    themeHas("review") || themeHas("commit"))
+                    return "Reviewing";
+                if (anyTitleHas("docs") || anyTitleHas("documentation") ||
+                    anyTitleHas("api reference") || anyTitleHas("tutorial") ||
+                    anyTitleHas("guide") || anyTitleHas("how to") ||
+                    anyTitleHas("learn") || anyTitleHas("manual"))
+                    return "Reading about";
+                return "Researching";
+            }
+            if (repVerb.find("editing") != std::string::npos ||
+                repVerb.find("coding")  != std::string::npos ||
+                repVerb.find("writing") != std::string::npos)
+                return "Working on";
+            if (repVerb.find("messaging") != std::string::npos ||
+                repVerb.find("chatting")  != std::string::npos ||
+                repVerb.find("meeting")   != std::string::npos ||
+                repVerb.find("calling")   != std::string::npos ||
+                repVerb.find("emailing")  != std::string::npos ||
+                repVerb.find("discussing")!= std::string::npos)
+                return "Discussing";
+            if (repVerb.find("designing") != std::string::npos ||
+                repVerb.find("drawing")   != std::string::npos)
+                return "Designing";
+            if (repVerb.find("watching") != std::string::npos ||
+                repVerb.find("playing")  != std::string::npos ||
+                repVerb.find("listening")!= std::string::npos)
+                return "Watching";
+            if (repVerb.find("reading") != std::string::npos)
+                return "Reading";
+            if (repVerb.find("terminal") != std::string::npos ||
+                repVerb.find("shell")    != std::string::npos)
+                return "Working on";
+            if (rep.verb.empty()) return "Working on";
+            std::string v = rep.verb;
+            if (!v.empty() && v[0] >= 'a' && v[0] <= 'z') v[0] = char(v[0] - 32);
+            return v;
+        };
+
+        auto clusterPhrase = [&](const Cluster& cl) -> std::string {
+            std::string theme = themeFor(cl);
+            std::string p;
+            if (theme.empty())
+                p = phraseFor(bag[cl.repIdx]);
             else
             {
-                // Merge into existing cluster: re-average centroid.
-                std::vector<float>& c = clusterCentroid[bestC];
-                size_t n = clusterMembers[bestC].size();
-                for (int d = 0; d < EMBED_DIM; ++d)
-                    c[d] = (c[d] * static_cast<float>(n) + appEmb[i][d])
-                           / static_cast<float>(n + 1);
-                // Re-normalize centroid.
-                float norm = 0.0f;
-                for (int d = 0; d < EMBED_DIM; ++d) norm += c[d] * c[d];
-                norm = std::sqrt(norm);
-                if (norm > 1e-9f)
-                    for (int d = 0; d < EMBED_DIM; ++d) c[d] /= norm;
-
-                clusterMembers[bestC].push_back(i);
-                clusterTotalFocus[bestC] += ranked[i].totalFocusSecs;
-                clusterOf[i] = bestC;
+                std::string verb = verbFor(cl, theme);
+                p = verb + " " + theme;
             }
-        }
-        snap.model = "all-MiniLM-L6-v2";
-    }
-    else
-    {
-        // No model -- every app is its own cluster.
-        for (size_t i = 0; i < ranked.size(); ++i)
-        {
-            clusterCentroid.push_back({});
-            clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
-            clusterMembers.push_back({ i });
-            clusterOf[i] = static_cast<int>(i);
-        }
-        snap.model = "deterministic";
-    }
 
-    snap.threadCount = static_cast<int>(clusterMembers.size());
+            if (cl.members.size() >= 2)
+            {
+                std::string suffix;
+                size_t shown = 0;
+                for (size_t j = 0; j < cl.members.size() && shown < 3; ++j, ++shown)
+                {
+                    if (shown == 0)
+                        suffix = " (across " + bag[cl.members[j]].friendlyName;
+                    else if (shown + 1 == (std::min)(cl.members.size(), size_t{3}))
+                        suffix += " & " + bag[cl.members[j]].friendlyName;
+                    else
+                        suffix += ", " + bag[cl.members[j]].friendlyName;
+                }
+                size_t hidden = cl.members.size() - shown;
+                if (hidden > 0)
+                {
+                    std::ostringstream o;
+                    o << " + " << hidden << " more";
+                    suffix += o.str();
+                }
+                suffix += ")";
+                p += suffix;
+            }
+            return p;
+        };
+
+        // ---- Adaptive top-N --------------------------------------
+        std::string oneLiner;
+        int    covered  = 0;
+        size_t included = 0;
+        for (size_t i = 0; i < clusters.size(); ++i)
+        {
+            std::string phrase = clusterPhrase(clusters[i]);
+            std::string candidate = oneLiner.empty()
+                ? phrase
+                : oneLiner + " \xC2\xB7 " + phrase;
+            if (i > 0
+             && (candidate.size() > ONE_LINER_BUDGET
+              || (bagTotalFocus > 0
+                  && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 80)))
+                break;
+            oneLiner = candidate;
+            covered += clusters[i].totalFocus;
+            ++included;
+        }
+        if (included < clusters.size())
+        {
+            size_t remaining = clusters.size() - included;
+            std::ostringstream o;
+            const char* label = (remaining == 1) ? " other thread" : " other threads";
+            o << oneLiner << " \xC2\xB7 + " << remaining << label;
+            oneLiner = o.str();
+        }
+
+        out.text        = std::move(oneLiner);
+        out.clusterOf   = std::move(clOf);
+        out.threadCount = static_cast<int>(clusters.size());
+        return out;
+    };
+
+    // ---- "All" composition (also produces the items[] thread IDs) -
+    OneLinerBuild allBuild = composeOneLinerFromBag(ranked);
+    snap.threadCount       = allBuild.threadCount;
+    std::vector<int>& clusterOf = allBuild.clusterOf;
+    if (clusterOf.empty()) clusterOf.assign(ranked.size(), -1);
+    snap.model = m_modelReady ? "all-MiniLM-L6-v2" : "deterministic";
 
     // ---- Structured breakdown (per-app top 5) ---------------------
     for (size_t i = 0; i < ranked.size() && snap.items.size() < MAX_ITEMS; ++i)
@@ -1200,7 +1475,9 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         it.pct          = totalFocusSecs > 0
             ? static_cast<int>((ranked[i].totalFocusSecs * 100LL) / totalFocusSecs)
             : 0;
-        it.threadId     = clusterOf[i] + 1; // 1-based for callers
+        it.threadId     = (i < clusterOf.size() && clusterOf[i] >= 0)
+                              ? clusterOf[i] + 1
+                              : 0;
         snap.items.push_back(std::move(it));
     }
 
@@ -1239,301 +1516,153 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         return snap;
     }
 
-    // ---- Compose one-liner from cluster representatives -----------
-    // Sort clusters by total focus desc, picking each cluster's
-    // representative (highest-focus member -- which is also the first
-    // member, since `ranked` is already sorted by focus).
-    struct Cluster
-    {
-        int    totalFocus;
-        size_t repIdx;             // index into ranked
-        std::vector<size_t> members;
+    snap.oneLiner = allBuild.text;
+
+    // -----------------------------------------------------------------
+    // Per-category one-liners.  Each is an *independent* projection of
+    // the same 15-min activity window, composed through the same
+    // pipeline above.  A consumer picks one of {all, documents,
+    // websites, apps} via the dropdown to narrow the surface.
+    //
+    // Categorization rules:
+    //   * Browsers (isBrowser=true) feed Websites only.
+    //   * Document apps -- code editors, IDEs, Office, PDF readers,
+    //     note apps, design tools that edit content -- feed Documents
+    //     only.
+    //   * Everything else (comms, terminals, media players, remote
+    //     desktop, system tools) feeds Apps only.
+    // Documents/Websites/Apps therefore form a strict partition of
+    // ranked; an app that is in one is never in another.
+    // -----------------------------------------------------------------
+    auto isDocumentApp = [](const AppAgg& a) -> bool {
+        if (a.isBrowser) return false;
+        std::string v = AsciiLower(a.verb);
+        if (v.find("editing")        != std::string::npos) return true;
+        if (v.find("drafting")       != std::string::npos) return true;
+        if (v.find("taking notes")   != std::string::npos) return true;
+        if (v.find("reading pdf")    != std::string::npos) return true;
+        if (v.find("designing")      != std::string::npos) return true;
+        if (v.find("modeling")       != std::string::npos) return true;
+        if (v.find("compositing")    != std::string::npos) return true;
+        if (v.find("diagramming")    != std::string::npos) return true;
+        if (v.find("working on")     != std::string::npos) return true; // Excel
+        if (v.find("working in")     != std::string::npos) return true; // MATLAB / Access
+        return false;
     };
-    std::vector<Cluster> clusters;
-    clusters.reserve(clusterMembers.size());
-    for (size_t c = 0; c < clusterMembers.size(); ++c)
+
+    std::vector<AppAgg> rankedDocs;
+    std::vector<AppAgg> rankedApps;
+    rankedDocs.reserve(ranked.size());
+    rankedApps.reserve(ranked.size());
+    for (const auto& a : ranked)
     {
-        Cluster cl;
-        cl.totalFocus = clusterTotalFocus[c];
-        cl.members    = clusterMembers[c];
-        // Rep = first member (already focus-sorted).
-        cl.repIdx     = clusterMembers[c].front();
-        clusters.push_back(std::move(cl));
+        if (a.isBrowser) continue;
+        if (isDocumentApp(a)) rankedDocs.push_back(a);
+        else                  rankedApps.push_back(a);
     }
-    std::sort(clusters.begin(), clusters.end(),
-              [](const Cluster& a, const Cluster& b){
-                  return a.totalFocus > b.totalFocus;
-              });
 
-    // ---- Semantic theme extraction (per cluster) ------------------
-    // For each cluster: gather content tokens from the cleaned titles
-    // of its members, score them (frequency * (1 + cosine-to-clean-
-    // centroid) when MiniLM is loaded, frequency-only otherwise), and
-    // pick the top 1-2 as the cluster's *theme phrase*.  This produces
-    // a semantic 1-liner -- "Working on authentication", not "Editing
-    // \"auth.cpp - WARP\" in Visual Studio".  Fallback to verbatim
-    // title when no usable content tokens remain.
-    auto themeFor = [&](const Cluster& cl) -> std::string {
-        // Bag of tokens across this cluster's member titles.
-        std::unordered_map<std::string, int>          freq;
-        std::unordered_map<std::string, std::string>  bestSurface; // case-pretty form
-        std::vector<std::string>                      orderedLowers;
+    // Augment Documents with recently-touched file basenames captured
+    // by FileMonitor.  This catches docs that the user looked at
+    // briefly (so they never accumulated significant focus seconds in
+    // an editor) but that still represent a "document the user was
+    // on".  Skip noisy extensions (.dll/.log/.tmp/.bak) and any
+    // basenames already present in rankedDocs (case-insensitive).
+    {
+        std::unordered_set<std::string> seenLowered;
+        for (const auto& a : rankedDocs)
+            seenLowered.insert(AsciiLower(a.bestTitle));
 
-        for (size_t mi : cl.members)
+        struct FileVirt { std::string base; int64_t ts; int hits; };
+        std::unordered_map<std::string, FileVirt> byBase;
+        for (const auto& f : files)
         {
-            auto toks = ExtractContentTokens(ranked[mi].bestTitle);
-            for (const auto& t : toks)
+            std::string p = WideToUtf8(f.path);
+            if (p.empty()) continue;
+            size_t slash = p.find_last_of("/\\");
+            std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
+            if (base.empty()) continue;
+            std::string baseLower = AsciiLower(base);
+            if (baseLower.size() >= 4 &&
+                (baseLower.compare(baseLower.size()-4, 4, ".dll") == 0 ||
+                 baseLower.compare(baseLower.size()-4, 4, ".log") == 0 ||
+                 baseLower.compare(baseLower.size()-4, 4, ".tmp") == 0 ||
+                 baseLower.compare(baseLower.size()-4, 4, ".bak") == 0))
+                continue;
+            if (seenLowered.count(baseLower)) continue;
+            auto it = byBase.find(baseLower);
+            if (it == byBase.end())
+                byBase[baseLower] = { base, f.timestampUtc, 1 };
+            else
             {
-                if (freq.find(t.lower) == freq.end())
-                    orderedLowers.push_back(t.lower);
-                freq[t.lower] += 1;
-                // Prefer the title-cased / mixed-case original spelling
-                // (e.g. "Authentication" beats "authentication").
-                auto& s = bestSurface[t.lower];
-                if (s.empty() ||
-                   (s.size() == t.surface.size() && t.surface > s)) // crude tiebreak
-                    s = t.surface;
+                it->second.hits += 1;
+                if (f.timestampUtc > it->second.ts) it->second.ts = f.timestampUtc;
             }
         }
-        if (orderedLowers.empty()) return std::string();
-
-        struct ScoredTok { std::string lower; double score; size_t firstIdx; };
-        std::vector<ScoredTok> scored;
-        scored.reserve(orderedLowers.size());
-
-        // Build a "clean centroid" from the joined content tokens of
-        // this cluster's titles.  Only used when MiniLM is loaded.
-        std::vector<float> cleanCentroid;
-        if (m_modelReady)
+        std::vector<FileVirt> fv;
+        fv.reserve(byBase.size());
+        for (auto& kv : byBase) fv.push_back(std::move(kv.second));
+        std::sort(fv.begin(), fv.end(),
+                  [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
+        if (fv.size() > 6) fv.resize(6);
+        for (auto& v : fv)
         {
-            std::string joined;
-            for (const auto& lc : orderedLowers)
-            {
-                if (!joined.empty()) joined.push_back(' ');
-                // Use the surface form so casing can help the encoder.
-                joined += bestSurface[lc].empty() ? lc : bestSurface[lc];
-            }
-            cleanCentroid = Embed(joined);
+            AppAgg agg{};
+            agg.friendlyName    = "Document";
+            agg.verb            = "Editing";
+            agg.bestTitle       = v.base;
+            agg.totalFocusSecs  = (std::max)(5, v.hits * 5);
+            agg.lastSeenTs      = v.ts;
+            agg.isBrowser       = false;
+            rankedDocs.push_back(std::move(agg));
         }
-
-        // Cap embedded candidates to top 8 by raw frequency to keep
-        // ONNX cost bounded.  Ties broken by first-seen order.
-        std::vector<std::string> candidates = orderedLowers;
-        std::sort(candidates.begin(), candidates.end(),
-                  [&](const std::string& a, const std::string& b){
-                      if (freq[a] != freq[b]) return freq[a] > freq[b];
-                      return a < b;
+        std::sort(rankedDocs.begin(), rankedDocs.end(),
+                  [](const AppAgg& a, const AppAgg& b){
+                      if (a.totalFocusSecs != b.totalFocusSecs)
+                          return a.totalFocusSecs > b.totalFocusSecs;
+                      return a.lastSeenTs > b.lastSeenTs;
                   });
-        if (candidates.size() > 8) candidates.resize(8);
+    }
 
-        for (size_t ci = 0; ci < candidates.size(); ++ci)
+    // Build the Websites bag from BrowsingMonitor records.  Each
+    // unique tab title becomes a virtual AppAgg with focus weighted
+    // by visit count (we don't have per-tab dwell time -- visit count
+    // is a reasonable proxy for "interest").  Cap at 16 entries so we
+    // don't blow ONNX cost on hyper-active browsing windows.
+    std::vector<AppAgg> rankedWeb;
+    {
+        std::unordered_map<std::string, AppAgg> webByTitle;
+        for (const auto& b : browse)
         {
-            const std::string& lc = candidates[ci];
-            double s = static_cast<double>(freq[lc]);
-            if (m_modelReady && !cleanCentroid.empty())
+            std::string raw = WideToUtf8(b.title);
+            if (raw.empty()) continue;
+            std::string clean = CleanTitle(raw, "Browser");
+            if (clean.empty()) continue;
+            std::string key = AsciiLower(clean);
+            auto& agg = webByTitle[key];
+            if (agg.bestTitle.empty())
             {
-                std::vector<float> v = Embed(bestSurface[lc].empty() ? lc : bestSurface[lc]);
-                if (!v.empty())
-                {
-                    float cs = CosineSim(v, cleanCentroid);
-                    // Keep cosine bounded to [0,1]+ so the multiplier
-                    // never goes negative; semantically irrelevant
-                    // tokens get score >= freq, central ones get more.
-                    if (cs < 0.0f) cs = 0.0f;
-                    s *= (1.0 + static_cast<double>(cs));
-                }
+                agg.bestTitle    = clean;
+                agg.friendlyName = "Browser";
+                agg.verb         = "Reading";
+                agg.isBrowser    = true;
             }
-            // First-seen index (lower = appears earlier in titles).
-            size_t firstIdx = 0;
-            for (size_t k = 0; k < orderedLowers.size(); ++k)
-                if (orderedLowers[k] == lc) { firstIdx = k; break; }
-            scored.push_back({ lc, s, firstIdx });
+            agg.totalFocusSecs += 30;
+            if (b.timestampUtc > agg.lastSeenTs) agg.lastSeenTs = b.timestampUtc;
         }
-
-        std::sort(scored.begin(), scored.end(),
-                  [](const ScoredTok& a, const ScoredTok& b){
-                      if (a.score != b.score) return a.score > b.score;
-                      return a.firstIdx < b.firstIdx;
+        rankedWeb.reserve(webByTitle.size());
+        for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
+        std::sort(rankedWeb.begin(), rankedWeb.end(),
+                  [](const AppAgg& a, const AppAgg& b){
+                      if (a.totalFocusSecs != b.totalFocusSecs)
+                          return a.totalFocusSecs > b.totalFocusSecs;
+                      return a.lastSeenTs > b.lastSeenTs;
                   });
-
-        // Pick top 1-2 tokens; drop the second if it's much weaker
-        // (< 60 % of the top score) or duplicates the first as a prefix.
-        std::vector<std::string> picks;
-        picks.push_back(bestSurface[scored[0].lower].empty()
-                           ? scored[0].lower
-                           : bestSurface[scored[0].lower]);
-        if (scored.size() >= 2 && scored[1].score >= scored[0].score * 0.6)
-        {
-            const std::string& w1 = scored[0].lower;
-            const std::string& w2 = scored[1].lower;
-            if (w1.find(w2) == std::string::npos &&
-                w2.find(w1) == std::string::npos)
-            {
-                picks.push_back(bestSurface[scored[1].lower].empty()
-                                   ? scored[1].lower
-                                   : bestSurface[scored[1].lower]);
-            }
-        }
-
-        // Order the picks by the position they first appeared in titles
-        // so the phrase reads naturally ("Context Inference" not
-        // "Inference Context").
-        if (picks.size() == 2)
-        {
-            size_t p0 = 0, p1 = 0;
-            for (size_t k = 0; k < orderedLowers.size(); ++k)
-            {
-                if (orderedLowers[k] == scored[0].lower) p0 = k;
-                if (orderedLowers[k] == scored[1].lower) p1 = k;
-            }
-            if (p1 < p0) std::swap(picks[0], picks[1]);
-        }
-
-        std::string out;
-        for (const auto& p : picks) { if (!out.empty()) out += " "; out += p; }
-        return TitleCase(out);
-    };
-
-    // Pick a semantic verb based on the rep app's verb + the dominant
-    // content tokens in the cluster.  Keeps the verb set small so the
-    // one-liner stays uniform.
-    auto verbFor = [&](const Cluster& cl, const std::string& theme) -> std::string {
-        const AppAgg& rep = ranked[cl.repIdx];
-        std::string repVerb = AsciiLower(rep.verb);
-        std::string lowerTheme = AsciiLower(theme);
-
-        auto themeHas = [&](const char* kw) -> bool {
-            return lowerTheme.find(kw) != std::string::npos;
-        };
-        // Look across ALL member titles for keyword hints (cleaned form).
-        auto anyTitleHas = [&](const char* kw) -> bool {
-            for (size_t mi : cl.members)
-            {
-                std::string lo = AsciiLower(ranked[mi].bestTitle);
-                if (lo.find(kw) != std::string::npos) return true;
-            }
-            return false;
-        };
-
-        if (rep.isBrowser)
-        {
-            if (anyTitleHas("pull request") || anyTitleHas("pr #") ||
-                anyTitleHas("merge request") || anyTitleHas("commit") ||
-                anyTitleHas("diff") || anyTitleHas("review") ||
-                anyTitleHas("issue #") || anyTitleHas("/pull/") ||
-                themeHas("review") || themeHas("commit"))
-                return "Reviewing";
-            if (anyTitleHas("docs") || anyTitleHas("documentation") ||
-                anyTitleHas("api reference") || anyTitleHas("tutorial") ||
-                anyTitleHas("guide") || anyTitleHas("how to") ||
-                anyTitleHas("learn") || anyTitleHas("manual"))
-                return "Reading about";
-            return "Researching";
-        }
-        if (repVerb.find("editing") != std::string::npos ||
-            repVerb.find("coding")  != std::string::npos ||
-            repVerb.find("writing") != std::string::npos)
-            return "Working on";
-        if (repVerb.find("messaging") != std::string::npos ||
-            repVerb.find("chatting")  != std::string::npos ||
-            repVerb.find("meeting")   != std::string::npos ||
-            repVerb.find("calling")   != std::string::npos ||
-            repVerb.find("emailing")  != std::string::npos ||
-            repVerb.find("discussing")!= std::string::npos)
-            return "Discussing";
-        if (repVerb.find("designing") != std::string::npos ||
-            repVerb.find("drawing")   != std::string::npos)
-            return "Designing";
-        if (repVerb.find("watching") != std::string::npos ||
-            repVerb.find("playing")  != std::string::npos ||
-            repVerb.find("listening")!= std::string::npos)
-            return "Watching";
-        if (repVerb.find("reading") != std::string::npos)
-            return "Reading";
-        if (repVerb.find("terminal") != std::string::npos ||
-            repVerb.find("shell")    != std::string::npos)
-            return "Working on";
-        // Fallback: keep the rep's verb but normalise capitalization.
-        if (rep.verb.empty()) return "Working on";
-        std::string v = rep.verb;
-        if (!v.empty() && v[0] >= 'a' && v[0] <= 'z') v[0] = char(v[0] - 32);
-        return v;
-    };
-
-    auto clusterPhrase = [&](const Cluster& cl) -> std::string {
-        std::string theme = themeFor(cl);
-        std::string p;
-        if (theme.empty())
-        {
-            // No usable content tokens -- fall back to the verbatim
-            // per-app phrase to avoid emitting a context-free verb.
-            p = phraseFor(ranked[cl.repIdx]);
-        }
-        else
-        {
-            std::string verb = verbFor(cl, theme);
-            p = verb + " " + theme;
-        }
-
-        // Append app-context tail when this cluster spans 2+ apps so
-        // the user can still see *where* the work is happening.
-        if (cl.members.size() >= 2)
-        {
-            std::string suffix;
-            size_t shown = 0;
-            for (size_t j = 0; j < cl.members.size() && shown < 3; ++j, ++shown)
-            {
-                if (shown == 0)
-                    suffix = " (across " + ranked[cl.members[j]].friendlyName;
-                else if (shown + 1 == (std::min)(cl.members.size(), size_t{3}))
-                    suffix += " & " + ranked[cl.members[j]].friendlyName;
-                else
-                    suffix += ", " + ranked[cl.members[j]].friendlyName;
-            }
-            size_t hidden = cl.members.size() - shown;
-            if (hidden > 0)
-            {
-                std::ostringstream o;
-                o << " + " << hidden << " more";
-                suffix += o.str();
-            }
-            suffix += ")";
-            p += suffix;
-        }
-        return p;
-    };
-
-    // Adaptive top-N: include clusters until we cover ~80 % of focus
-    // OR the character budget is hit.  Always include at least one.
-    std::string oneLiner;
-    int covered = 0;
-    size_t included = 0;
-    for (size_t i = 0; i < clusters.size(); ++i)
-    {
-        std::string phrase = clusterPhrase(clusters[i]);
-        std::string candidate = oneLiner.empty()
-            ? phrase
-            : oneLiner + " \xC2\xB7 " + phrase; // " · "
-        if (i > 0
-         && (candidate.size() > ONE_LINER_BUDGET
-          || (totalFocusSecs > 0
-              && static_cast<int>((covered * 100LL) / totalFocusSecs) >= 80)))
-            break;
-        oneLiner = candidate;
-        covered += clusters[i].totalFocus;
-        ++included;
+        if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    if (included < clusters.size())
-    {
-        size_t remaining = clusters.size() - included;
-        std::ostringstream o;
-        const char* label = (remaining == 1) ? " other thread" : " other threads";
-        o << oneLiner << " \xC2\xB7 + " << remaining << label;
-        oneLiner = o.str();
-    }
-
-    snap.oneLiner = oneLiner;
+    snap.oneLinerDocuments = composeOneLinerFromBag(rankedDocs).text;
+    snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb).text;
+    snap.oneLinerApps      = composeOneLinerFromBag(rankedApps).text;
 
     // ---- Confidence -----------------------------------------------
     // Heuristic: 0 if no focus, ~0.3 with a small amount of focus, up
@@ -1553,14 +1682,31 @@ ContextSnapshot ContextInference::ComposeSnapshot()
 // =====================================================================
 //  Query API
 // =====================================================================
-std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s)
+std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
+                                                   const std::string& category)
 {
+    // Resolve the top-level "one_liner" surface based on the requested
+    // category.  "all" (default) keeps the combined one; the three
+    // category names swap in the matching per-category line so a UI
+    // that simply renders the JSON sees a focused response.  All four
+    // category-specific fields are *also* emitted for consumers that
+    // want the full breakdown.
+    std::string topLine = s.oneLiner;
+    if (category == "documents") topLine = s.oneLinerDocuments;
+    else if (category == "websites") topLine = s.oneLinerWebsites;
+    else if (category == "apps")     topLine = s.oneLinerApps;
+
     std::ostringstream o;
     o << "{"
       << "\"timestamp\":"       << s.timestamp
       << ",\"window_start\":"   << s.windowStartTs
       << ",\"window_end\":"     << s.windowEndTs
-      << ",\"one_liner\":\""    << EscapeJson(s.oneLiner) << "\""
+      << ",\"category\":\""     << EscapeJson(category) << "\""
+      << ",\"one_liner\":\""    << EscapeJson(topLine) << "\""
+      << ",\"one_liner_all\":\""       << EscapeJson(s.oneLiner)          << "\""
+      << ",\"one_liner_documents\":\"" << EscapeJson(s.oneLinerDocuments) << "\""
+      << ",\"one_liner_websites\":\""  << EscapeJson(s.oneLinerWebsites)  << "\""
+      << ",\"one_liner_apps\":\""      << EscapeJson(s.oneLinerApps)      << "\""
       << ",\"activity_count\":" << s.activityCount
       << ",\"focus_seconds\":"  << s.focusSeconds
       << ",\"dominant_focus_pct\":" << s.dominantPct
@@ -1589,23 +1735,34 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s)
     return o.str();
 }
 
-std::string ContextInference::GetRecentContext()
+// Normalize the requested category to one of the four known values.
+// Empty / unknown / "all" all map to "all".
+static std::string NormalizeCategory(const std::string& c)
 {
+    if (c == "documents" || c == "websites" || c == "apps") return c;
+    return "all";
+}
+
+std::string ContextInference::GetRecentContext(const std::string& category)
+{
+    std::string cat = NormalizeCategory(category);
     std::lock_guard<std::mutex> lk(m_mutex);
     std::ostringstream o;
     o << "{\"recent_context\":";
     if (m_haveLatest)
-        o << SnapshotToJsonObject(m_latest);
+        o << SnapshotToJsonObject(m_latest, cat);
     else
         o << "null";
-    o << ",\"history_count\":" << m_history.size() << "}";
+    o << ",\"category\":\"" << cat << "\""
+      << ",\"history_count\":" << m_history.size() << "}";
     return o.str();
 }
 
-std::string ContextInference::GetRecentContexts(int count)
+std::string ContextInference::GetRecentContexts(int count, const std::string& category)
 {
     if (count <= 0)  count = 10;
     if (count > 200) count = 200;
+    std::string cat = NormalizeCategory(category);
 
     std::lock_guard<std::mutex> lk(m_mutex);
 
@@ -1620,9 +1777,10 @@ std::string ContextInference::GetRecentContexts(int count)
     for (size_t i = 0; i < latestFirst.size(); ++i)
     {
         if (i) o << ",";
-        o << SnapshotToJsonObject(*latestFirst[i]);
+        o << SnapshotToJsonObject(*latestFirst[i], cat);
     }
-    o << "],\"returned\":" << latestFirst.size()
+    o << "],\"category\":\"" << cat << "\""
+      << ",\"returned\":" << latestFirst.size()
       << ",\"history_count\":" << m_history.size()
       << ",\"requested\":"     << count << "}";
     return o.str();
