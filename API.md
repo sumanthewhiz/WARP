@@ -279,8 +279,8 @@ you received in the previous response to get only new/updated records.
 
 #### GetRecentContext
 
-Retrieve the **latest** one-liner snapshot from the deterministic
-`ContextInference` summarizer. This operation has no parameters.
+Retrieve the **latest** one-liner snapshot from the `ContextInference`
+summarizer. This operation has no parameters.
 
 Every 60 seconds, WARP gathers all activities from the last 15-minute window
 (overlaying the user's currently-active foreground window as a virtual focus
@@ -545,17 +545,20 @@ Each section has:
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
-    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · Reading \"GitHub - dev branch\" in Edge · + 2 other apps",
+    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · Reading \"Slack - WARP channel\" in Slack · + 1 other thread",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
+    "model": "all-MiniLM-L6-v2",
+    "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
-      { "app": "Visual Studio", "exe": "devenv.exe",  "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4 },
-      { "app": "Edge",          "exe": "msedge.exe",  "title": "GitHub - dev branch",         "focus_seconds": 184, "pct": 22.7 },
-      { "app": "Outlook",       "exe": "OUTLOOK.EXE", "title": "Inbox - Suman Ghosh",         "focus_seconds":  78, "pct":  9.6 },
-      { "app": "Teams",         "exe": "ms-teams.exe","title": "Daily Standup",               "focus_seconds":  52, "pct":  6.4 }
+      { "app": "Visual Studio",  "exe": "devenv.exe",        "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4, "thread_id": 1 },
+      { "app": "Edge",           "exe": "msedge.exe",        "title": "ContextInference PR review",  "focus_seconds": 184, "pct": 22.7, "thread_id": 1 },
+      { "app": "GitHub Desktop", "exe": "GitHubDesktop.exe", "title": "WARP - dev",                  "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
+      { "app": "Slack",          "exe": "slack.exe",         "title": "Slack - WARP channel",        "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
+      { "app": "Outlook",        "exe": "OUTLOOK.EXE",       "title": "Inbox - Suman Ghosh",         "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
     ],
     "history_count": 12
   }
@@ -571,8 +574,10 @@ Each section has:
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
+| `model` | `string` | `"all-MiniLM-L6-v2"` when the ONNX sentence-encoder is loaded and clustering is active; `"deterministic"` when the model files were not found and the engine is composing the one-liner per-app. |
+| `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; equals the number of items when `model == "deterministic"`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct }`. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the MiniLM clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
@@ -582,9 +587,12 @@ Each section has:
   runs returns the result from the most recent completed cycle.
 - Snapshots are stored in memory (not persisted to disk). Restarting WARP
   clears the history.
-- The composer is **fully deterministic** — no ML model, no NuGet package, no
-  external dependency. The build ships ~80 MB lighter than v3.x and uses no
-  embedding-runtime memory.
+- The composer uses MiniLM for **dynamic clustering, not bucket matching** —
+  there is no fixed taxonomy of topics. Each cluster is induced from the
+  actual document, tab, and app titles in the window. If `models/minilm.onnx`
+  + `models/vocab.txt` are missing the engine still runs and emits
+  `"model": "deterministic"`; consumers should treat both modes as a single
+  interface and just read `one_liner` / `items` / `thread_id` as documented.
 
 ### GetRecentContexts Response
 
@@ -595,11 +603,13 @@ Each section has:
       "timestamp": 1750012345,
       "window_start": 1750011445,
       "window_end": 1750012345,
-      "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · + 3 other apps",
+      "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · + 2 other threads",
       "activity_count": 47,
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
       "confidence": 0.84,
+      "model": "all-MiniLM-L6-v2",
+      "thread_count": 3,
       "signal_types": ["focus", "file", "browsing"],
       "items": [ /* … same shape as GetRecentContext … */ ]
     },
@@ -612,6 +622,8 @@ Each section has:
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
       "confidence": 0.71,
+      "model": "all-MiniLM-L6-v2",
+      "thread_count": 2,
       "signal_types": ["focus", "browsing"],
       "items": [ /* … */ ]
     }
@@ -847,9 +859,14 @@ For short-term memory or context drift over time, call:
 Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
-The composer is fully deterministic (no ML model, no embedding runtime) and
-works directly off the literal window/tab/app titles — so the answer always
-names *what* the user is on, not just *what category* it belongs to.
+The composer uses MiniLM (`all-MiniLM-L6-v2`) for **dynamic semantic
+clustering** — *not* mapping to a fixed taxonomy. Two activities are merged
+into one *thread of work* iff their embeddings are similar to each other
+(cosine ≥ 0.65), so the answer always names *what* the user is on (the
+literal document/tab/app title), and the breakdown reveals which activities
+actually belong together. If the model files are missing the engine still
+runs and reports `"model": "deterministic"` — the one-liner format is
+identical.
 
 ---
 
@@ -1607,7 +1624,26 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.0.*
+*This documentation describes WARP API version 5.1.*
+
+*Changes from v5.0:*
+- ***Additive:*** *`GetRecentContext` response gains three fields:
+  `model` (`"all-MiniLM-L6-v2"` or `"deterministic"`), `thread_count`
+  (number of clustered threads of work), and a per-item `thread_id`
+  (1-based cluster ID, items sharing it were merged). All previous fields
+  are unchanged in shape — v5.0 consumers continue to work.*
+- *The summarizer now uses the **MiniLM (`all-MiniLM-L6-v2`) ONNX**
+  sentence-encoder for **dynamic semantic clustering** of the per-app
+  phrases observed in the rolling 15-minute window. There is **no fixed
+  taxonomy of buckets** — clusters are induced from the actual document/
+  tab/app titles. Activities with cosine similarity ≥ 0.65 are merged into
+  one *thread of work*, surfaced as `(with X & Y …)` in the one-liner.*
+- *Graceful degradation: if `models/minilm.onnx` + `models/vocab.txt` are
+  missing the engine logs and falls through to the deterministic per-app
+  composer (the v5.0 behavior). `model` then reads `"deterministic"` and
+  `thread_count` equals the number of items.*
+- *Build adds NuGet `Microsoft.ML.OnnxRuntime 1.22.0`. The MiniLM model
+  files are downloaded once into `models/` (instructions in `README.md`).*
 
 *Changes from v4.0:*
 - ***Breaking:*** *`GetRecentContext` response shape replaced. The previous fields
@@ -1619,9 +1655,9 @@ CREATE INDEX idx_inference_version    ON inference(version);
 - *New `"op": "GetRecentContexts"` request that returns the last `count` snapshots
   (newest first; default 10, hard-capped at 200) for short-term memory and context-
   drift charting.*
-- *The summarizer is now fully deterministic — no ONNX Runtime, no embedding
-  model, no NuGet dependency. The build ships ~80 MB lighter and uses no
-  embedding-runtime memory.*
+- *In v5.0 the summarizer was fully deterministic and shipped no ONNX Runtime
+  or embedding model. (v5.1 reintroduces MiniLM but for **clustering**, not
+  bucket matching — see the v5.1 notes above.)*
 - *Recompute cycle changed from 5 minutes → 60 seconds. History buffer grew from
   288 → 1 440 entries (~24 hours at 60-sec cadence). New entries are appended
   only on material change (different one-liner, different dominant app, or a

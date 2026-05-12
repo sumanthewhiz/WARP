@@ -3,9 +3,14 @@
 #include "ActivityDatabase.h"
 #include "ForegroundMonitor.h"
 
+#include <onnxruntime_cxx_api.h>
+
 #include <ctime>
 #include <cwctype>
+#include <cmath>
 #include <algorithm>
+#include <array>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
@@ -29,6 +34,16 @@ static const int64_t HISTORY_HEARTBEAT_SECS = 5 * 60;
 // composed one-liner.
 static const size_t  MAX_ITEMS         = 5;
 static const size_t  ONE_LINER_BUDGET  = 180; // characters
+
+// MiniLM embedding pipeline constants.
+static const int     EMBED_DIM         = 384;
+static const int     MAX_SEQ_LEN       = 128;
+
+// Semantic-clustering threshold: per-app phrases whose embeddings have
+// cosine similarity >= this value are merged into one "thread of work".
+// 0.65 is generous enough to merge `auth.cpp` editing with `Auth PR review`
+// in a browser, but tight enough not to merge unrelated apps.
+static const float   CLUSTER_COS_THRESHOLD = 0.65f;
 
 // =====================================================================
 //  App / verb classifier  --  layered match (exact exe -> path heuristic
@@ -460,13 +475,141 @@ ContextInference::ContextInference()
 ContextInference::~ContextInference()
 {
     Stop();
+
+    delete m_ortSession;
+    delete m_ortOpts;
+    delete m_ortMemInfo;
+    delete m_ortEnv;
+
     if (m_stopEvent) CloseHandle(m_stopEvent);
 }
 
-bool ContextInference::Init()
+// =====================================================================
+//  Init -- load MiniLM model + tokenizer if available.  This is best-effort:
+//  if any step fails the engine still runs in deterministic-only mode.
+// =====================================================================
+bool ContextInference::Init(const std::wstring& modelsDir)
 {
-    // No model files, no remote dependencies.  Always succeeds.
+    if (modelsDir.empty()) return true;  // explicitly skip model load
+
+    // Tokenizer vocab
+    std::string vocabPath = WideToUtf8(modelsDir) + "\\vocab.txt";
+    if (!m_tokenizer.Load(vocabPath))
+        return true;  // graceful degrade
+
+    std::wstring modelPath = modelsDir + L"\\minilm.onnx";
+
+    try
+    {
+        m_ortEnv  = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "WarpContextInference");
+        m_ortOpts = new Ort::SessionOptions();
+        m_ortOpts->SetIntraOpNumThreads(2);
+        m_ortOpts->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        m_ortSession = new Ort::Session(*m_ortEnv, modelPath.c_str(), *m_ortOpts);
+        m_ortMemInfo = new Ort::MemoryInfo(
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
+    }
+    catch (const Ort::Exception&)
+    {
+        delete m_ortSession; m_ortSession = nullptr;
+        delete m_ortOpts;    m_ortOpts    = nullptr;
+        delete m_ortMemInfo; m_ortMemInfo = nullptr;
+        delete m_ortEnv;     m_ortEnv     = nullptr;
+        return true;  // graceful degrade
+    }
+
+    m_modelReady = true;
     return true;
+}
+
+// =====================================================================
+//  Sentence embedding with MiniLM (384-dim, mean-pool + L2-normalize).
+//  Empty vector if the model isn't loaded.
+// =====================================================================
+std::vector<float> ContextInference::Embed(const std::string& text)
+{
+    if (!m_modelReady || !m_ortSession) return {};
+
+    std::vector<int64_t> inputIds = m_tokenizer.Encode(text, MAX_SEQ_LEN);
+    std::vector<int64_t> attentionMask(inputIds.size(), 1);
+    std::vector<int64_t> tokenTypeIds(inputIds.size(), 0);
+
+    while ((int64_t)inputIds.size() < MAX_SEQ_LEN)
+    {
+        inputIds.push_back(m_tokenizer.PadId());
+        attentionMask.push_back(0);
+        tokenTypeIds.push_back(0);
+    }
+
+    std::array<int64_t, 2> shape = { 1, MAX_SEQ_LEN };
+
+    Ort::Value inputIdsTensor = Ort::Value::CreateTensor<int64_t>(
+        *m_ortMemInfo, inputIds.data(), inputIds.size(),
+        shape.data(), shape.size());
+    Ort::Value attMaskTensor = Ort::Value::CreateTensor<int64_t>(
+        *m_ortMemInfo, attentionMask.data(), attentionMask.size(),
+        shape.data(), shape.size());
+    Ort::Value tokTypeTensor = Ort::Value::CreateTensor<int64_t>(
+        *m_ortMemInfo, tokenTypeIds.data(), tokenTypeIds.size(),
+        shape.data(), shape.size());
+
+    const char* inputNames[]  = { "input_ids", "attention_mask", "token_type_ids" };
+    const char* outputNames[] = { "last_hidden_state" };
+
+    std::vector<Ort::Value> inputTensors;
+    inputTensors.push_back(std::move(inputIdsTensor));
+    inputTensors.push_back(std::move(attMaskTensor));
+    inputTensors.push_back(std::move(tokTypeTensor));
+
+    std::vector<Ort::Value> outputTensors;
+    try
+    {
+        outputTensors = m_ortSession->Run(
+            Ort::RunOptions{ nullptr },
+            inputNames, inputTensors.data(), 3,
+            outputNames, 1);
+    }
+    catch (const Ort::Exception&)
+    {
+        return {};
+    }
+
+    const float* rawOutput = outputTensors[0].GetTensorData<float>();
+
+    std::vector<float> embedding(EMBED_DIM, 0.0f);
+    int realTokens = 0;
+    for (int t = 0; t < MAX_SEQ_LEN; ++t)
+    {
+        if (attentionMask[t] == 0) continue;
+        ++realTokens;
+        for (int d = 0; d < EMBED_DIM; ++d)
+            embedding[d] += rawOutput[t * EMBED_DIM + d];
+    }
+    if (realTokens > 0)
+    {
+        for (int d = 0; d < EMBED_DIM; ++d)
+            embedding[d] /= static_cast<float>(realTokens);
+    }
+
+    float norm = 0.0f;
+    for (int d = 0; d < EMBED_DIM; ++d) norm += embedding[d] * embedding[d];
+    norm = std::sqrt(norm);
+    if (norm > 1e-9f)
+    {
+        for (int d = 0; d < EMBED_DIM; ++d) embedding[d] /= norm;
+    }
+
+    return embedding;
+}
+
+float ContextInference::CosineSim(const std::vector<float>& a,
+                                  const std::vector<float>& b)
+{
+    if (a.size() != b.size() || a.empty()) return 0.0f;
+    float dot = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) dot += a[i] * b[i];
+    return dot;
 }
 
 void ContextInference::Start(ActivityDatabase* db, ForegroundMonitor* fg)
@@ -685,7 +828,105 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         snap.dominantPct = static_cast<int>(
             (ranked.front().totalFocusSecs * 100LL) / totalFocusSecs);
 
-    // ---- Structured breakdown -------------------------------------
+    // ---- One-liner composition ------------------------------------
+    auto phraseFor = [](const AppAgg& a) -> std::string {
+        if (a.bestTitle.empty())
+            return std::string(a.verb) + " " + a.friendlyName;
+        return std::string(a.verb) + " \"" + a.bestTitle + "\" in " + a.friendlyName;
+    };
+
+    // ---- Dynamic semantic clustering (MiniLM) ---------------------
+    // For each ranked app, embed its candidate phrase and run greedy
+    // clustering with cosine similarity >= CLUSTER_COS_THRESHOLD.  Apps
+    // whose embeddings are close get merged into one "thread".  This
+    // surfaces, e.g., editing `auth.cpp` and viewing the auth PR as a
+    // single thread instead of two unrelated lines.
+    //
+    // If the model is not loaded, every app becomes its own cluster
+    // (== the previous per-app composition).
+    std::vector<int>                 clusterOf(ranked.size(), -1);
+    std::vector<std::vector<float>>  clusterCentroid; // 384-dim each
+    std::vector<int>                 clusterTotalFocus;
+    std::vector<std::vector<size_t>> clusterMembers;  // indices into `ranked`
+
+    if (m_modelReady && ranked.size() >= 2)
+    {
+        // Cap embedding work at top 8 to bound CPU on hyper-noisy users.
+        const size_t embedLimit = (std::min)(ranked.size(), static_cast<size_t>(8));
+        std::vector<std::vector<float>> appEmb(ranked.size());
+        for (size_t i = 0; i < embedLimit; ++i)
+            appEmb[i] = Embed(phraseFor(ranked[i]));
+
+        for (size_t i = 0; i < ranked.size(); ++i)
+        {
+            if (i >= embedLimit || appEmb[i].empty())
+            {
+                // No embedding available -- give it its own cluster.
+                int cid = static_cast<int>(clusterCentroid.size());
+                clusterCentroid.push_back({});
+                clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
+                clusterMembers.push_back({ i });
+                clusterOf[i] = cid;
+                continue;
+            }
+            int bestC = -1;
+            float bestSim = CLUSTER_COS_THRESHOLD;
+            for (size_t c = 0; c < clusterCentroid.size(); ++c)
+            {
+                if (clusterCentroid[c].empty()) continue;
+                float s = CosineSim(appEmb[i], clusterCentroid[c]);
+                if (s > bestSim)
+                {
+                    bestSim = s;
+                    bestC = static_cast<int>(c);
+                }
+            }
+            if (bestC < 0)
+            {
+                int cid = static_cast<int>(clusterCentroid.size());
+                clusterCentroid.push_back(appEmb[i]);
+                clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
+                clusterMembers.push_back({ i });
+                clusterOf[i] = cid;
+            }
+            else
+            {
+                // Merge into existing cluster: re-average centroid.
+                std::vector<float>& c = clusterCentroid[bestC];
+                size_t n = clusterMembers[bestC].size();
+                for (int d = 0; d < EMBED_DIM; ++d)
+                    c[d] = (c[d] * static_cast<float>(n) + appEmb[i][d])
+                           / static_cast<float>(n + 1);
+                // Re-normalize centroid.
+                float norm = 0.0f;
+                for (int d = 0; d < EMBED_DIM; ++d) norm += c[d] * c[d];
+                norm = std::sqrt(norm);
+                if (norm > 1e-9f)
+                    for (int d = 0; d < EMBED_DIM; ++d) c[d] /= norm;
+
+                clusterMembers[bestC].push_back(i);
+                clusterTotalFocus[bestC] += ranked[i].totalFocusSecs;
+                clusterOf[i] = bestC;
+            }
+        }
+        snap.model = "all-MiniLM-L6-v2";
+    }
+    else
+    {
+        // No model -- every app is its own cluster.
+        for (size_t i = 0; i < ranked.size(); ++i)
+        {
+            clusterCentroid.push_back({});
+            clusterTotalFocus.push_back(ranked[i].totalFocusSecs);
+            clusterMembers.push_back({ i });
+            clusterOf[i] = static_cast<int>(i);
+        }
+        snap.model = "deterministic";
+    }
+
+    snap.threadCount = static_cast<int>(clusterMembers.size());
+
+    // ---- Structured breakdown (per-app top 5) ---------------------
     for (size_t i = 0; i < ranked.size() && snap.items.size() < MAX_ITEMS; ++i)
     {
         ContextSnapshot::AppItem it;
@@ -696,15 +937,9 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         it.pct          = totalFocusSecs > 0
             ? static_cast<int>((ranked[i].totalFocusSecs * 100LL) / totalFocusSecs)
             : 0;
+        it.threadId     = clusterOf[i] + 1; // 1-based for callers
         snap.items.push_back(std::move(it));
     }
-
-    // ---- One-liner composition ------------------------------------
-    auto phraseFor = [](const AppAgg& a) -> std::string {
-        if (a.bestTitle.empty())
-            return std::string(a.verb) + " " + a.friendlyName;
-        return std::string(a.verb) + " \"" + a.bestTitle + "\" in " + a.friendlyName;
-    };
 
     if (ranked.empty())
     {
@@ -741,14 +976,65 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         return snap;
     }
 
-    // Adaptive top-N: include apps until we cover ~80 % of focus time
+    // ---- Compose one-liner from cluster representatives -----------
+    // Sort clusters by total focus desc, picking each cluster's
+    // representative (highest-focus member -- which is also the first
+    // member, since `ranked` is already sorted by focus).
+    struct Cluster
+    {
+        int    totalFocus;
+        size_t repIdx;             // index into ranked
+        std::vector<size_t> members;
+    };
+    std::vector<Cluster> clusters;
+    clusters.reserve(clusterMembers.size());
+    for (size_t c = 0; c < clusterMembers.size(); ++c)
+    {
+        Cluster cl;
+        cl.totalFocus = clusterTotalFocus[c];
+        cl.members    = clusterMembers[c];
+        // Rep = first member (already focus-sorted).
+        cl.repIdx     = clusterMembers[c].front();
+        clusters.push_back(std::move(cl));
+    }
+    std::sort(clusters.begin(), clusters.end(),
+              [](const Cluster& a, const Cluster& b){
+                  return a.totalFocus > b.totalFocus;
+              });
+
+    auto clusterPhrase = [&](const Cluster& cl) -> std::string {
+        std::string p = phraseFor(ranked[cl.repIdx]);
+        if (cl.members.size() >= 2)
+        {
+            // List up to 2 secondary apps inline; cap the rest with " + N more".
+            std::string suffix = " (with ";
+            size_t shown = 0;
+            for (size_t j = 1; j < cl.members.size() && shown < 2; ++j, ++shown)
+            {
+                if (shown > 0) suffix += " & ";
+                suffix += ranked[cl.members[j]].friendlyName;
+            }
+            size_t hidden = cl.members.size() - 1 - shown;
+            if (hidden > 0)
+            {
+                std::ostringstream o;
+                o << " + " << hidden << " more";
+                suffix += o.str();
+            }
+            suffix += ")";
+            p += suffix;
+        }
+        return p;
+    };
+
+    // Adaptive top-N: include clusters until we cover ~80 % of focus
     // OR the character budget is hit.  Always include at least one.
     std::string oneLiner;
     int covered = 0;
     size_t included = 0;
-    for (size_t i = 0; i < ranked.size(); ++i)
+    for (size_t i = 0; i < clusters.size(); ++i)
     {
-        std::string phrase = phraseFor(ranked[i]);
+        std::string phrase = clusterPhrase(clusters[i]);
         std::string candidate = oneLiner.empty()
             ? phrase
             : oneLiner + " \xC2\xB7 " + phrase; // " · "
@@ -758,16 +1044,16 @@ ContextSnapshot ContextInference::ComposeSnapshot()
               && static_cast<int>((covered * 100LL) / totalFocusSecs) >= 80)))
             break;
         oneLiner = candidate;
-        covered += ranked[i].totalFocusSecs;
+        covered += clusters[i].totalFocus;
         ++included;
     }
 
-    if (included < ranked.size())
+    if (included < clusters.size())
     {
-        size_t remaining = ranked.size() - included;
+        size_t remaining = clusters.size() - included;
         std::ostringstream o;
-        o << oneLiner << " \xC2\xB7 + " << remaining
-          << " other app" << (remaining == 1 ? "" : "s");
+        const char* label = (remaining == 1) ? " other thread" : " other threads";
+        o << oneLiner << " \xC2\xB7 + " << remaining << label;
         oneLiner = o.str();
     }
 
@@ -803,6 +1089,8 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s)
       << ",\"focus_seconds\":"  << s.focusSeconds
       << ",\"dominant_focus_pct\":" << s.dominantPct
       << ",\"confidence\":"     << s.confidence
+      << ",\"thread_count\":"   << s.threadCount
+      << ",\"model\":\""        << EscapeJson(s.model) << "\""
       << ",\"signal_types\":[";
     for (size_t i = 0; i < s.signalTypes.size(); ++i)
     {
@@ -818,7 +1106,8 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s)
           << "\",\"exe\":\"" << EscapeJson(it.exe)
           << "\",\"title\":\"" << EscapeJson(it.title)
           << "\",\"focus_seconds\":" << it.focusSeconds
-          << ",\"pct\":" << it.pct << "}";
+          << ",\"pct\":" << it.pct
+          << ",\"thread_id\":" << it.threadId << "}";
     }
     o << "]}";
     return o.str();

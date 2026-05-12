@@ -4,7 +4,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
 [![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
-[![Inference](https://img.shields.io/badge/inference-deterministic%20%C2%B7%20no%20model-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
+[![Inference](https://img.shields.io/badge/inference-MiniLM%20%C2%B7%20dynamic%20clustering-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
 
 WARP is a lightweight Windows desktop application that silently monitors file/folder
 activity, application launches, foreground app focus (with window titles and dwell
@@ -60,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A deterministic, model-free summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Editing "ContextInference.cpp - WARP" in Visual Studio · Reading "GitHub - dev branch" in Edge · + 2 other apps`. The composer uses a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that strips noisy app suffixes, separator glyphs, and unsaved-doc markers. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, and a structured `items[]` breakdown. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext`; the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Editing "ContextInference.cpp - WARP" in Visual Studio (with Edge & GitHub Desktop) · Reading "Slack - WARP channel" in Slack · + 1 other thread`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that strips noisy app suffixes, separator glyphs, and unsaved-doc markers. When the optional **MiniLM (`all-MiniLM-L6-v2`) ONNX model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. Without the model the engine degrades gracefully to per-app composition. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"all-MiniLM-L6-v2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown with per-item `thread_id`. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext`; the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -117,7 +117,7 @@ flowchart TB
         EC["EventContext<br/><sub>per-event payload</sub>"]:::storage
         DB[("ActivityDatabase<br/><sub>SQLite WAL · activity.db</sub>")]:::storage
         IE["InferenceEngine<br/><sub>confidence-weighted REAL counters</sub>"]:::storage
-        TI["ContextInference<br/><sub>deterministic · 60-sec cycle</sub>"]:::storage
+        TI["ContextInference<br/><sub>MiniLM clustering · 60-sec cycle</sub>"]:::storage
     end
 
     subgraph QueryLayer ["Query surface"]
@@ -663,16 +663,21 @@ cache via `ClearCache()`.
 
 #### `ContextInference` (`ContextInference.h` / `ContextInference.cpp`)
 
-A **deterministic, model-free** context summarizer that reads recent activity
-directly from SQLite and composes a single human-readable **one-liner** describing
-what the user is actively doing — using the actual document names, browser tab
-titles, and application titles observed, not a fixed list of pre-defined buckets.
+A **dynamic, MiniLM-clustered** context summarizer that reads recent activity
+directly from SQLite and composes a single human-readable **one-liner**
+describing what the user is actively doing — using the actual document names,
+browser tab titles, and application titles observed, **not** a fixed list of
+pre-defined topic buckets.
 
 **Lifecycle:**
 
-1. `Init()` -- no model files, no NuGet dependency. Just initializes in-memory
-   state (the rolling history buffer and recompute timer).
-2. `Start(db, foregroundMonitor)` / `Stop()` -- manages a background timer thread.
+1. `Init(modelsDir)` — looks for `vocab.txt` + `minilm.onnx` first under the
+   directory passed in (typically `<exe>\models\`), then falls back to
+   `%LOCALAPPDATA%\WARP\models`. If both files are present, loads the
+   `BertTokenizer` (WordPiece) and creates an ONNX Runtime session pinned to
+   the CPU provider; otherwise the engine reports `model="deterministic"` and
+   skips the embedding pass entirely. **Loading failure is never fatal.**
+2. `Start(db, foregroundMonitor)` / `Stop()` — manages a background timer thread.
 3. Every **60 seconds**, `RunOnce()` runs:
    - Pulls all file, app-launch, browsing, and **app-focus** activities from the
      last **15 minutes** via `ActivityDatabase`.
@@ -698,17 +703,31 @@ titles, and application titles observed, not a fixed list of pre-defined buckets
      ellipsis.
    - For browsers, the *cleaned active tab title* (from `BrowsingActivity`) takes
      precedence over the window title.
-   - Composes the final one-liner by emitting `<verb> "<title>" in <friendlyName>`
-     for the dominant apps, joined by ` · `, with **adaptive top-N**: keep adding
-     apps until 80 % of focus time is covered or the 180-character budget is
-     reached, then append `+ N other app(s)` if any are left.
+   - **Dynamic semantic clustering (MiniLM path).** The composed per-app phrase
+     `<verb> "<title>" in <friendlyName>` for the top-8 ranked apps is fed
+     through the WordPiece tokenizer and the MiniLM ONNX model. Token embeddings
+     are mean-pooled over real (non-pad) tokens and L2-normalised to a 384-dim
+     sentence vector. A greedy single-pass clusterer compares each new vector
+     to the centroid of every existing cluster and joins the first one with
+     **cosine similarity ≥ 0.65**, otherwise opens a new cluster. The cluster
+     centroid is updated as a running mean. There are **no pre-defined topic
+     labels** — the threads of work emerge from whatever the user is actually
+     doing in the rolling 15-minute window.
+   - **One-liner composition (cluster-aware).** Clusters are sorted by total
+     focus seconds. Each cluster's representative phrase (highest-focus member)
+     is emitted as `<verb> "<title>" in <friendlyName>`; if the cluster has
+     additional members, ` (with App1 & App2 + N more)` is appended. Reps are
+     joined by ` · ` with **adaptive top-N**: keep adding until 80 % of focus
+     time is covered or the 180-character budget is reached, then append
+     `+ N other thread(s)`. Without the model the engine treats each app as its
+     own cluster, producing the prior per-app behaviour.
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
      capped at 0.99.
 4. Snapshots (`ContextSnapshot`: timestamp, window bounds, one-liner,
    activity count, focus seconds, confidence, dominant percentage, signal types,
-   top-5 `items[]`) are stored in a rolling history buffer (up to 1 440 entries =
-   ~24 hours at 60-sec cadence).
+   `model`, `thread_count`, top-5 `items[]` each with `thread_id`) are stored in
+   a rolling history buffer (up to 1 440 entries = ~24 hours at 60-sec cadence).
 5. **Material-change dedup**: a new snapshot is appended to history only when (a)
    the one-liner string differs from the last appended, **or** (b) the dominant
    exe changes, **or** (c) at least 5 minutes have elapsed since the last append.
@@ -720,14 +739,17 @@ The `GetRecentContext()` method returns the latest snapshot as JSON; the new
 the [GetRecentContext](#getrecentcontext) and
 [GetRecentContexts](#getrecentcontexts) API sections below.
 
-> **Why deterministic instead of an embedding model?** The previous design used a
-> local MiniLM ONNX model to map activity strings to one of ~50 pre-defined topic
-> buckets via cosine similarity. In practice this (a) hard-coded the user's
-> possible contexts to a fixed taxonomy, (b) lost the actual document/tab/app
-> name in the result, (c) added an ~80 MB model file plus an ONNX Runtime DLL to
-> the build, and (d) consumed ~120 MB of RAM at idle. The new path produces a
-> *richer* answer — the literal name of the document or tab the user is working
-> on — at zero RAM cost and with no model to ship.
+> **Why MiniLM for clustering instead of fixed buckets?** An earlier design used
+> the same MiniLM model to map every activity to one of ~50 hand-curated topic
+> strings via cosine similarity. That hard-coded the user's possible contexts to
+> a fixed taxonomy and lost the actual document/tab/app name in the result. The
+> current design uses MiniLM in the opposite direction: it does not classify —
+> it *clusters* the literal phrases observed in the rolling window. Two
+> activities are merged iff they are semantically similar to each other, not to
+> a pre-defined list. The result is a richer, ground-truthful one-liner whose
+> shape adapts to whatever the user is doing. If the model files are not
+> shipped or fail to load, the engine still produces a per-app one-liner — it
+> just no longer collapses related work into a single "thread".
 
 > **Query surface**
 
@@ -1013,18 +1035,36 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
 - Visual Studio 2022 (v143 toolset)
 - Windows 10 SDK (10.0 or later)
 - C++14 standard
+- NuGet (Visual Studio bundles this; CLI users can grab `nuget.exe` from
+  <https://dist.nuget.org/win-x86-commandline/latest/nuget.exe>)
 
 The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
-and has **no external runtime dependencies** — context inference is fully
-deterministic and ships in-binary.
+and pulls **`Microsoft.ML.OnnxRuntime` 1.22.0** via NuGet (declared in
+`packages.config`). The MiniLM sentence-encoder model files are **not** committed
+to the repo — they are downloaded once into a `models/` folder before the build.
 
 **Steps:**
 
-1. Open `WARP!.sln` in Visual Studio 2022.
-2. Build any configuration (Debug/Release × Win32/x64/ARM64).
+1. Open `WARP!.sln` in Visual Studio (or run `nuget restore "WARP!.sln" -PackagesDirectory ..\packages` from the repo root).
+2. Download the MiniLM model files into `models/` (one-time, ~86 MB):
 
-That's it — there are no NuGet model downloads, no external `.dll` copies, and
-no `models/` folder to provision.
+   ```powershell
+   New-Item -ItemType Directory -Path models -Force | Out-Null
+   Invoke-WebRequest `
+     -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" `
+     -OutFile "models/minilm.onnx"
+   Invoke-WebRequest `
+     -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt" `
+     -OutFile "models/vocab.txt"
+   ```
+
+3. Build any configuration (Debug/Release × Win32/x64/ARM64). The post-build
+   `CopyOnnxRuntime` MSBuild target copies `onnxruntime.dll` and the `models/`
+   folder next to `WARP!.exe` automatically.
+
+> **Skipping the model download is fine** — the binary will still build and
+> run; `ContextInference::Init()` just falls through to the deterministic
+> per-app composer and reports `"model": "deterministic"` in every snapshot.
 
 ---
 
@@ -1032,9 +1072,9 @@ no `models/` folder to provision.
 
 WARP is intentionally lean: a single Win32 executable that talks directly to
 the operating system for capture, to embedded SQLite for persistence, and uses
-a deterministic in-process summarizer for context inference. There is no
-service host, no background broker, no managed runtime, and no ML model in the
-dependency graph.
+the **MiniLM (`all-MiniLM-L6-v2`)** ONNX sentence-encoder for *dynamic* context
+clustering — no fixed taxonomy, no managed runtime, no service host, no
+background broker.
 
 ```mermaid
 flowchart TB
@@ -1066,7 +1106,7 @@ flowchart TB
     end
 
     subgraph CTX ["Context inference layer"]
-        CI["ContextInference<br/><sub>deterministic summarizer · in-process</sub>"]:::ml
+        CI["ContextInference<br/><sub>MiniLM dynamic clustering · in-process</sub>"]:::ml
         CLS["kAppClasses + path heuristics<br/><sub>~80 entries · 3-layer classifier</sub>"]:::ml
         TC["CleanTitle + ComposeOneLiner<br/><sub>UTF-8 normaliser · adaptive top-N</sub>"]:::ml
     end
@@ -1101,7 +1141,7 @@ flowchart TB
 | **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
 | **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
 | **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
-| **Context**      | `ContextInference` (deterministic)   | 60-sec rolling 15-min summarizer; emits a one-liner + `items[]`        |
+| **Context**      | `ContextInference` (MiniLM clustering) | 60-sec rolling 15-min summarizer; emits a one-liner + clustered `items[]`        |
 | **Context**      | `kAppClasses` + path heuristics      | 3-layer exe classifier (~80 known apps + JetBrains/Office/browsers)    |
 | **Context**      | `CleanTitle` + `ComposeOneLiner`     | UTF-8 separator normaliser, suffix stripper, adaptive top-N composer   |
 
@@ -1141,8 +1181,12 @@ flowchart TB
    database. Confidence-weighted rolling counts are recomputed from the
    raw event tables (`SUM(COALESCE(confidence, 1.0))`).
 10. The named-pipe server starts accepting connections.
-11. The context inference engine starts (no model load — just an in-memory
-    timer) and begins its 60-second cycle.
+11. The context inference engine starts: it looks for `models/minilm.onnx` +
+    `models/vocab.txt` next to the exe (or under `%LOCALAPPDATA%\WARP\models`)
+    and, if found, loads the `BertTokenizer` plus an ONNX Runtime session for
+    `all-MiniLM-L6-v2`. If the files are absent or the session fails to
+    construct, the engine logs and falls through to deterministic per-app
+    composition. Either way it begins its 60-second cycle.
 12. Every detected event (file, app launch, app focus, or browsing) is
     enriched with an `EventContext` (source / foreground / parent ids,
     `ms_since_input`, `confidence`), inserted into the appropriate
@@ -1150,10 +1194,11 @@ flowchart TB
     event's confidence to the per-entity rolling counters.
 13. Every 60 seconds, the context inference engine gathers all activities
     from the last 15 minutes (overlaying the currently-active foreground
-    window as a virtual focus row), classifies and cleans them, and
-    composes a one-liner snapshot. The snapshot is appended to the
-    rolling history only on material change (different one-liner,
-    different dominant app, or a 5-minute heartbeat).
+    window as a virtual focus row), classifies and cleans them, embeds the
+    per-app phrases (when MiniLM is loaded), runs greedy clustering at
+    cosine ≥ 0.65, and composes a one-liner snapshot. The snapshot is
+    appended to the rolling history only on material change (different
+    one-liner, different dominant app, or a 5-minute heartbeat).
 14. Every 6 hours, records older than 30 days are purged from all event
     tables and inference rolling counts are recomputed.
 15. When the user crosses the **soft** idle threshold, new events are
@@ -1332,8 +1377,8 @@ Returns up to 5 000 records per call, ordered by ascending `version`.
 
 ##### GetRecentContext
 
-Retrieve the **latest** one-liner snapshot from the deterministic
-`ContextInference` summarizer. No parameters are required.
+Retrieve the **latest** one-liner snapshot from the `ContextInference`
+summarizer. No parameters are required.
 
 ```json
 {
@@ -1349,17 +1394,20 @@ Retrieve the **latest** one-liner snapshot from the deterministic
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
-    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · Reading \"GitHub - dev branch\" in Edge · + 2 other apps",
+    "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · Reading \"Slack - WARP channel\" in Slack · + 1 other thread",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
+    "model": "all-MiniLM-L6-v2",
+    "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
-      { "app": "Visual Studio", "exe": "devenv.exe", "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4 },
-      { "app": "Edge",          "exe": "msedge.exe", "title": "GitHub - dev branch",        "focus_seconds": 184, "pct": 22.7 },
-      { "app": "Outlook",       "exe": "OUTLOOK.EXE","title": "Inbox - Suman Ghosh",        "focus_seconds":  78, "pct":  9.6 },
-      { "app": "Teams",         "exe": "ms-teams.exe","title": "Daily Standup",             "focus_seconds":  52, "pct":  6.4 }
+      { "app": "Visual Studio", "exe": "devenv.exe",  "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4, "thread_id": 1 },
+      { "app": "Edge",          "exe": "msedge.exe",  "title": "ContextInference PR review",  "focus_seconds": 184, "pct": 22.7, "thread_id": 1 },
+      { "app": "GitHub Desktop","exe": "GitHubDesktop.exe","title": "WARP - dev",             "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
+      { "app": "Slack",         "exe": "slack.exe",   "title": "Slack - WARP channel",        "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
+      { "app": "Outlook",       "exe": "OUTLOOK.EXE", "title": "Inbox - Suman Ghosh",         "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
     ],
     "history_count": 12
   }
@@ -1375,8 +1423,10 @@ Retrieve the **latest** one-liner snapshot from the deterministic
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app. |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). |
+| `model` | `string` | `"all-MiniLM-L6-v2"` when the ONNX model is loaded; `"deterministic"` when the engine is running in fallback mode. |
+| `thread_count` | `integer` | Number of distinct *threads of work* the model clustered the activity into (always ≥ 1; equals the number of items when the model isn't loaded). |
 | `signal_types` | `string[]` | Which event categories contributed (`focus`, `file`, `app`, `browsing`). |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `app`, `exe`, `title`, `focus_seconds`, `pct`. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `app`, `exe`, `title`, `focus_seconds`, `pct`, `thread_id` (1-based cluster id; activities sharing a `thread_id` were merged by the MiniLM clusterer). |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 h). |
 
 ##### GetRecentContexts
@@ -1401,8 +1451,8 @@ wants short-term memory of what the user has been doing.
 ```json
 {
   "recent_contexts": [
-    { "timestamp": 1750012345, "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio · + 3 other apps", "confidence": 0.84, "/* …full snapshot fields… */": null },
-    { "timestamp": 1750012045, "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "/* … */": null }
+    { "timestamp": 1750012345, "one_liner": "Editing \"ContextInference.cpp - WARP\" in Visual Studio (with Edge & GitHub Desktop) · + 2 other threads", "confidence": 0.84, "model": "all-MiniLM-L6-v2", "thread_count": 3, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012045, "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "model": "all-MiniLM-L6-v2", "thread_count": 2, "/* … */": null }
   ],
   "returned": 2,
   "history_count": 12,
@@ -1765,11 +1815,17 @@ WARP!\
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
 |-- InferenceEngine.cpp         Confidence-weighted REAL counters, recency score,
 |                                QueryInferences & GetInferenceDeltas impl
-|-- ContextInference.h          Deterministic context summarizer interface
-|-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + ComposeOneLiner;
+|-- ContextInference.h          MiniLM-clustered context summarizer interface
+|-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + Embed/CosineSim
+|                                + greedy clustering + cluster-aware ComposeOneLiner;
 |                                60-sec rolling 15-min summarizer with material-change dedup
+|-- BertTokenizer.h             Header-only WordPiece tokenizer for MiniLM
 |
-|-- packages.config             NuGet package references (currently empty)
+|-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.22.0)
+|
+|-- models/                     (gitignored) all-MiniLM-L6-v2 ONNX model + vocab
+|   |-- minilm.onnx             Sentence encoder (384-dim, ~86 MB) - downloaded
+|   +-- vocab.txt               WordPiece vocab - downloaded
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)
 +-- sqlite3.h                   SQLite public header

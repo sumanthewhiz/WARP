@@ -1239,13 +1239,43 @@ void StartSubsystems()
 
     g_queryApi.Start(&g_db, &g_inference, &g_contextInference);
 
-    // Initialize and start the dynamic context inference engine.  No model
-    // files are required -- the summarizer is fully deterministic and
-    // composes a 1-liner from the actual document, tab, and window
-    // titles captured in the rolling 15-minute window.  See
-    // ContextInference.cpp for the algorithm.
-    g_contextInference.Init();
-    g_contextInference.Start(&g_db, &g_foregroundMonitor);
+    // Initialize and start the dynamic context inference engine.  If the
+    // MiniLM model files are present (`models/minilm.onnx` + `models/vocab.txt`)
+    // next to the exe -- or under `%LOCALAPPDATA%\WARP\models` -- the engine
+    // uses MiniLM to **dynamically cluster** the per-app descriptions seen in
+    // the rolling 15-min window.  No pre-defined topic buckets are involved;
+    // clusters emerge from the actual document/tab/app titles.  If the model
+    // is absent the engine falls back to a deterministic per-app composition.
+    {
+        std::wstring modelsDir;
+        wchar_t exePath[MAX_PATH] = { 0 };
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0)
+        {
+            std::wstring p = exePath;
+            size_t slash = p.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+            {
+                std::wstring exeDirModels = p.substr(0, slash) + L"\\models";
+                DWORD attr = GetFileAttributesW(exeDirModels.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+                    modelsDir = exeDirModels;
+            }
+        }
+        if (modelsDir.empty())
+        {
+            wchar_t appData[MAX_PATH] = { 0 };
+            if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA,
+                                           nullptr, 0, appData)))
+            {
+                std::wstring fallback = std::wstring(appData) + L"\\WARP\\models";
+                DWORD attr = GetFileAttributesW(fallback.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+                    modelsDir = fallback;
+            }
+        }
+        g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
+        g_contextInference.Start(&g_db, &g_foregroundMonitor);
+    }
 }
 
 void OnInferenceButton(HWND hWnd, int id)
