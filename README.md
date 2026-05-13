@@ -1439,9 +1439,9 @@ summarizer.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `documents`, `websites`, `apps`. Selects which one-liner is surfaced as the top-level `one_liner` field; all four are also returned individually so a consumer can switch facets without a re-query. |
+| `category` | `string` | `"all"` | One of `all`, `documents`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: with `"all"` the response also carries the three per-category one-liners (`one_liner_documents` / `_websites` / `_apps`); for any other value only the matching category's one-liner is returned (as `one_liner`) — the other categories are omitted to keep the response focused. |
 
-**Response:**
+**Response (when `category == "all"`):**
 
 ```json
 {
@@ -1451,7 +1451,6 @@ summarizer.
     "window_end": 1750012345,
     "category": "all",
     "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
-    "one_liner_all":       "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
     "one_liner_documents": "Editing Context Inference module · Drafting Daily Standup notes",
     "one_liner_websites":  "Researching React Hooks · Reviewing GitHub PR for ContextInference",
     "one_liner_apps":      "Discussing in Slack & Teams · Triaging Outlook inbox",
@@ -1475,16 +1474,39 @@ summarizer.
 }
 ```
 
+**Response (when `category == "documents"` / `"websites"` / `"apps"`):**
+
+```json
+{
+  "recent_context": {
+    "timestamp": 1750012345,
+    "window_start": 1750011445,
+    "window_end": 1750012345,
+    "category": "documents",
+    "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
+    "activity_count": 47,
+    "focus_seconds": 812,
+    "dominant_focus_pct": 61.4,
+    "confidence": 0.84,
+    "model": "bge-small-en-v1.5",
+    "thread_count": 3,
+    "signal_types": ["focus", "file", "browsing"],
+    "items": [ /* … same shape, always reflects the All clustering … */ ]
+  },
+  "category": "documents",
+  "history_count": 12
+}
+```
+
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | `integer` | When this snapshot was produced (Unix epoch seconds). |
 | `window_start` / `window_end` | `integer` | Bounds of the 15-minute lookback window (Unix epoch seconds). |
 | `category` | `string` | Echo of the requested category (`all` / `documents` / `websites` / `apps`). |
-| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals one of the four `one_liner_*` fields below depending on the requested `category`. |
-| `one_liner_all` | `string` | Combined one-liner across all activity (documents, websites, apps). |
-| `one_liner_documents` | `string` | One-liner derived only from documents/files the user has been editing or viewing in non-browser document apps. |
-| `one_liner_websites` | `string` | One-liner derived only from browser tab titles (per-tab aggregation). |
-| `one_liner_apps` | `string` | One-liner derived only from non-document, non-browser apps (comms, terminals, media players, remote-desktop, etc.). |
+| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
+| `one_liner_documents` | `string` | **Only present when `category == "all"`.** One-liner derived from documents/files the user has been editing or viewing in non-browser document apps. |
+| `one_liner_websites` | `string` | **Only present when `category == "all"`.** One-liner derived from browser tab titles (per-tab aggregation). |
+| `one_liner_apps` | `string` | **Only present when `category == "all"`.** One-liner derived from non-document, non-browser apps (comms, terminals, media players, remote-desktop, etc.). |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app. |

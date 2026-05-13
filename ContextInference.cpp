@@ -1810,15 +1810,22 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
                                                    const std::string& category)
 {
     // Resolve the top-level "one_liner" surface based on the requested
-    // category.  "all" (default) keeps the combined one; the three
-    // category names swap in the matching per-category line so a UI
-    // that simply renders the JSON sees a focused response.  All four
-    // category-specific fields are *also* emitted for consumers that
-    // want the full breakdown.
+    // category and decide which per-category fields to emit.
+    //
+    //   * category == "all": the combined one-liner is surfaced as
+    //     `one_liner` and the three per-category lines are *also*
+    //     emitted (so a single "All" round-trip carries the data the
+    //     UI dropdown can switch between without re-querying).
+    //
+    //   * category == "documents" / "websites" / "apps": only the
+    //     matching per-category line is emitted -- as the top-level
+    //     `one_liner`.  The other two categories and the combined
+    //     "all" line are *not* serialized, keeping the response
+    //     focused on what the consumer asked for.
     std::string topLine = s.oneLiner;
-    if (category == "documents") topLine = s.oneLinerDocuments;
-    else if (category == "websites") topLine = s.oneLinerWebsites;
-    else if (category == "apps")     topLine = s.oneLinerApps;
+    if      (category == "documents") topLine = s.oneLinerDocuments;
+    else if (category == "websites")  topLine = s.oneLinerWebsites;
+    else if (category == "apps")      topLine = s.oneLinerApps;
 
     std::ostringstream o;
     o << "{"
@@ -1826,12 +1833,17 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"window_start\":"   << s.windowStartTs
       << ",\"window_end\":"     << s.windowEndTs
       << ",\"category\":\""     << EscapeJson(category) << "\""
-      << ",\"one_liner\":\""    << EscapeJson(topLine) << "\""
-      << ",\"one_liner_all\":\""       << EscapeJson(s.oneLiner)          << "\""
-      << ",\"one_liner_documents\":\"" << EscapeJson(s.oneLinerDocuments) << "\""
-      << ",\"one_liner_websites\":\""  << EscapeJson(s.oneLinerWebsites)  << "\""
-      << ",\"one_liner_apps\":\""      << EscapeJson(s.oneLinerApps)      << "\""
-      << ",\"activity_count\":" << s.activityCount
+      << ",\"one_liner\":\""    << EscapeJson(topLine)  << "\"";
+
+    if (category == "all")
+    {
+        // Emit all three per-category lines alongside the combined one.
+        o << ",\"one_liner_documents\":\"" << EscapeJson(s.oneLinerDocuments) << "\""
+          << ",\"one_liner_websites\":\""  << EscapeJson(s.oneLinerWebsites)  << "\""
+          << ",\"one_liner_apps\":\""      << EscapeJson(s.oneLinerApps)      << "\"";
+    }
+
+    o << ",\"activity_count\":" << s.activityCount
       << ",\"focus_seconds\":"  << s.focusSeconds
       << ",\"dominant_focus_pct\":" << s.dominantPct
       << ",\"confidence\":"     << s.confidence

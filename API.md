@@ -291,9 +291,14 @@ apps the user is working with — not a fixed bucket label.
 
 ```json
 {
-  "op": "GetRecentContext"
+  "op": "GetRecentContext",
+  "category": "all"
 }
 ```
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `category` | `string` | `"all"` | One of `all`, `documents`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: `"all"` returns the combined line plus all three per-category lines; any other value returns only the matching category's one-liner. |
 
 The response is grounded in observed window titles and tab names, so it stays
 accurate as the user moves between projects, customers, or topics — there is
@@ -308,13 +313,15 @@ memory for an LLM agent, or rendering a "what was I doing" timeline.
 ```json
 {
   "op": "GetRecentContexts",
-  "count": 10
+  "count": 10,
+  "category": "all"
 }
 ```
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `count` | `integer` | `10` | Hard-capped at 200 to keep responses under the 64 KB pipe buffer. Negative or zero values are treated as the default. |
+| `category` | `string` | `"all"` | Same semantics as `GetRecentContext` — applied to every snapshot in the response. |
 
 History entries are de-duplicated on append: a new snapshot is recorded only on
 **material change** — different one-liner, different dominant app, or a
@@ -539,13 +546,30 @@ Each section has:
 
 ### GetRecentContext Response
 
+The shape varies with the requested `category`:
+
+* **`category == "all"` (default).** The response carries the **combined**
+  one-liner as `one_liner` plus all three per-category one-liners
+  (`one_liner_documents` / `_websites` / `_apps`), so a UI that wants to
+  switch facets locally can do so without re-querying.
+* **`category == "documents" | "websites" | "apps"`.** Only the matching
+  per-category one-liner is returned (as `one_liner`). The other
+  categories — including the combined "all" line — are **omitted**, keeping
+  the response focused on what the caller asked for.
+
+**Example — `category == "all"`:**
+
 ```json
 {
   "recent_context": {
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
+    "category": "all",
     "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
+    "one_liner_documents": "Editing Context Inference module · Drafting Daily Standup notes",
+    "one_liner_websites":  "Researching React Hooks · Reviewing GitHub PR for ContextInference",
+    "one_liner_apps":      "Discussing in Slack & Teams · Triaging Outlook inbox",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -559,9 +583,34 @@ Each section has:
       { "app": "GitHub Desktop", "exe": "GitHubDesktop.exe", "title": "WARP - dev",                  "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
       { "app": "Slack",          "exe": "slack.exe",         "title": "Slack - WARP channel",        "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
       { "app": "Outlook",        "exe": "OUTLOOK.EXE",       "title": "Inbox - Suman Ghosh",         "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
-    ],
-    "history_count": 12
-  }
+    ]
+  },
+  "category": "all",
+  "history_count": 12
+}
+```
+
+**Example — `category == "documents"` (also same shape for `"websites"` and `"apps"`):**
+
+```json
+{
+  "recent_context": {
+    "timestamp": 1750012345,
+    "window_start": 1750011445,
+    "window_end": 1750012345,
+    "category": "documents",
+    "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
+    "activity_count": 47,
+    "focus_seconds": 812,
+    "dominant_focus_pct": 61.4,
+    "confidence": 0.84,
+    "model": "bge-small-en-v1.5",
+    "thread_count": 3,
+    "signal_types": ["focus", "file", "browsing"],
+    "items": [ /* same shape as above; always reflects the All clustering */ ]
+  },
+  "category": "documents",
+  "history_count": 12
 }
 ```
 
@@ -569,15 +618,19 @@ Each section has:
 |---|---|---|
 | `timestamp` | `integer` | Unix epoch seconds (UTC) when this snapshot was produced. |
 | `window_start` / `window_end` | `integer` | Bounds of the 15-minute lookback window (Unix epoch seconds, UTC). |
-| `one_liner` | `string` | Human-readable summary of what the user is actively doing. |
+| `category` | `string` | Echo of the requested category (`all` / `documents` / `websites` / `apps`). |
+| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
+| `one_liner_documents` | `string` | **Only present when `category == "all"`.** Composed from non-browser document-editor / authoring / viewer apps plus recently-opened file basenames. |
+| `one_liner_websites` | `string` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
+| `one_liner_apps` | `string` | **Only present when `category == "all"`.** Composed from non-document, non-browser apps (comms, terminals, media, remote desktop, etc.). |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded and clustering is active; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found and the engine is composing the one-liner per-app. |
-| `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; equals the number of items when `model == "deterministic"`. |
+| `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. Always reflects the **All** clustering. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
@@ -1639,7 +1692,30 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.4.*
+*This documentation describes WARP API version 5.5.*
+
+*Changes from v5.4:*
+- ***Response shape is now category-gated.*** *`GetRecentContext` and
+  `GetRecentContexts` only emit the **requested** category's one-liner
+  in the response:*
+  - *`category == "all"` (default) returns the combined one-liner as
+    `one_liner` plus all three per-category lines
+    (`one_liner_documents` / `_websites` / `_apps`).*
+  - *`category == "documents" | "websites" | "apps"` returns **only**
+    the matching category's one-liner as `one_liner`. The other
+    categories are **omitted** from the response.*
+- *Rationale: the previous v5.3 behavior of always emitting all four
+  one-liners regardless of the requested category wasted ~3 of the 4
+  one-liner strings worth of response bytes (and ~3× the per-snapshot
+  embedding compute is irrelevant — those still run every cycle so the
+  snapshot is ready for the next request — but the wire format now
+  reflects what the caller asked for).*
+- *The redundant `one_liner_all` field (which duplicated `one_liner`
+  in the `category == "all"` response) has been removed.*
+- *Consumers that were reading `one_liner_documents` / `_websites` /
+  `_apps` from a non-`"all"` response must either (a) request
+  `category=all` to receive all four, or (b) issue separate per-category
+  requests.*
 
 *Changes from v5.3:*
 - *Switched the default sentence-encoder model from
@@ -1662,8 +1738,8 @@ CREATE INDEX idx_inference_version    ON inference(version);
   HuggingFace at CI build time and copied next to `WARP!.exe` by the
   `CopyOnnxRuntime` MSBuild target. (`models/minilm.onnx` is still
   copied if present, for upgrade scenarios.)*
-- *No request- or response-shape changes. Existing API consumers see
-  only the `model` string change.*
+- *No request- or response-shape changes at v5.4. Existing API consumers
+  saw only the `model` string change.*
 
 *Changes from v5.2:*
 - *Per-category one-liner facets. In addition to the combined `one_liner`,
