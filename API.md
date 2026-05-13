@@ -292,13 +292,15 @@ apps the user is working with — not a fixed bucket label.
 ```json
 {
   "op": "GetRecentContext",
-  "category": "all"
+  "category": "all",
+  "window_seconds": 900
 }
 ```
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `documents`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: `"all"` returns the combined line plus all three per-category lines; any other value returns only the matching category's one-liner. |
+| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: `"all"` returns the combined line plus all three per-category lines; any other value returns only the matching category's one-liner. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
+| `window_seconds` | `integer` | `900` (= 15 min) | Activity lookback span. Snapped to the nearest of: 300, 900, 1800, 3600, 7200, 21600, 86400, 604800, 1296000, 2592000 (5 min, 15 min, 30 min, 1 h, 2 h, 6 h, 24 h, 7 d, 15 d, 30 d). 15 min serves the cached snapshot from the 60-sec timer; any other value composes fresh on demand. |
 
 The response is grounded in observed window titles and tab names, so it stays
 accurate as the user moves between projects, customers, or topics — there is
@@ -314,7 +316,8 @@ memory for an LLM agent, or rendering a "what was I doing" timeline.
 {
   "op": "GetRecentContexts",
   "count": 10,
-  "category": "all"
+  "category": "all",
+  "window_seconds": 900
 }
 ```
 
@@ -322,6 +325,7 @@ memory for an LLM agent, or rendering a "what was I doing" timeline.
 |---|---|---|---|
 | `count` | `integer` | `10` | Hard-capped at 200 to keep responses under the 64 KB pipe buffer. Negative or zero values are treated as the default. |
 | `category` | `string` | `"all"` | Same semantics as `GetRecentContext` — applied to every snapshot in the response. |
+| `window_seconds` | `integer` | `900` | Filters history to snapshots whose `timestamp` falls within the last `window_seconds`.  Larger values include more historical rows; each row's underlying compute window stays at the rolling-history cadence (15 min). |
 
 History entries are de-duplicated on append: a new snapshot is recorded only on
 **material change** — different one-liner, different dominant app, or a
@@ -550,14 +554,14 @@ The shape varies with the requested `category`:
 
 * **`category == "all"` (default).** The response carries the **combined**
   one-liner as `one_liner` plus all three per-category one-liners
-  (`one_liner_documents` / `_websites` / `_apps`), so a UI that wants to
+  (`one_liner_files` / `_websites` / `_apps`), so a UI that wants to
   switch facets locally can do so without re-querying.
-* **`category == "documents" | "websites" | "apps"`.** Only the matching
+* **`category == "files" | "websites" | "apps"`.** Only the matching
   per-category one-liner is returned (as `one_liner`). The other
   categories — including the combined "all" line — are **omitted**, keeping
   the response focused on what the caller asked for.
 
-**Example — `category == "all"`:**
+**Example — `category == "all"`, `window_seconds = 900`:**
 
 ```json
 {
@@ -565,11 +569,12 @@ The shape varies with the requested `category`:
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
+    "window_seconds": 900,
     "category": "all",
     "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
-    "one_liner_documents": "Editing Context Inference module · Drafting Daily Standup notes",
-    "one_liner_websites":  "Researching React Hooks · Reviewing GitHub PR for ContextInference",
-    "one_liner_apps":      "Discussing in Slack & Teams · Triaging Outlook inbox",
+    "one_liner_files":    "Editing Context Inference module · Drafting Daily Standup notes",
+    "one_liner_websites": "Researching React Hooks · Reviewing GitHub PR for ContextInference",
+    "one_liner_apps":     "Discussing in Slack & Teams · Triaging Outlook inbox",
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -578,19 +583,20 @@ The shape varies with the requested `category`:
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
-      { "app": "Visual Studio",  "exe": "devenv.exe",        "title": "ContextInference.cpp - WARP", "focus_seconds": 498, "pct": 61.4, "thread_id": 1 },
-      { "app": "Edge",           "exe": "msedge.exe",        "title": "ContextInference PR review",  "focus_seconds": 184, "pct": 22.7, "thread_id": 1 },
-      { "app": "GitHub Desktop", "exe": "GitHubDesktop.exe", "title": "WARP - dev",                  "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
-      { "app": "Slack",          "exe": "slack.exe",         "title": "Slack - WARP channel",        "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
-      { "app": "Outlook",        "exe": "OUTLOOK.EXE",       "title": "Inbox - Suman Ghosh",         "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
+      { "app": "Visual Studio",  "exe": "devenv.exe",        "title": "ContextInference.cpp - WARP", "raw_title": "● ContextInference.cpp - WARP! - Microsoft Visual Studio",                        "focus_seconds": 498, "pct": 61.4, "thread_id": 1 },
+      { "app": "Edge",           "exe": "msedge.exe",        "title": "ContextInference PR review",  "raw_title": "ContextInference PR review · sumanthewhiz/WARP · Pull Request #34 — Microsoft Edge", "focus_seconds": 184, "pct": 22.7, "thread_id": 1 },
+      { "app": "GitHub Desktop", "exe": "GitHubDesktop.exe", "title": "WARP - dev",                  "raw_title": "WARP - dev — GitHub Desktop",                                                       "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
+      { "app": "Slack",          "exe": "slack.exe",         "title": "Slack - WARP channel",        "raw_title": "Slack - WARP channel — Slack",                                                      "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
+      { "app": "Outlook",        "exe": "OUTLOOK.EXE",       "title": "Inbox - Suman Ghosh",         "raw_title": "Inbox - Suman Ghosh - Outlook",                                                     "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
     ]
   },
   "category": "all",
+  "window_seconds": 900,
   "history_count": 12
 }
 ```
 
-**Example — `category == "documents"` (also same shape for `"websites"` and `"apps"`):**
+**Example — `category == "files"` (same shape for `"websites"` and `"apps"`):**
 
 ```json
 {
@@ -598,7 +604,8 @@ The shape varies with the requested `category`:
     "timestamp": 1750012345,
     "window_start": 1750011445,
     "window_end": 1750012345,
-    "category": "documents",
+    "window_seconds": 900,
+    "category": "files",
     "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
     "activity_count": 47,
     "focus_seconds": 812,
@@ -609,7 +616,8 @@ The shape varies with the requested `category`:
     "signal_types": ["focus", "file", "browsing"],
     "items": [ /* same shape as above; always reflects the All clustering */ ]
   },
-  "category": "documents",
+  "category": "files",
+  "window_seconds": 900,
   "history_count": 12
 }
 ```
@@ -617,20 +625,21 @@ The shape varies with the requested `category`:
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | `integer` | Unix epoch seconds (UTC) when this snapshot was produced. |
-| `window_start` / `window_end` | `integer` | Bounds of the 15-minute lookback window (Unix epoch seconds, UTC). |
-| `category` | `string` | Echo of the requested category (`all` / `documents` / `websites` / `apps`). |
+| `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds, UTC). |
+| `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` after normalisation to the nearest allowed value. |
+| `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
 | `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
-| `one_liner_documents` | `string` | **Only present when `category == "all"`.** Composed from non-browser document-editor / authoring / viewer apps plus recently-opened file basenames. |
+| `one_liner_files` | `string` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
 | `one_liner_websites` | `string` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
-| `one_liner_apps` | `string` | **Only present when `category == "all"`.** Composed from non-document, non-browser apps (comms, terminals, media, remote desktop, etc.). |
+| `one_liner_apps` | `string` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded and clustering is active; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found and the engine is composing the one-liner per-app. |
+| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. Always reflects the **All** clustering. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
@@ -1692,7 +1701,73 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.5.*
+*This documentation describes WARP API version 5.6.*
+
+*Changes from v5.5:*
+- ***`category` enum renamed: `"documents"` → `"files"`.*** *The
+  per-category facet was renamed to make it clear that it covers
+  *any* file the user has open — `.docx` in Word, `.xlsx` in Excel,
+  `.pptx` in PowerPoint, `.pdf` / `.jpg` / `.png` / `.heic` in image
+  viewers, `.cpp` / `.json` / `.md` / `.txt` in any editor, etc. —
+  not just "document" files in the colloquial sense.  The legacy
+  value `"documents"` is still accepted (treated as an alias for
+  `"files"`) so existing callers don't break.*
+- ***Files category broadened.*** *Routing rules now form a strict
+  three-way partition in priority order:* (1) *browsers → Websites
+  only;* (2) *known comms / media / terminals / VMs / VCS UIs
+  (Outlook, Teams, Slack, Discord, WhatsApp, Signal, Telegram,
+  Zoom, Webex, Spotify, VLC, Windows Terminal, PowerShell, Remote
+  Desktop, GitHub Desktop, Sourcetree, etc.) → Apps only, **even
+  if** their title mentions a filename;* (3) *whitelisted file
+  apps (editors, Office, OneNote, PDF readers, image viewers like
+  Photos / IrfanView / Paint / Paint.NET / GIMP, design tools) →
+  Files;* (4) *any other app whose window title contains a
+  recognized file extension (45+ extensions across documents,
+  spreadsheets, slides, PDFs, images, code, data, config,
+  archives) → Files;* (5) *everything else → Apps.*
+- ***Response shape: new `one_liner_files` field*** (replaces
+  `one_liner_documents` from v5.3; same semantics, broader scope).
+  *The combined `one_liner` plus the three per-category lines
+  remain only present when `category == "all"`.*
+- ***New `raw_title` field in `items[]`*** — the **full** original
+  window title before any cleaning, so callers can see the
+  complete context (e.g.
+  `"● ContextInference.cpp - WARP! - Microsoft Visual Studio"`
+  instead of just `"ContextInference.cpp - WARP"`).  The existing
+  `title` (cleaned form) is unchanged.
+- ***New `window_seconds` request parameter*** for both
+  `GetRecentContext` and `GetRecentContexts`.  Allowed values
+  (snapped to nearest match): `300, 900, 1800, 3600, 7200, 21600,
+  86400, 604800, 1296000, 2592000` corresponding to 5 min / 15 min
+  (**default**) / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d /
+  30 d.  For 15 min WARP serves the cached snapshot from the
+  60-sec background timer.  For any other value
+  `GetRecentContext` composes a snapshot fresh on demand, and
+  `GetRecentContexts` filters the rolling history to only return
+  entries whose `timestamp` falls within the last
+  `window_seconds`.  Echoed back in the response as
+  `window_seconds` at both envelope and snapshot level.
+- ***`windowSeconds` field added to every snapshot*** alongside
+  `window_start` / `window_end` so callers don't have to compute it
+  themselves.
+- ***Better one-liner coherence.*** *The combined "All" one-liner
+  is now hard-capped at the top 3 clusters by focus, and any
+  cluster contributing less than 5 % of total focus is dropped
+  from the head.  Theme tokens are now scored by `cross-title
+  coverage × (1 + cosine-to-clean-cluster-centroid)` instead of
+  raw frequency × cosine — so a token appearing in 3 different
+  titles dominates a token appearing 5× in one title (the latter
+  was the main cause of "mish-mash" one-liners).  Single-title
+  tokens are demoted to 0.4× score when the cluster has 3+
+  titles.  Per-category one-liners can now emit up to 3 theme
+  tokens (up from 2) when the bag has 4+ titles, for richer
+  themes.*
+- ***UI: window-length dropdown added*** to the right of the
+  category dropdown (10 entries from "Last 5 minutes" to "Last 30
+  days", default "Last 15 minutes").  Both context buttons
+  forward the selection as the `window_seconds` JSON parameter.
+- ***UI: category dropdown item renamed*** from "Documents" to
+  "Files" (mirrors the API enum change).
 
 *Changes from v5.4:*
 - ***Response shape is now category-gated.*** *`GetRecentContext` and

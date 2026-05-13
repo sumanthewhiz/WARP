@@ -62,9 +62,12 @@
 // Recent context inference (dynamic 1-liner summarization)
 #define IDB_RECENT_CONTEXT		440
 #define IDB_CONTEXT_HISTORY		441
-// Category dropdown (All / Documents / Websites / Apps) — narrows the
+// Category dropdown (All / Files / Websites / Apps) — narrows the
 // ContextInference snapshot returned by the two buttons above.
 #define IDC_CTX_CATEGORY		442
+// Window-length dropdown (Last 5 min ... Last 30 days) — controls the
+// activity lookback span for the two context buttons.
+#define IDC_CTX_WINDOW			443
 #define IDT_TOPIC_TIMER			302
 
 #ifndef IDC_STATIC

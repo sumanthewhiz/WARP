@@ -179,7 +179,12 @@ void QueryApi::HandleClient(HANDLE hPipe)
     if (opVal == "GetRecentContext" && m_ctxInf)
     {
         std::string category = findValue("category");
-        std::string json = m_ctxInf->GetRecentContext(category);
+        std::string winStr   = findValue("window_seconds");
+        if (winStr.empty()) winStr = findValue("window_secs");
+        int64_t winSecs = 0;
+        if (!winStr.empty())
+            winSecs = static_cast<int64_t>(strtoll(winStr.c_str(), nullptr, 10));
+        std::string json = m_ctxInf->GetRecentContext(category, winSecs);
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);
@@ -193,7 +198,12 @@ void QueryApi::HandleClient(HANDLE hPipe)
         if (!countStr.empty())
             count = static_cast<int>(strtol(countStr.c_str(), nullptr, 10));
         std::string category = findValue("category");
-        std::string json = m_ctxInf->GetRecentContexts(count, category);
+        std::string winStr   = findValue("window_seconds");
+        if (winStr.empty()) winStr = findValue("window_secs");
+        int64_t winSecs = 0;
+        if (!winStr.empty())
+            winSecs = static_cast<int64_t>(strtoll(winStr.c_str(), nullptr, 10));
+        std::string json = m_ctxInf->GetRecentContexts(count, category, winSecs);
         DWORD written = 0;
         WriteFile(hPipe, json.c_str(), static_cast<DWORD>(json.size()), &written, nullptr);
         FlushFileBuffers(hPipe);

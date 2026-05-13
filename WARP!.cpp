@@ -143,10 +143,11 @@ static HWND g_hBtnInferLookup = nullptr;
 static HWND g_hEditInferTopN  = nullptr;
 static HWND g_hInferTopNLabel = nullptr;
 
-// Recent context buttons + category selector
+// Recent context buttons + category / window selectors
 static HWND g_hBtnRecentContext  = nullptr;
 static HWND g_hBtnContextHistory = nullptr;
 static HWND g_hCtxCategoryCombo  = nullptr;
+static HWND g_hCtxWindowCombo    = nullptr;
 
 // Forward declarations
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -496,7 +497,7 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
     SendMessageW(g_hBtnContextHistory, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
     // Category drop-down: narrows the context one-liner returned by the
-    // two buttons above to a single facet (Documents / Websites / Apps)
+    // two buttons above to a single facet (Files / Websites / Apps)
     // or shows the combined view (All).  Default = All.
     g_hCtxCategoryCombo = CreateWindowExW(0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
@@ -504,10 +505,30 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
         0, 0, 0, 0, hWnd, (HMENU)IDC_CTX_CATEGORY, hInstance, nullptr);
     SendMessageW(g_hCtxCategoryCombo, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"All");
-    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Documents");
+    SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Files");
     SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Websites");
     SendMessageW(g_hCtxCategoryCombo, CB_ADDSTRING, 0, (LPARAM)L"Apps");
     SendMessageW(g_hCtxCategoryCombo, CB_SETCURSEL, 0, 0); // default "All"
+
+    // Window-length drop-down: controls how far back the snapshot
+    // looks for activity.  Default = Last 15 minutes (which matches
+    // the rolling-history compute cadence).
+    g_hCtxWindowCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+        CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        0, 0, 0, 0, hWnd, (HMENU)IDC_CTX_WINDOW, hInstance, nullptr);
+    SendMessageW(g_hCtxWindowCombo, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 5 minutes");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 15 minutes");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 30 minutes");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 1 hour");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 2 hours");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 6 hours");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 24 hours");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 7 days");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 15 days");
+    SendMessageW(g_hCtxWindowCombo, CB_ADDSTRING, 0, (LPARAM)L"Last 30 days");
+    SendMessageW(g_hCtxWindowCombo, CB_SETCURSEL, 1, 0); // default "Last 15 minutes"
 
     LayoutControls(hWnd);
 }
@@ -608,16 +629,23 @@ void LayoutControls(HWND hWnd)
     MoveWindow(g_hBtnInferLookup, pad + editW + gap, y, lookupBtnW, 26, TRUE);
     y += 34;
 
-    // Recent context buttons + category selector
-    int ctxBtnW    = 200;
-    int ctxBtnW2   = 250;
-    int ctxComboW  = 130;
-    MoveWindow(g_hBtnRecentContext,  pad,                                  y, ctxBtnW,   30, TRUE);
-    MoveWindow(g_hBtnContextHistory, pad + ctxBtnW + gap,                  y, ctxBtnW2,  30, TRUE);
+    // Recent context buttons + category selector + window selector
+    int ctxBtnW       = 200;
+    int ctxBtnW2      = 250;
+    int ctxCatComboW  = 110;
+    int ctxWinComboW  = 160;
+    int xCursor = pad;
+    MoveWindow(g_hBtnRecentContext,  xCursor, y, ctxBtnW,   30, TRUE);
+    xCursor += ctxBtnW + gap;
+    MoveWindow(g_hBtnContextHistory, xCursor, y, ctxBtnW2,  30, TRUE);
+    xCursor += ctxBtnW2 + gap;
     // ComboBox visible height = field + drop-list; CB_DROPDOWNLIST uses
-    // the height parameter as the *combined* drop-list height.  Give it
-    // 6 lines so all four items fit without scrolling.
-    MoveWindow(g_hCtxCategoryCombo,  pad + ctxBtnW + gap + ctxBtnW2 + gap, y, ctxComboW, 30 + 6 * 20, TRUE);
+    // the height parameter as the *combined* drop-list height.  Give
+    // the category combo ~6 lines (4 items + room) and the window
+    // combo ~12 lines (10 items + room).
+    MoveWindow(g_hCtxCategoryCombo,  xCursor, y, ctxCatComboW, 30 + 6  * 20, TRUE);
+    xCursor += ctxCatComboW + gap;
+    MoveWindow(g_hCtxWindowCombo,    xCursor, y, ctxWinComboW, 30 + 12 * 20, TRUE);
     y += 38;
 
     // Response label
@@ -930,24 +958,50 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             OnInferenceButton(hWnd, wmId);
         else if (wmId == IDB_RECENT_CONTEXT)
         {
-            // Read current category from the dropdown and forward it
-            // to ContextInference; default is "all".
-            int sel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
+            // Read current category + window from the dropdowns and
+            // forward them to ContextInference; defaults are "all" /
+            // 15 minutes.
+            int catSel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
             const char* cat = "all";
-            if (sel == 1) cat = "documents";
-            else if (sel == 2) cat = "websites";
-            else if (sel == 3) cat = "apps";
-            std::string req = std::string("{\"op\":\"GetRecentContext\",\"category\":\"") + cat + "\"}";
+            if      (catSel == 1) cat = "files";
+            else if (catSel == 2) cat = "websites";
+            else if (catSel == 3) cat = "apps";
+            int winSel = (int)SendMessageW(g_hCtxWindowCombo, CB_GETCURSEL, 0, 0);
+            // Index mapping must match CreateUIControls dropdown order.
+            static const long long kWinSecs[] = {
+                300, 900, 1800, 3600, 7200, 21600, 86400,
+                604800, 1296000, 2592000
+            };
+            long long winSecs = 900; // default 15 min
+            if (winSel >= 0 && winSel < (int)(sizeof(kWinSecs)/sizeof(kWinSecs[0])))
+                winSecs = kWinSecs[winSel];
+            std::string req = std::string("{\"op\":\"GetRecentContext\",\"category\":\"")
+                            + cat
+                            + "\",\"window_seconds\":"
+                            + std::to_string(winSecs)
+                            + "}";
             SendApiQuery(hWnd, req);
         }
         else if (wmId == IDB_CONTEXT_HISTORY)
         {
-            int sel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
+            int catSel = (int)SendMessageW(g_hCtxCategoryCombo, CB_GETCURSEL, 0, 0);
             const char* cat = "all";
-            if (sel == 1) cat = "documents";
-            else if (sel == 2) cat = "websites";
-            else if (sel == 3) cat = "apps";
-            std::string req = std::string("{\"op\":\"GetRecentContexts\",\"count\":10,\"category\":\"") + cat + "\"}";
+            if      (catSel == 1) cat = "files";
+            else if (catSel == 2) cat = "websites";
+            else if (catSel == 3) cat = "apps";
+            int winSel = (int)SendMessageW(g_hCtxWindowCombo, CB_GETCURSEL, 0, 0);
+            static const long long kWinSecs[] = {
+                300, 900, 1800, 3600, 7200, 21600, 86400,
+                604800, 1296000, 2592000
+            };
+            long long winSecs = 900;
+            if (winSel >= 0 && winSel < (int)(sizeof(kWinSecs)/sizeof(kWinSecs[0])))
+                winSecs = kWinSecs[winSel];
+            std::string req = std::string("{\"op\":\"GetRecentContexts\",\"count\":10,\"category\":\"")
+                            + cat
+                            + "\",\"window_seconds\":"
+                            + std::to_string(winSecs)
+                            + "}";
             SendApiQuery(hWnd, req);
         }
         else

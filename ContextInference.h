@@ -43,26 +43,34 @@ class ForegroundMonitor;
 struct ContextSnapshot
 {
     int64_t       timestamp      = 0;   // When this snapshot was generated (epoch s).
-    int64_t       windowStartTs  = 0;   // Inclusive start of the 15-min window (epoch s).
-    int64_t       windowEndTs    = 0;   // Inclusive end of the 15-min window (epoch s).
+    int64_t       windowStartTs  = 0;   // Inclusive start of the lookback window (epoch s).
+    int64_t       windowEndTs    = 0;   // Inclusive end of the lookback window (epoch s).
+    int64_t       windowSeconds  = 0;   // Width of the lookback window (= windowEndTs - windowStartTs).
     std::string   oneLiner;             // Combined "All" one-liner summary.
     // Category-specific one-liners.  Each is composed independently from a
-    // *projection* of the same 15-min activity window so a consumer can ask
-    // "what documents has the user been in?", "what websites?", or "what
+    // *projection* of the same activity window so a consumer can ask
+    // "what files has the user been in?", "what websites?", or "what
     // apps?" without having to mentally separate them out of the combined
     // line.  All three use the same dynamic-clustering + theme-distillation
     // pipeline as the combined one -- only the input bag of titles differs.
-    //   * Documents -- non-browser content-editor apps (code editors, IDEs,
-    //                  Office apps, PDF readers, note-taking apps) +
+    //   * Files     -- ANY app where the user is engaged with a file: not
+    //                  just whitelisted document-editor apps but ALSO any
+    //                  app whose window title contains a recognized file
+    //                  extension (doc/docx in Word, xls/xlsx in Excel,
+    //                  ppt/pptx in PowerPoint, jpg/png/heic in Photos /
+    //                  IrfanView / Paint, cpp/h/json/txt in VS Code /
+    //                  Notepad++ / Sublime, pdf in any reader, etc.) plus
     //                  recently-opened file basenames from FileMonitor.
     //   * Websites  -- per-tab aggregation of BrowsingMonitor records.
-    //   * Apps      -- non-document, non-browser foreground apps (comms,
-    //                  terminals, media players, remote desktop, design
-    //                  tools, system tools).  Strictly disjoint from
-    //                  Documents and Websites.
+    //   * Apps      -- non-file, non-browser foreground apps: communications
+    //                  (Outlook / Teams / Slack / Discord / WhatsApp / Zoom),
+    //                  media players (Spotify / VLC), terminals, remote
+    //                  desktop, version-control UIs, and anything else that
+    //                  isn't engaged with a specific file.  Strictly
+    //                  disjoint from Files and Websites.
     // An empty string here means the category had no usable activity in the
     // window.
-    std::string   oneLinerDocuments;
+    std::string   oneLinerFiles;
     std::string   oneLinerWebsites;
     std::string   oneLinerApps;
     int           activityCount  = 0;   // Number of raw signals considered.
@@ -79,6 +87,7 @@ struct ContextSnapshot
         std::string app;          // Friendly app name e.g. "Visual Studio".
         std::string exe;          // exe basename e.g. "devenv.exe".
         std::string title;        // Cleaned document/tab title.
+        std::string rawTitle;     // Original window title before cleaning.
         int         focusSeconds = 0;
         int         pct          = 0; // % of total focus seconds.
         int         threadId     = 0; // Cluster ID this item belongs to (1-based).
@@ -111,15 +120,25 @@ struct ContextSnapshot
 //   * Stop()     -- joins the thread.
 //
 // Query API
-//   * GetRecentContext(category)         -- JSON: {"recent_context": <latest snapshot>}
-//   * GetRecentContexts(n, category)     -- JSON: {"recent_contexts":[...]} newest first.
-//   * ClearHistory()                     -- empties history (called on user "Clear").
+//   * GetRecentContext(category, windowSecs)
+//         JSON: {"recent_context": <snapshot>}  (single snapshot)
+//   * GetRecentContexts(n, category, windowSecs)
+//         JSON: {"recent_contexts":[...]} newest first.
+//   * ClearHistory() -- empties history (called on user "Clear").
 //
-// `category` is one of "all" (default), "documents", "websites", "apps".
-// When supplied (and not "all") the response's top-level `one_liner` field
-// is replaced with the matching per-category one-liner, and the three
-// `one_liner_documents` / `one_liner_websites` / `one_liner_apps` fields
-// are still emitted for callers that want the full breakdown.
+// `category` is one of "all" (default), "files", "websites", "apps".
+// When supplied (and not "all") the response carries ONLY that
+// category's one-liner (as `one_liner`); the other categories are
+// omitted from the response.  Backward-compat: the legacy value
+// "documents" is accepted and treated as "files".
+//
+// `windowSecs` is the activity lookback window in seconds (default
+// 15 * 60 = 900).  When the requested window equals the default and a
+// fresh cached snapshot is available, that cache is returned; for any
+// other window the snapshot is composed on demand against the
+// requested span.  For GetRecentContexts the rolling history is also
+// filtered by timestamp to only include entries whose snapshot
+// timestamp falls within the last `windowSecs`.
 //
 // History cap is 1440 (24 h at one snapshot per minute, with material-
 // change dedup the actual count is usually much smaller).
@@ -136,8 +155,11 @@ public:
     void Stop();
 
     void RunOnce();
-    std::string GetRecentContext(const std::string& category = "all");
-    std::string GetRecentContexts(int count, const std::string& category = "all");
+    std::string GetRecentContext (const std::string& category    = "all",
+                                  int64_t            windowSecs  = 0);
+    std::string GetRecentContexts(int                count,
+                                  const std::string& category    = "all",
+                                  int64_t            windowSecs  = 0);
     void ClearHistory();
 
 private:
@@ -175,7 +197,9 @@ private:
                            const std::vector<float>& b);
 
     void TimerLoop();
-    ContextSnapshot ComposeSnapshot();
+    // Compose a fresh snapshot covering the last `windowSecs` seconds of
+    // activity.  Pass 0 to use the default 15-minute window.
+    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0);
 
     // Decide whether `snap` is materially different from the last-appended
     // history entry.  Used to keep `GetRecentContexts` from returning rows

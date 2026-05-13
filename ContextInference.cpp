@@ -138,6 +138,18 @@ static const AppClass kAppClasses[] = {
     { L"spotify.exe",        "Spotify",           "Listening in"          },
     { L"vlc.exe",             "VLC",              "Watching in"           },
     { L"wmplayer.exe",       "Media Player",      "Listening in"          },
+    // Image viewers / light image editors -- feed the "Files" facet
+    // when the title carries a real image filename.
+    { L"photos.exe",                 "Photos",       "Viewing"            },
+    { L"microsoft.photos.exe",       "Photos",       "Viewing"            },
+    { L"irfanview.exe",              "IrfanView",    "Viewing"            },
+    { L"i_view64.exe",               "IrfanView",    "Viewing"            },
+    { L"i_view32.exe",               "IrfanView",    "Viewing"            },
+    { L"mspaint.exe",                "Paint",        "Editing image in"   },
+    { L"paint.exe",                  "Paint",        "Editing image in"   },
+    { L"paintdotnet.exe",            "Paint.NET",    "Editing image in"   },
+    { L"gimp.exe",                   "GIMP",         "Editing image in"   },
+    { L"gimp-2.10.exe",              "GIMP",         "Editing image in"   },
     // Dev tooling
     { L"git-bash.exe",       "Git Bash",          "Running commands in"   },
     { L"docker desktop.exe", "Docker Desktop",    "Working in"            },
@@ -201,43 +213,159 @@ static bool IsBoringExe(const std::wstring& exeLower)
     return false;
 }
 
-// True if this app's friendly name represents a *document app* — an
+// True if this app's friendly name represents a *file app* — an
 // editor / viewer / authoring tool whose foreground titles are
-// dominated by document, file, or canvas names.  This is the canonical
-// source of truth for the "Documents" facet of the per-category
-// one-liner.  Browsers are intentionally excluded (they feed the
-// "Websites" facet).  Comms / chat / meeting / terminal / streaming /
-// remote-desktop / VM tools all feed the "Apps" facet.
+// dominated by document, file, image, or canvas names.  This is one of
+// the signals for routing an activity to the "Files" facet of the
+// per-category one-liner; the other signal is title-based file-extension
+// detection (`TitleLooksLikeFileActivity` below) which catches
+// arbitrary apps whose window title includes a recognized filename
+// (e.g. `report.docx - WordPad`, `chart.xlsx - LibreOffice Calc`).
 //
-// Anything not in this set (including unrecognized apps that get the
-// generic "Working in" fallback verb) goes to Apps.  That keeps the
-// fallback from leaking unknown apps (WhatsApp UWP variants, MAUI
-// chat apps, random user-installed utilities) into the Documents
-// facet just because they happen to share a verb substring.
-static bool IsDocumentFriendlyName(const std::string& friendlyName)
+// Browsers are intentionally excluded (they feed the "Websites" facet).
+// Apps known to be communications, media, terminals, remote desktop, or
+// other non-file engagement go to the "Apps" facet via
+// `IsAppOnlyFriendlyName` below, even if their title happens to mention
+// a filename.
+static bool IsFileAppFriendlyName(const std::string& friendlyName)
 {
-    static const std::unordered_set<std::string> kDocApps = {
+    static const std::unordered_set<std::string> kFileApps = {
         // Code editors / IDEs
         "visual studio", "vs code", "notepad++", "sublime text",
         "atom", "intellij idea", "pycharm", "clion", "webstorm",
         "goland", "rubymine", "phpstorm", "rider", "datagrip",
         "android studio", "eclipse", "rstudio", "matlab",
         "notepad", "wordpad",
-        // Office authoring (not Outlook — that's comms)
+        // Office authoring (Outlook is communications -> Apps)
         "word", "excel", "powerpoint", "onenote", "access",
         "visio", "publisher",
         // PDF / document viewers
         "acrobat reader", "acrobat", "sumatra pdf", "foxit reader",
         // Notes / knowledge bases
         "notion", "obsidian", "evernote", "logseq",
-        // Design / authoring
+        // Design / image / video / 3D authoring
         "photoshop", "illustrator", "figma", "blender",
         "premiere pro", "after effects",
-        // Virtual "Document" entries injected from FileMonitor
-        "document",
+        // Image viewers / light editors
+        "photos", "irfanview", "paint", "paint.net", "gimp",
+        "windows photo viewer",
+        // Virtual entries injected from FileMonitor
+        "document", "file",
     };
     std::string lower = Utf8Lower(friendlyName);
-    return kDocApps.find(lower) != kDocApps.end();
+    return kFileApps.find(lower) != kFileApps.end();
+}
+
+// True if this app's friendly name represents a non-file engagement
+// app: communications (email / chat / video calls), media players,
+// terminals, remote desktop, version-control UIs.  These always go to
+// the "Apps" facet, even if their window title happens to contain a
+// filename token (e.g. a Teams chat message mentioning `report.pdf`).
+// This is the second leg of the disjoint Files / Apps partition.
+static bool IsAppOnlyFriendlyName(const std::string& friendlyName)
+{
+    static const std::unordered_set<std::string> kCommsAndSystem = {
+        // Email / chat / meetings
+        "outlook", "teams", "slack", "discord", "telegram",
+        "whatsapp", "signal", "skype for business",
+        "zoom", "webex",
+        // Media / streaming
+        "spotify", "vlc", "media player",
+        // Terminals (they show command lines, not document edits)
+        "windows terminal", "command prompt", "powershell", "console",
+        "git bash", "warp terminal",
+        // VMs / remote
+        "remote desktop", "vmware", "virtualbox",
+        // Containers / dev infra UIs
+        "docker desktop", "docker",
+        // Version control UIs (they show repos, not files-being-edited)
+        "github desktop", "sourcetree",
+    };
+    std::string lower = Utf8Lower(friendlyName);
+    return kCommsAndSystem.find(lower) != kCommsAndSystem.end();
+}
+
+// Heuristic: does this window title look like the user has a real file
+// open?  Detects "name.ext" patterns where `ext` is a known file
+// extension (documents, spreadsheets, slides, PDFs, images, code, data,
+// config) with a proper word boundary on both sides.  This lets us
+// route an activity to the "Files" facet even when the host app isn't
+// in the explicit file-app whitelist -- e.g. someone opens a `.psd1`
+// in a generic editor we don't recognize.
+static bool TitleLooksLikeFileActivity(const std::string& title)
+{
+    if (title.size() < 4) return false;
+    static const char* const kExts[] = {
+        // Documents
+        ".doc", ".docx", ".rtf", ".odt",
+        ".xls", ".xlsx", ".csv", ".tsv", ".ods",
+        ".ppt", ".pptx", ".odp",
+        ".pdf", ".epub", ".mobi",
+        ".txt", ".md", ".rst", ".tex", ".one",
+        // Images
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+        ".webp", ".heic", ".heif", ".raw", ".dng", ".cr2", ".nef",
+        ".psd", ".ai", ".eps", ".svg", ".ico",
+        // Audio / video (lighter; mostly captured via media players in Apps)
+        ".mp3", ".wav", ".flac", ".m4a", ".aac",
+        ".mp4", ".mkv", ".mov", ".avi", ".webm",
+        // Code / data / config
+        ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+        ".cs", ".java", ".kt", ".scala", ".groovy",
+        ".py", ".rb", ".pl", ".php", ".js", ".mjs", ".cjs",
+        ".jsx", ".ts", ".tsx",
+        ".go", ".rs", ".swift", ".m", ".mm", ".dart",
+        ".sh", ".bash", ".zsh", ".fish",
+        ".ps1", ".psm1", ".psd1",
+        ".html", ".htm", ".css", ".scss", ".sass", ".less",
+        ".xml", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+        ".sql", ".graphql", ".vue", ".svelte",
+        ".r", ".jl", ".lua", ".ex", ".exs", ".erl", ".hs", ".clj",
+        // Archives (someone is browsing/extracting a file)
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz",
+    };
+    // Lowercase ASCII inline (Utf8Lower is fine but this is hot enough).
+    std::string lo;
+    lo.reserve(title.size());
+    for (unsigned char c : title)
+        lo.push_back((c >= 'A' && c <= 'Z') ? char(c + 32) : char(c));
+
+    for (const char* ext : kExts)
+    {
+        size_t extLen = std::strlen(ext);
+        size_t pos = 0;
+        while ((pos = lo.find(ext, pos)) != std::string::npos)
+        {
+            size_t end = pos + extLen;
+            // Word boundary on RIGHT: next char must not be alphanumeric
+            // (so ".js" doesn't match inside ".jsonp" and ".c" doesn't
+            // match inside ".cpp").
+            bool rightBoundary = (end == lo.size()) ||
+                !((lo[end] >= 'a' && lo[end] <= 'z') ||
+                  (lo[end] >= '0' && lo[end] <= '9'));
+            // Word boundary on LEFT: char before the '.' must be a
+            // letter/digit/underscore/hyphen (a real filename character),
+            // and there must be at least 2 such chars before the dot.
+            bool leftBoundary = false;
+            if (pos >= 2)
+            {
+                char prev = lo[pos - 1];
+                if ((prev >= 'a' && prev <= 'z') ||
+                    (prev >= '0' && prev <= '9') ||
+                     prev == '_' || prev == '-')
+                {
+                    char prev2 = lo[pos - 2];
+                    if ((prev2 >= 'a' && prev2 <= 'z') ||
+                        (prev2 >= '0' && prev2 <= '9') ||
+                         prev2 == '_' || prev2 == '-' || prev2 == ' ')
+                        leftBoundary = true;
+                }
+            }
+            if (rightBoundary && leftBoundary) return true;
+            pos = end;
+        }
+    }
+    return false;
 }
 
 // Layer-1 lookup: exact basename match.  Returns nullptr if no override.
@@ -500,6 +628,7 @@ struct AppAgg
     int          totalFocusSecs = 0;
     int64_t      lastSeenTs     = 0;
     std::string  bestTitle;         // cleaned, ready for one-liner
+    std::string  rawTitle;          // original window title before cleaning
     bool         isBrowser      = false;
 };
 
@@ -1004,7 +1133,7 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
     // Append on material change: different one-liner (combined or any of
     // the per-category lines) OR different dominant app.
     if (snap.oneLiner          != prev.oneLiner)          return true;
-    if (snap.oneLinerDocuments != prev.oneLinerDocuments) return true;
+    if (snap.oneLinerFiles != prev.oneLinerFiles) return true;
     if (snap.oneLinerWebsites  != prev.oneLinerWebsites)  return true;
     if (snap.oneLinerApps      != prev.oneLinerApps)      return true;
     if (!snap.items.empty() && !prev.items.empty()
@@ -1017,18 +1146,21 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 // =====================================================================
 //  Snapshot composition
 // =====================================================================
-ContextSnapshot ContextInference::ComposeSnapshot()
+ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 {
+    if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
+
     ContextSnapshot snap;
     snap.timestamp     = static_cast<int64_t>(std::time(nullptr));
     snap.windowEndTs   = snap.timestamp;
-    snap.windowStartTs = snap.timestamp - CONTEXT_WINDOW_SECS;
+    snap.windowStartTs = snap.timestamp - windowSecs;
+    snap.windowSeconds = windowSecs;
 
     // ---- Gather raw signals ---------------------------------------
-    auto focus  = m_db->QueryAppFocusCustomSeconds(CONTEXT_WINDOW_SECS);
-    auto browse = m_db->QueryBrowsingCustomSeconds(CONTEXT_WINDOW_SECS);
-    auto apps   = m_db->QueryAppLaunchesCustomSeconds(CONTEXT_WINDOW_SECS);
-    auto files  = m_db->QueryFilesCustomSeconds(CONTEXT_WINDOW_SECS);
+    auto focus  = m_db->QueryAppFocusCustomSeconds(windowSecs);
+    auto browse = m_db->QueryBrowsingCustomSeconds(windowSecs);
+    auto apps   = m_db->QueryAppLaunchesCustomSeconds(windowSecs);
+    auto files  = m_db->QueryFilesCustomSeconds(windowSecs);
 
     std::unordered_set<std::string> sigs;
     if (!focus.empty())  sigs.insert("app_focus");
@@ -1110,6 +1242,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         {
             agg.lastSeenTs = f.timestampUtc;
             std::string title = WideToUtf8(f.windowTitle);
+            agg.rawTitle  = title;
             agg.bestTitle = CleanTitle(title, agg.friendlyName);
         }
     }
@@ -1136,6 +1269,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
             {
                 std::string t = WideToUtf8(b.title);
                 if (t.empty()) continue;
+                kv.second.rawTitle  = t;
                 kv.second.bestTitle = CleanTitle(t, kv.second.friendlyName);
                 break;
             }
@@ -1311,18 +1445,28 @@ ContextSnapshot ContextInference::ComposeSnapshot()
 
         // ---- Per-cluster theme extraction ----------------------------
         auto themeFor = [&](const Cluster& cl) -> std::string {
+            // freq         = total occurrences of a token across the cluster's titles
+            // titlesWith   = number of *distinct* titles in which the token appears
+            //                (used to suppress one-off mentions: a token seen in a
+            //                single title gets scored down vs. one that recurs
+            //                across multiple titles, which is the strongest signal
+            //                of an actual coherent theme).
             std::unordered_map<std::string, int>          freq;
+            std::unordered_map<std::string, int>          titlesWith;
             std::unordered_map<std::string, std::string>  bestSurface;
             std::vector<std::string>                      orderedLowers;
 
             for (size_t mi : cl.members)
             {
                 auto toks = ExtractContentTokens(bag[mi].bestTitle);
+                std::unordered_set<std::string> seenInTitle;
                 for (const auto& t : toks)
                 {
                     if (freq.find(t.lower) == freq.end())
                         orderedLowers.push_back(t.lower);
                     freq[t.lower] += 1;
+                    if (seenInTitle.insert(t.lower).second)
+                        titlesWith[t.lower] += 1;
                     auto& s = bestSurface[t.lower];
                     if (s.empty() ||
                        (s.size() == t.surface.size() && t.surface > s))
@@ -1330,6 +1474,8 @@ ContextSnapshot ContextInference::ComposeSnapshot()
                 }
             }
             if (orderedLowers.empty()) return std::string();
+
+            const size_t titleCount = cl.members.size();
 
             struct ScoredTok { std::string lower; double score; size_t firstIdx; };
             std::vector<ScoredTok> scored;
@@ -1350,15 +1496,33 @@ ContextSnapshot ContextInference::ComposeSnapshot()
             std::vector<std::string> candidates = orderedLowers;
             std::sort(candidates.begin(), candidates.end(),
                       [&](const std::string& a, const std::string& b){
+                          // Primary key: cross-title coverage.  Strongly
+                          // prefers tokens that recur across multiple titles
+                          // over high-frequency-but-single-title tokens
+                          // (which are usually random IDs, version numbers,
+                          // or status indicators that bloated one title).
+                          if (titlesWith[a] != titlesWith[b])
+                              return titlesWith[a] > titlesWith[b];
                           if (freq[a] != freq[b]) return freq[a] > freq[b];
                           return a < b;
                       });
-            if (candidates.size() > 8) candidates.resize(8);
+            if (candidates.size() > 10) candidates.resize(10);
 
             for (size_t ci = 0; ci < candidates.size(); ++ci)
             {
                 const std::string& lc = candidates[ci];
-                double s = static_cast<double>(freq[lc]);
+                // Base score: cross-title coverage dominates frequency.
+                // A token seen in 3 different titles outweighs one that
+                // appeared 5 times in one title.
+                double coverage = static_cast<double>(titlesWith[lc]);
+                double rawFreq  = static_cast<double>(freq[lc]);
+                double s = coverage * 2.0 + std::log1p(rawFreq);
+
+                // When the cluster has multiple titles, demote tokens
+                // that appear in only one of them (single-title noise).
+                if (titleCount >= 3 && titlesWith[lc] == 1)
+                    s *= 0.4;
+
                 if (m_modelReady && !cleanCentroid.empty())
                 {
                     std::vector<float> v = Embed(bestSurface[lc].empty() ? lc : bestSurface[lc]);
@@ -1381,32 +1545,59 @@ ContextSnapshot ContextInference::ComposeSnapshot()
                           return a.firstIdx < b.firstIdx;
                       });
 
+            // How many theme tokens to emit?  Category-mode bags are
+            // forced into one virtual cluster and tend to have many
+            // titles, so allow up to 3 themes when the bag is large
+            // enough.  Combined-"all" mode stays at 1-2 tokens.
+            size_t maxPicks = (categoryMode && titleCount >= 4) ? 3u : 2u;
+
             std::vector<std::string> picks;
-            picks.push_back(bestSurface[scored[0].lower].empty()
-                               ? scored[0].lower
-                               : bestSurface[scored[0].lower]);
-            if (scored.size() >= 2 && scored[1].score >= scored[0].score * 0.6)
-            {
-                const std::string& w1 = scored[0].lower;
-                const std::string& w2 = scored[1].lower;
-                if (w1.find(w2) == std::string::npos &&
-                    w2.find(w1) == std::string::npos)
+            auto surfaceOf = [&](const std::string& lc) {
+                return bestSurface[lc].empty() ? lc : bestSurface[lc];
+            };
+            auto wouldDuplicate = [&](const std::string& candLower) {
+                for (const auto& already : picks)
                 {
-                    picks.push_back(bestSurface[scored[1].lower].empty()
-                                       ? scored[1].lower
-                                       : bestSurface[scored[1].lower]);
+                    std::string al = AsciiLower(already);
+                    if (al.find(candLower) != std::string::npos ||
+                        candLower.find(al) != std::string::npos)
+                        return true;
                 }
+                return false;
+            };
+
+            if (!scored.empty())
+                picks.push_back(surfaceOf(scored[0].lower));
+
+            for (size_t k = 1; k < scored.size() && picks.size() < maxPicks; ++k)
+            {
+                if (scored[k].score < scored[0].score * 0.5) break;
+                if (wouldDuplicate(scored[k].lower)) continue;
+                picks.push_back(surfaceOf(scored[k].lower));
             }
 
-            if (picks.size() == 2)
+            // Re-order picks by first-appearance index in the original
+            // title stream so the theme reads more naturally.
+            if (picks.size() >= 2)
             {
-                size_t p0 = 0, p1 = 0;
-                for (size_t k = 0; k < orderedLowers.size(); ++k)
+                std::vector<size_t> idx(picks.size(), 0);
+                for (size_t pi = 0; pi < picks.size(); ++pi)
                 {
-                    if (orderedLowers[k] == scored[0].lower) p0 = k;
-                    if (orderedLowers[k] == scored[1].lower) p1 = k;
+                    std::string lo = AsciiLower(picks[pi]);
+                    for (size_t k = 0; k < orderedLowers.size(); ++k)
+                        if (orderedLowers[k] == lo) { idx[pi] = k; break; }
                 }
-                if (p1 < p0) std::swap(picks[0], picks[1]);
+                // Tiny insertion sort -- picks.size() <= 3.
+                for (size_t a = 1; a < picks.size(); ++a)
+                {
+                    size_t b = a;
+                    while (b > 0 && idx[b - 1] > idx[b])
+                    {
+                        std::swap(idx[b - 1], idx[b]);
+                        std::swap(picks[b - 1], picks[b]);
+                        --b;
+                    }
+                }
             }
 
             std::string outStr;
@@ -1486,14 +1677,14 @@ ContextSnapshot ContextInference::ComposeSnapshot()
                     // title (that's how the old "verbatim mish-mash"
                     // regression happened).  Use the dominant verb of
                     // the representative entry plus the friendlyName
-                    // (or, for the virtual "Document" / "Browser"
+                    // (or, for the virtual "File" / "Browser"
                     // friendly names, a more natural phrase).
                     const AppAgg& rep = bag[cl.repIdx];
                     std::string verb = rep.verb.empty() ? std::string("Using") : rep.verb;
                     if (!verb.empty() && verb[0] >= 'a' && verb[0] <= 'z')
                         verb[0] = char(verb[0] - 32);
-                    if (rep.friendlyName == "Document")
-                        p = "Working on documents";
+                    if (rep.friendlyName == "File")
+                        p = "Working on files";
                     else if (rep.friendlyName == "Browser")
                         p = "Browsing the web";
                     else
@@ -1517,7 +1708,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
                 // virtual AppAgg has friendlyName="Browser" — would
                 // render as "(across Browser, Browser & Browser)" and
                 // the Documents bag (where file-virt entries also share
-                // friendlyName="Document") would do the same.
+                // friendlyName="File") would do the same.
                 std::vector<std::string> uniqueNames;
                 uniqueNames.reserve(cl.members.size());
                 for (size_t mi : cl.members)
@@ -1552,11 +1743,39 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         };
 
         // ---- Adaptive top-N --------------------------------------
+        //
+        // For the combined "All" one-liner we want a coherent
+        // *summary* of what the user is actually doing, not a kitchen
+        // sink of every little cluster.  Three guard rails:
+        //
+        //   1. Hard cap at 3 clusters in the head.  Anything beyond is
+        //      collapsed into a trailing "+ N other thread(s)".
+        //   2. Drop clusters whose focus contribution is < 5% of the
+        //      total -- these are typically a tab the user glanced at
+        //      for a few seconds and are pure noise.
+        //   3. Stop once we hit ONE_LINER_BUDGET (180 chars) or 80%
+        //      cumulative focus coverage (the prior behaviour).
+        //
+        // In category mode we always force every entry into one
+        // cluster, so guard rails 1 & 2 are no-ops there.
+        const size_t kMaxClustersHead     = 3;
+        const int    kMinClusterPctOfFocus = 5;
         std::string oneLiner;
         int    covered  = 0;
         size_t included = 0;
         for (size_t i = 0; i < clusters.size(); ++i)
         {
+            if (!categoryMode)
+            {
+                if (included >= kMaxClustersHead) break;
+                if (included >= 1 && bagTotalFocus > 0)
+                {
+                    int clusterPct =
+                        static_cast<int>((clusters[i].totalFocus * 100LL)
+                                         / bagTotalFocus);
+                    if (clusterPct < kMinClusterPctOfFocus) continue;
+                }
+            }
             std::string phrase = clusterPhrase(clusters[i]);
             std::string candidate = oneLiner.empty()
                 ? phrase
@@ -1599,6 +1818,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         it.app          = ranked[i].friendlyName;
         it.exe          = ExeBasenameUtf8(ToLower(ranked[i].exeName));
         it.title        = ranked[i].bestTitle;
+        it.rawTitle     = ranked[i].rawTitle;
         it.focusSeconds = ranked[i].totalFocusSecs;
         it.pct          = totalFocusSecs > 0
             ? static_cast<int>((ranked[i].totalFocusSecs * 100LL) / totalFocusSecs)
@@ -1648,52 +1868,56 @@ ContextSnapshot ContextInference::ComposeSnapshot()
 
     // -----------------------------------------------------------------
     // Per-category one-liners.  Each is an *independent* projection of
-    // the same 15-min activity window, composed through the same
-    // pipeline above.  A consumer picks one of {all, documents,
-    // websites, apps} via the dropdown to narrow the surface.
+    // the same activity window, composed through the same pipeline
+    // above.  A consumer picks one of {all, files, websites, apps} via
+    // the dropdown to narrow the surface.
     //
-    // Categorization rules:
+    // Categorization rules (in priority order, first match wins):
     //   * Browsers (isBrowser=true) feed Websites only.
-    //   * Document apps -- code editors, IDEs, Office, PDF readers,
-    //     note apps, design tools that edit content -- feed Documents
-    //     only.
-    //   * Everything else (comms, terminals, media players, remote
-    //     desktop, system tools) feeds Apps only.
-    // Documents/Websites/Apps therefore form a strict partition of
+    //   * Apps known to be comms / media / terminals / remote / VCS UI
+    //     (`IsAppOnlyFriendlyName`) feed Apps only -- even if the title
+    //     mentions a filename (e.g. a Teams chat message about a PDF).
+    //   * Files apps -- editors, IDEs, Office, PDF readers, note apps,
+    //     image viewers / editors, design tools (`IsFileAppFriendlyName`)
+    //     -- feed Files.
+    //   * Generic / unrecognized apps with a window title that contains
+    //     a recognized file extension (`TitleLooksLikeFileActivity`)
+    //     also feed Files -- this catches arbitrary apps the user has
+    //     opened a file in (e.g. `report.docx - LibreOffice Writer`,
+    //     `notes.md - GenericMarkdownApp`).
+    //   * Everything else feeds Apps.
+    // Files / Websites / Apps therefore form a strict partition of
     // ranked; an app that is in one is never in another.
     // -----------------------------------------------------------------
-    // Categorize ranked entries into Documents vs Apps.  Browsers feed
-    // Websites only.  Documents is an explicit whitelist of editor /
-    // viewer / authoring app friendly names (see `IsDocumentFriendlyName`
-    // near the top of the file) — *not* a verb-pattern match, because
-    // the catch-all fallback verb for unrecognized apps is "Working
-    // in" which would otherwise sweep WhatsApp UWP, MAUI chat apps,
-    // and any other unknown app into Documents.
-    auto isDocumentApp = [](const AppAgg& a) -> bool {
+    auto isFileApp = [](const AppAgg& a) -> bool {
         if (a.isBrowser) return false;
-        return IsDocumentFriendlyName(a.friendlyName);
+        if (IsAppOnlyFriendlyName(a.friendlyName)) return false;
+        if (IsFileAppFriendlyName(a.friendlyName)) return true;
+        if (TitleLooksLikeFileActivity(a.bestTitle)) return true;
+        if (TitleLooksLikeFileActivity(a.rawTitle))  return true;
+        return false;
     };
 
-    std::vector<AppAgg> rankedDocs;
+    std::vector<AppAgg> rankedFiles;
     std::vector<AppAgg> rankedApps;
-    rankedDocs.reserve(ranked.size());
+    rankedFiles.reserve(ranked.size());
     rankedApps.reserve(ranked.size());
     for (const auto& a : ranked)
     {
         if (a.isBrowser) continue;
-        if (isDocumentApp(a)) rankedDocs.push_back(a);
-        else                  rankedApps.push_back(a);
+        if (isFileApp(a)) rankedFiles.push_back(a);
+        else              rankedApps.push_back(a);
     }
 
-    // Augment Documents with recently-touched file basenames captured
-    // by FileMonitor.  This catches docs that the user looked at
+    // Augment Files with recently-touched file basenames captured
+    // by FileMonitor.  This catches files that the user looked at
     // briefly (so they never accumulated significant focus seconds in
-    // an editor) but that still represent a "document the user was
+    // an editor) but that still represent a "file the user was
     // on".  Skip noisy extensions (.dll/.log/.tmp/.bak) and any
-    // basenames already present in rankedDocs (case-insensitive).
+    // basenames already present in rankedFiles (case-insensitive).
     {
         std::unordered_set<std::string> seenLowered;
-        for (const auto& a : rankedDocs)
+        for (const auto& a : rankedFiles)
             seenLowered.insert(AsciiLower(a.bestTitle));
 
         struct FileVirt { std::string base; int64_t ts; int hits; };
@@ -1731,15 +1955,16 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         for (auto& v : fv)
         {
             AppAgg agg{};
-            agg.friendlyName    = "Document";
+            agg.friendlyName    = "File";
             agg.verb            = "Editing";
             agg.bestTitle       = v.base;
+            agg.rawTitle        = v.base;
             agg.totalFocusSecs  = (std::max)(5, v.hits * 5);
             agg.lastSeenTs      = v.ts;
             agg.isBrowser       = false;
-            rankedDocs.push_back(std::move(agg));
+            rankedFiles.push_back(std::move(agg));
         }
-        std::sort(rankedDocs.begin(), rankedDocs.end(),
+        std::sort(rankedFiles.begin(), rankedFiles.end(),
                   [](const AppAgg& a, const AppAgg& b){
                       if (a.totalFocusSecs != b.totalFocusSecs)
                           return a.totalFocusSecs > b.totalFocusSecs;
@@ -1766,6 +1991,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
             if (agg.bestTitle.empty())
             {
                 agg.bestTitle    = clean;
+                agg.rawTitle     = raw;
                 agg.friendlyName = "Browser";
                 agg.verb         = "Reading";
                 agg.isBrowser    = true;
@@ -1784,7 +2010,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    snap.oneLinerDocuments = composeOneLinerFromBag(rankedDocs, /*categoryMode=*/true).text;
+    snap.oneLinerFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).text;
     snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb,  /*categoryMode=*/true).text;
     snap.oneLinerApps      = composeOneLinerFromBag(rankedApps, /*categoryMode=*/true).text;
 
@@ -1817,30 +2043,31 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     //     emitted (so a single "All" round-trip carries the data the
     //     UI dropdown can switch between without re-querying).
     //
-    //   * category == "documents" / "websites" / "apps": only the
+    //   * category == "files" / "websites" / "apps": only the
     //     matching per-category line is emitted -- as the top-level
     //     `one_liner`.  The other two categories and the combined
     //     "all" line are *not* serialized, keeping the response
     //     focused on what the consumer asked for.
     std::string topLine = s.oneLiner;
-    if      (category == "documents") topLine = s.oneLinerDocuments;
+    if      (category == "files")     topLine = s.oneLinerFiles;
     else if (category == "websites")  topLine = s.oneLinerWebsites;
     else if (category == "apps")      topLine = s.oneLinerApps;
 
     std::ostringstream o;
     o << "{"
-      << "\"timestamp\":"       << s.timestamp
-      << ",\"window_start\":"   << s.windowStartTs
-      << ",\"window_end\":"     << s.windowEndTs
-      << ",\"category\":\""     << EscapeJson(category) << "\""
-      << ",\"one_liner\":\""    << EscapeJson(topLine)  << "\"";
+      << "\"timestamp\":"        << s.timestamp
+      << ",\"window_start\":"    << s.windowStartTs
+      << ",\"window_end\":"      << s.windowEndTs
+      << ",\"window_seconds\":"  << s.windowSeconds
+      << ",\"category\":\""      << EscapeJson(category) << "\""
+      << ",\"one_liner\":\""     << EscapeJson(topLine)  << "\"";
 
     if (category == "all")
     {
         // Emit all three per-category lines alongside the combined one.
-        o << ",\"one_liner_documents\":\"" << EscapeJson(s.oneLinerDocuments) << "\""
-          << ",\"one_liner_websites\":\""  << EscapeJson(s.oneLinerWebsites)  << "\""
-          << ",\"one_liner_apps\":\""      << EscapeJson(s.oneLinerApps)      << "\"";
+        o << ",\"one_liner_files\":\""    << EscapeJson(s.oneLinerFiles)    << "\""
+          << ",\"one_liner_websites\":\"" << EscapeJson(s.oneLinerWebsites) << "\""
+          << ",\"one_liner_apps\":\""     << EscapeJson(s.oneLinerApps)     << "\"";
     }
 
     o << ",\"activity_count\":" << s.activityCount
@@ -1860,11 +2087,12 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     {
         if (i) o << ",";
         const auto& it = s.items[i];
-        o << "{\"app\":\""  << EscapeJson(it.app)
-          << "\",\"exe\":\"" << EscapeJson(it.exe)
-          << "\",\"title\":\"" << EscapeJson(it.title)
+        o << "{\"app\":\""        << EscapeJson(it.app)
+          << "\",\"exe\":\""      << EscapeJson(it.exe)
+          << "\",\"title\":\""    << EscapeJson(it.title)
+          << "\",\"raw_title\":\""<< EscapeJson(it.rawTitle)
           << "\",\"focus_seconds\":" << it.focusSeconds
-          << ",\"pct\":" << it.pct
+          << ",\"pct\":"  << it.pct
           << ",\"thread_id\":" << it.threadId << "}";
     }
     o << "]}";
@@ -1872,41 +2100,108 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
 }
 
 // Normalize the requested category to one of the four known values.
-// Empty / unknown / "all" all map to "all".
+// Empty / unknown / "all" all map to "all".  The legacy value
+// "documents" is accepted as a backward-compat alias for "files".
 static std::string NormalizeCategory(const std::string& c)
 {
-    if (c == "documents" || c == "websites" || c == "apps") return c;
+    if (c == "files" || c == "websites" || c == "apps") return c;
+    if (c == "documents") return "files";    // backward compatibility
     return "all";
 }
 
-std::string ContextInference::GetRecentContext(const std::string& category)
+// Acceptable window lengths (seconds).  The UI dropdown surfaces
+// exactly these values; any request outside this set is clamped to
+// the nearest valid value, defaulting to 15 min for empty / invalid.
+static const int64_t kAllowedWindowSecs[] = {
+    300,        //   5 min
+    900,        //  15 min  (default)
+    1800,       //  30 min
+    3600,       //   1 h
+    7200,       //   2 h
+    21600,      //   6 h
+    86400,      //  24 h
+    604800,     //   7 d
+    1296000,    //  15 d
+    2592000     //  30 d
+};
+
+static int64_t NormalizeWindowSecs(int64_t requested)
+{
+    if (requested <= 0) return 900;
+    // Snap to the nearest allowed value (ratio-based -- closer to log
+    // scale than linear so we don't bias toward the bigger windows).
+    int64_t best = 900;
+    double  bestRatio = 1e18;
+    for (int64_t v : kAllowedWindowSecs)
+    {
+        double r = (requested > v)
+            ? static_cast<double>(requested) / static_cast<double>(v)
+            : static_cast<double>(v) / static_cast<double>(requested);
+        if (r < bestRatio) { bestRatio = r; best = v; }
+    }
+    return best;
+}
+
+std::string ContextInference::GetRecentContext(const std::string& category,
+                                               int64_t            windowSecs)
 {
     std::string cat = NormalizeCategory(category);
+    int64_t     win = NormalizeWindowSecs(windowSecs);
+
+    // For the default window we serve the cached `m_latest` snapshot
+    // (refreshed by the 60-second timer).  For any non-default window
+    // we compose fresh on demand against the requested span.
+    ContextSnapshot fresh;
+    bool            useFresh = false;
+    if (win != 900 && m_db)
+    {
+        fresh    = ComposeSnapshot(win);
+        useFresh = true;
+    }
+
     std::lock_guard<std::mutex> lk(m_mutex);
     std::ostringstream o;
     o << "{\"recent_context\":";
-    if (m_haveLatest)
+    if (useFresh)
+        o << SnapshotToJsonObject(fresh, cat);
+    else if (m_haveLatest)
         o << SnapshotToJsonObject(m_latest, cat);
     else
         o << "null";
     o << ",\"category\":\"" << cat << "\""
+      << ",\"window_seconds\":" << win
       << ",\"history_count\":" << m_history.size() << "}";
     return o.str();
 }
 
-std::string ContextInference::GetRecentContexts(int count, const std::string& category)
+std::string ContextInference::GetRecentContexts(int                count,
+                                                const std::string& category,
+                                                int64_t            windowSecs)
 {
     if (count <= 0)  count = 10;
     if (count > 200) count = 200;
     std::string cat = NormalizeCategory(category);
+    int64_t     win = NormalizeWindowSecs(windowSecs);
 
     std::lock_guard<std::mutex> lk(m_mutex);
+
+    // Filter history by timestamp: only return snapshots whose
+    // `timestamp` falls within the requested lookback window.  This
+    // gives the natural "show me what I've been doing in the last 1 h
+    // / 24 h / 7 d / ..." semantics regardless of the underlying
+    // per-snapshot compute window (which stays at the default 15 min
+    // for the rolling history thread).
+    int64_t now    = static_cast<int64_t>(std::time(nullptr));
+    int64_t cutoff = now - win;
 
     std::vector<const ContextSnapshot*> latestFirst;
     for (auto it = m_history.rbegin();
          it != m_history.rend() && (int)latestFirst.size() < count;
          ++it)
+    {
+        if (it->timestamp < cutoff) break;
         latestFirst.push_back(&*it);
+    }
 
     std::ostringstream o;
     o << "{\"recent_contexts\":[";
@@ -1916,9 +2211,10 @@ std::string ContextInference::GetRecentContexts(int count, const std::string& ca
         o << SnapshotToJsonObject(*latestFirst[i], cat);
     }
     o << "],\"category\":\"" << cat << "\""
-      << ",\"returned\":" << latestFirst.size()
+      << ",\"window_seconds\":" << win
+      << ",\"returned\":"  << latestFirst.size()
       << ",\"history_count\":" << m_history.size()
-      << ",\"requested\":"     << count << "}";
+      << ",\"requested\":" << count << "}";
     return o.str();
 }
 
