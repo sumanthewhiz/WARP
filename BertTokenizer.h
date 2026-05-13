@@ -8,7 +8,10 @@
 #include <sstream>
 #include <cctype>
 
-// Minimal BERT WordPiece tokenizer for all-MiniLM-L6-v2.
+// Minimal BERT WordPiece tokenizer.  Compatible with both
+// `BAAI/bge-small-en-v1.5` (the current default model) and the legacy
+// `sentence-transformers/all-MiniLM-L6-v2` -- both share the standard
+// `bert-base-uncased` 30 522-entry WordPiece vocabulary.
 // Loads vocab.txt once, then tokenizes text into token IDs
 // with [CLS] / [SEP] framing.
 class BertTokenizer

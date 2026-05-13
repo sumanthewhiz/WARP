@@ -273,6 +273,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="CopyOnnxRuntime" AfterTargets="Build">
     <Copy SourceFiles="$(OrtRuntimeDir)\onnxruntime.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(ProjectDir)models\bge-small.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\bge-small.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\minilm.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\minilm.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\vocab.txt" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\vocab.txt')" />
   </Target>

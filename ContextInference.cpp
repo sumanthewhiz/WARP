@@ -35,7 +35,7 @@ static const int64_t HISTORY_HEARTBEAT_SECS = 5 * 60;
 static const size_t  MAX_ITEMS         = 5;
 static const size_t  ONE_LINER_BUDGET  = 180; // characters
 
-// MiniLM embedding pipeline constants.
+// Sentence-encoder embedding pipeline constants.
 static const int     EMBED_DIM         = 384;
 static const int     MAX_SEQ_LEN       = 128;
 
@@ -507,7 +507,8 @@ struct AppAgg
 //  Semantic theme extraction.  Given the cleaned per-app titles in a
 //  cluster, distill 1-2 *content* tokens that describe what the user is
 //  doing -- not the verbatim title text.  No fixed taxonomy: the theme
-//  emerges from the actual titles.  MiniLM is used (when available) to
+//  emerges from the actual titles.  The sentence-encoder (BGE-small or
+//  the legacy MiniLM, see Init) is used (when available) to
 //  weight tokens by semantic centrality to the cluster.
 // =====================================================================
 
@@ -787,7 +788,10 @@ ContextInference::~ContextInference()
 }
 
 // =====================================================================
-//  Init -- load MiniLM model + tokenizer if available.  This is best-effort:
+//  Init -- load the sentence-encoder model + tokenizer if available.
+//  Prefers BAAI/bge-small-en-v1.5 (`bge-small.onnx`); falls back to
+//  the legacy all-MiniLM-L6-v2 (`minilm.onnx`) if BGE isn't present.
+//  This is best-effort:
 //  if any step fails the engine still runs in deterministic-only mode.
 // =====================================================================
 bool ContextInference::Init(const std::wstring& modelsDir)
@@ -799,7 +803,25 @@ bool ContextInference::Init(const std::wstring& modelsDir)
     if (!m_tokenizer.Load(vocabPath))
         return true;  // graceful degrade
 
-    std::wstring modelPath = modelsDir + L"\\minilm.onnx";
+    std::wstring modelPath  = modelsDir + L"\\bge-small.onnx";
+    std::string  modelLabel = "bge-small-en-v1.5";
+
+    // Backward compat: if the new BGE model file isn't present, fall
+    // back to the legacy MiniLM model (same 384 dim, same tokenizer,
+    // same call surface).  Lets existing installations keep working
+    // through an in-place binary upgrade until the user re-downloads.
+    {
+        DWORD attrs = GetFileAttributesW(modelPath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            std::wstring legacy = modelsDir + L"\\minilm.onnx";
+            if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                modelPath  = std::move(legacy);
+                modelLabel = "all-MiniLM-L6-v2";
+            }
+        }
+    }
 
     try
     {
@@ -822,11 +844,14 @@ bool ContextInference::Init(const std::wstring& modelsDir)
     }
 
     m_modelReady = true;
+    m_modelName  = std::move(modelLabel);
     return true;
 }
 
 // =====================================================================
-//  Sentence embedding with MiniLM (384-dim, mean-pool + L2-normalize).
+//  Sentence embedding (384-dim, mean-pool + L2-normalize).  Works with
+//  either BGE-small-en-v1.5 or all-MiniLM-L6-v2 -- both export the same
+//  tensor shape and tokenization.
 //  Empty vector if the model isn't loaded.
 // =====================================================================
 std::vector<float> ContextInference::Embed(const std::string& text)
@@ -1145,7 +1170,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
     // Composable one-liner builder.  Takes a bag of AppAgg entries (any
     // projection of the activity stream -- the full ranked list, the
     // doc-editor subset, the per-tab browsing list, etc.) and produces
-    // the same `<verb> <Theme>` one-liner using the existing MiniLM
+    // the same `<verb> <Theme>` one-liner using the existing sentence-encoder
     // clustering + theme-distillation pipeline.  Used four times below
     // to build the combined one-liner plus the three per-category ones
     // (Documents / Websites / Apps).
@@ -1178,7 +1203,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
         if (categoryMode)
         {
             // Per-category bags (Documents / Websites / Apps) tend to be
-            // small (2-16 entries) and topic-diverse.  MiniLM clustering
+            // small (2-16 entries) and topic-diverse.  Sentence-encoder clustering
             // on such a bag produces mostly singleton clusters whose
             // themes degrade to brand-name-only token sets — yielding
             // verbatim-title soup once the per-cluster fallback to
@@ -1565,7 +1590,7 @@ ContextSnapshot ContextInference::ComposeSnapshot()
     snap.threadCount       = allBuild.threadCount;
     std::vector<int>& clusterOf = allBuild.clusterOf;
     if (clusterOf.empty()) clusterOf.assign(ranked.size(), -1);
-    snap.model = m_modelReady ? "all-MiniLM-L6-v2" : "deterministic";
+    snap.model = m_modelReady ? m_modelName : std::string("deterministic");
 
     // ---- Structured breakdown (per-app top 5) ---------------------
     for (size_t i = 0; i < ranked.size() && snap.items.size() < MAX_ITEMS; ++i)

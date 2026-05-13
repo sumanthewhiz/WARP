@@ -550,7 +550,7 @@ Each section has:
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "all-MiniLM-L6-v2",
+    "model": "bge-small-en-v1.5",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
@@ -574,10 +574,10 @@ Each section has:
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"all-MiniLM-L6-v2"` when the ONNX sentence-encoder is loaded and clustering is active; `"deterministic"` when the model files were not found and the engine is composing the one-liner per-app. |
+| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded and clustering is active; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found and the engine is composing the one-liner per-app. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; equals the number of items when `model == "deterministic"`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the MiniLM clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, focus_seconds, pct, thread_id }`. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(with X & Y …)`. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
@@ -587,10 +587,10 @@ Each section has:
   runs returns the result from the most recent completed cycle.
 - Snapshots are stored in memory (not persisted to disk). Restarting WARP
   clears the history.
-- The composer uses MiniLM for **dynamic clustering, not bucket matching** —
+- The composer uses the sentence-encoder for **dynamic clustering, not bucket matching** —
   there is no fixed taxonomy of topics. Each cluster is induced from the
-  actual document, tab, and app titles in the window. If `models/minilm.onnx`
-  + `models/vocab.txt` are missing the engine still runs and emits
+  actual document, tab, and app titles in the window. If `models/bge-small.onnx`
+  (or the legacy `models/minilm.onnx`) + `models/vocab.txt` are missing the engine still runs and emits
   `"model": "deterministic"`; consumers should treat both modes as a single
   interface and just read `one_liner` / `items` / `thread_id` as documented.
 
@@ -608,7 +608,7 @@ Each section has:
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
       "confidence": 0.84,
-      "model": "all-MiniLM-L6-v2",
+      "model": "bge-small-en-v1.5",
       "thread_count": 3,
       "signal_types": ["focus", "file", "browsing"],
       "items": [ /* … same shape as GetRecentContext … */ ]
@@ -622,7 +622,7 @@ Each section has:
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
       "confidence": 0.71,
-      "model": "all-MiniLM-L6-v2",
+      "model": "bge-small-en-v1.5",
       "thread_count": 2,
       "signal_types": ["focus", "browsing"],
       "items": [ /* … */ ]
@@ -865,7 +865,9 @@ For short-term memory or context drift over time, call:
 Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
-The composer uses MiniLM (`all-MiniLM-L6-v2`) for **dynamic semantic
+The composer uses a BERT WordPiece sentence-encoder (`BAAI/bge-small-en-v1.5`
+by default, with `sentence-transformers/all-MiniLM-L6-v2` supported as a
+transparent backward-compat fallback) for **dynamic semantic
 clustering** *and* **theme distillation** — *not* mapping to a fixed
 taxonomy. Two activities are merged into one *thread of work* iff their
 embeddings are similar to each other (cosine ≥ 0.65), and within each
@@ -1637,7 +1639,54 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.2.*
+*This documentation describes WARP API version 5.4.*
+
+*Changes from v5.3:*
+- *Switched the default sentence-encoder model from
+  `sentence-transformers/all-MiniLM-L6-v2` to
+  `BAAI/bge-small-en-v1.5`. Same 384-dim embedding, same BERT WordPiece
+  tokenizer (no code-side tokenizer change), but **+6.5 MTEB Clustering**
+  (42.4 → 48.9) — directly relevant to the short-text-clustering +
+  theme-distillation workload that drives the `one_liner` and the
+  per-category facets. ~33 M params (vs. 22 M for MiniLM), ~130 MB on
+  disk (vs. ~86 MB).*
+- *The `model` field in `GetRecentContext` / `GetRecentContexts`
+  responses now reads `"bge-small-en-v1.5"` (or `"all-MiniLM-L6-v2"`
+  when the legacy model is the only one present, or `"deterministic"`
+  when no model file is present).*
+- *Backward-compatible runtime: `ContextInference::Init()` looks for
+  `models/bge-small.onnx` first and transparently falls back to
+  `models/minilm.onnx` if BGE isn't present. Existing installations
+  with only the legacy model file keep working without re-download.*
+- *Build pipeline updated: `models/bge-small.onnx` is downloaded from
+  HuggingFace at CI build time and copied next to `WARP!.exe` by the
+  `CopyOnnxRuntime` MSBuild target. (`models/minilm.onnx` is still
+  copied if present, for upgrade scenarios.)*
+- *No request- or response-shape changes. Existing API consumers see
+  only the `model` string change.*
+
+*Changes from v5.2:*
+- *Per-category one-liner facets. In addition to the combined `one_liner`,
+  every snapshot now carries three independent one-liners —
+  `one_liner_documents` (composed from non-browser document apps + recent
+  file basenames), `one_liner_websites` (composed from browser tab
+  titles), and `one_liner_apps` (composed from comms, terminals, media
+  players, remote-desktop, and other non-document, non-browser apps).
+  The three categories form a strict partition of the activity stream,
+  so no app contributes to two facets.*
+- *New optional `category` request parameter on `GetRecentContext` and
+  `GetRecentContexts` (`"all"` | `"documents"` | `"websites"` | `"apps"`;
+  default `"all"`). When non-`"all"`, the top-level `one_liner` field is
+  mirrored from the matching per-category field so raw-JSON consumers
+  see a focused response; the other three are always still emitted.*
+- *Response also echoes the resolved `category` value at both the
+  envelope and the snapshot level.*
+- *UI: a category dropdown (`All` / `Documents` / `Websites` / `Apps`,
+  default `All`) sits next to the *Show Recent Context* / *Show Context
+  History* buttons and is plumbed through to the JSON request.*
+- *History dedup widened: a new snapshot is now appended on a material
+  change in **any** of the four one-liner fields (previously only the
+  combined one).*
 
 *Changes from v5.1:*
 - *The `one_liner` is now a **semantic description** of what the user
@@ -1647,7 +1696,7 @@ CREATE INDEX idx_inference_version    ON inference(version);
   stop-word, file-extension, and brand/app-name lists (also matched
   on the un-split form, so `YouTube` doesn't leak as `Tube`), and the
   top 1-2 surviving tokens — scored by `frequency × (1 + cosine-to-
-  cluster-centroid)` when MiniLM is loaded — become the cluster's
+  cluster-centroid)` when the sentence-encoder is loaded — become the cluster's
   **theme phrase**. The activity verb is chosen from a small fixed
   vocabulary (`Working on`, `Reviewing`, `Reading about`,
   `Researching`, `Discussing`, `Watching`, `Designing`, `Reading`)
@@ -1665,7 +1714,9 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 *Changes from v5.0:*
 - ***Additive:*** *`GetRecentContext` response gains three fields:
-  `model` (`"all-MiniLM-L6-v2"` or `"deterministic"`), `thread_count`
+  `model` (`"all-MiniLM-L6-v2"` or `"deterministic"` at this version;
+  see v5.4 notes for the BGE-small default introduced later),
+  `thread_count`
   (number of clustered threads of work), and a per-item `thread_id`
   (1-based cluster ID, items sharing it were merged). All previous fields
   are unchanged in shape — v5.0 consumers continue to work.*

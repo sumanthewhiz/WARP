@@ -4,7 +4,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
 [![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
-[![Inference](https://img.shields.io/badge/inference-MiniLM%20%C2%B7%20dynamic%20clustering-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
+[![Inference](https://img.shields.io/badge/inference-BGE--small%20%C2%B7%20dynamic%20clustering-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
 
 WARP is a lightweight Windows desktop application that silently monitors file/folder
 activity, application launches, foreground app focus (with window titles and dwell
@@ -60,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner. When the optional **MiniLM (`all-MiniLM-L6-v2`) ONNX model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `frequency × (1 + cosine-to-clean-cluster-centroid)`; the top 1–2 tokens become the cluster's theme phrase. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"all-MiniLM-L6-v2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown (verbatim titles preserved) with per-item `thread_id`. **Per-category facets:** in addition to the combined one-liner, the snapshot also carries three independent one-liners — `one_liner_documents` (derived only from documents being edited/viewed in non-browser document apps, augmented with file basenames from the file monitor), `one_liner_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `one_liner_apps` (derived only from non-document, non-browser apps such as comms, terminals, media players, remote-desktop) — each composed through the same MiniLM cluster→theme pipeline. The UI dropdown next to the *Show Recent Context* / *Show Context History* buttons (default **All**) lets the user pick which facet to surface. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` parameter); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the last 15-minute window are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single 15-minute deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner. When the optional **BGE-small (`BAAI/bge-small-en-v1.5`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. (The legacy `all-MiniLM-L6-v2` ONNX is automatically picked up as a backward-compatibility fallback when `bge-small.onnx` isn't present; both produce 384-dim embeddings and share the same BERT WordPiece tokenizer.) For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `frequency × (1 + cosine-to-clean-cluster-centroid)`; the top 1–2 tokens become the cluster's theme phrase. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown (verbatim titles preserved) with per-item `thread_id`. **Per-category facets:** in addition to the combined one-liner, the snapshot also carries three independent one-liners — `one_liner_documents` (derived only from documents being edited/viewed in non-browser document apps, augmented with file basenames from the file monitor), `one_liner_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `one_liner_apps` (derived only from non-document, non-browser apps such as comms, terminals, media players, remote-desktop) — each composed through the same sentence-encoder cluster→theme pipeline. The UI dropdown next to the *Show Recent Context* / *Show Context History* buttons (default **All**) lets the user pick which facet to surface. Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` parameter); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -117,7 +117,7 @@ flowchart TB
         EC["EventContext<br/><sub>per-event payload</sub>"]:::storage
         DB[("ActivityDatabase<br/><sub>SQLite WAL · activity.db</sub>")]:::storage
         IE["InferenceEngine<br/><sub>confidence-weighted REAL counters</sub>"]:::storage
-        TI["ContextInference<br/><sub>MiniLM clustering · 60-sec cycle</sub>"]:::storage
+        TI["ContextInference<br/><sub>BGE-small clustering · 60-sec cycle</sub>"]:::storage
     end
 
     subgraph QueryLayer ["Query surface"]
@@ -663,17 +663,19 @@ cache via `ClearCache()`.
 
 #### `ContextInference` (`ContextInference.h` / `ContextInference.cpp`)
 
-A **dynamic, MiniLM-clustered** context summarizer that reads recent activity
-directly from SQLite and composes a single human-readable **one-liner**
+A **dynamic, sentence-encoder-clustered** context summarizer that reads recent
+activity directly from SQLite and composes a single human-readable **one-liner**
 describing what the user is actively doing — using the actual document names,
 browser tab titles, and application titles observed, **not** a fixed list of
 pre-defined topic buckets.
 
 **Lifecycle:**
 
-1. `Init(modelsDir)` — looks for `vocab.txt` + `minilm.onnx` first under the
-   directory passed in (typically `<exe>\models\`), then falls back to
-   `%LOCALAPPDATA%\WARP\models`. If both files are present, loads the
+1. `Init(modelsDir)` — looks for `vocab.txt` + `bge-small.onnx` (BAAI/bge-small-en-v1.5)
+   first under the directory passed in (typically `<exe>\models\`), then falls
+   back to `%LOCALAPPDATA%\WARP\models`, and finally to the legacy
+   `minilm.onnx` (all-MiniLM-L6-v2) for installations that haven't re-downloaded
+   the model. If a model file + vocab are present, loads the
    `BertTokenizer` (WordPiece) and creates an ONNX Runtime session pinned to
    the CPU provider; otherwise the engine reports `model="deterministic"` and
    skips the embedding pass entirely. **Loading failure is never fatal.**
@@ -703,9 +705,11 @@ pre-defined topic buckets.
      ellipsis.
    - For browsers, the *cleaned active tab title* (from `BrowsingActivity`) takes
      precedence over the window title.
-   - **Dynamic semantic clustering (MiniLM path).** The composed per-app phrase
+   - **Dynamic semantic clustering (sentence-encoder path).** The composed per-app phrase
      `<verb> "<title>" in <friendlyName>` for the top-8 ranked apps is fed
-     through the WordPiece tokenizer and the MiniLM ONNX model. Token embeddings
+     through the WordPiece tokenizer and the BGE-small ONNX model
+     (`BAAI/bge-small-en-v1.5`, 384-dim, ~33 M params; legacy
+     `all-MiniLM-L6-v2` is supported as a drop-in fallback). Token embeddings
      are mean-pooled over real (non-pad) tokens and L2-normalised to a 384-dim
      sentence vector. A greedy single-pass clusterer compares each new vector
      to the centroid of every existing cluster and joins the first one with
@@ -723,7 +727,7 @@ pre-defined topic buckets.
      — also matched on the *un-split* form so `YouTube` doesn't leak as
      `Tube`). Each surviving token is scored by
      `frequency × (1 + cosine(token-embedding, clean-cluster-centroid))`,
-     where the *clean cluster centroid* is the MiniLM embedding of the
+     where the *clean cluster centroid* is the sentence-encoder embedding of the
      joined content-token bag. The top **1–2** tokens (the second is
      dropped if its score is < 60 % of the first or if one is a prefix of
      the other) become the cluster's **theme phrase**, ordered by their
@@ -746,8 +750,8 @@ pre-defined topic buckets.
      bag yields zero usable content tokens (all stop-words / brands),
      that cluster falls back to the prior verbatim format
      `<verb> "<title>" in <friendlyName>` so a context-free verb is
-     never emitted. Without MiniLM the same theme extraction runs on
-     frequency alone (no cosine weighting).
+     never emitted. Without the sentence-encoder loaded the same theme
+     extraction runs on frequency alone (no cosine weighting).
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
      capped at 0.99.
@@ -766,17 +770,26 @@ The `GetRecentContext()` method returns the latest snapshot as JSON; the new
 the [GetRecentContext](#getrecentcontext) and
 [GetRecentContexts](#getrecentcontexts) API sections below.
 
-> **Why MiniLM for clustering instead of fixed buckets?** An earlier design used
-> the same MiniLM model to map every activity to one of ~50 hand-curated topic
-> strings via cosine similarity. That hard-coded the user's possible contexts to
-> a fixed taxonomy and lost the actual document/tab/app name in the result. The
-> current design uses MiniLM in the opposite direction: it does not classify —
-> it *clusters* the literal phrases observed in the rolling window. Two
-> activities are merged iff they are semantically similar to each other, not to
-> a pre-defined list. The result is a richer, ground-truthful one-liner whose
-> shape adapts to whatever the user is doing. If the model files are not
-> shipped or fail to load, the engine still produces a per-app one-liner — it
-> just no longer collapses related work into a single "thread".
+> **Why a sentence-encoder for clustering instead of fixed buckets?** An
+> earlier design used MiniLM to map every activity to one of ~50 hand-curated
+> topic strings via cosine similarity. That hard-coded the user's possible
+> contexts to a fixed taxonomy and lost the actual document/tab/app name in
+> the result. The current design uses the sentence-encoder in the opposite
+> direction: it does not classify — it *clusters* the literal phrases
+> observed in the rolling window. Two activities are merged iff they are
+> semantically similar to each other, not to a pre-defined list. The result
+> is a richer, ground-truthful one-liner whose shape adapts to whatever the
+> user is doing. If the model files are not shipped or fail to load, the
+> engine still produces a per-app one-liner — it just no longer collapses
+> related work into a single "thread".
+>
+> **Why BGE-small-en-v1.5 specifically?** `BAAI/bge-small-en-v1.5` is the
+> CPU-friendly successor to MiniLM-L6-v2: same 384-dim output, same BERT
+> WordPiece tokenizer (so no tokenizer change), but **+6.5 MTEB Clustering**
+> (42.4 → 48.9) — directly relevant to WARP's short-text-clustering +
+> theme-distillation workload. ~33 M params (vs. 22 M for MiniLM), ~3–5 ms
+> per-title CPU latency at INT8, ~130 MB on disk. Installations with the
+> legacy `minilm.onnx` continue to work transparently.
 
 > **Query surface**
 
@@ -1067,23 +1080,29 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
 
 The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
 and pulls **`Microsoft.ML.OnnxRuntime` 1.22.0** via NuGet (declared in
-`packages.config`). The MiniLM sentence-encoder model files are **not** committed
+`packages.config`). The BGE-small sentence-encoder model files are **not** committed
 to the repo — they are downloaded once into a `models/` folder before the build.
 
 **Steps:**
 
 1. Open `WARP!.sln` in Visual Studio (or run `nuget restore "WARP!.sln" -PackagesDirectory ..\packages` from the repo root).
-2. Download the MiniLM model files into `models/` (one-time, ~86 MB):
+2. Download the sentence-encoder model files into `models/` (one-time, ~130 MB):
 
    ```powershell
    New-Item -ItemType Directory -Path models -Force | Out-Null
    Invoke-WebRequest `
-     -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" `
-     -OutFile "models/minilm.onnx"
+     -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" `
+     -OutFile "models/bge-small.onnx"
    Invoke-WebRequest `
-     -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt" `
+     -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt" `
      -OutFile "models/vocab.txt"
    ```
+
+   > Legacy `models/minilm.onnx` (all-MiniLM-L6-v2) installations also work —
+   > `ContextInference::Init()` falls back to it automatically when
+   > `bge-small.onnx` isn't present. The two models share the same 384-dim
+   > embedding space and the same BERT WordPiece vocab, so no other change
+   > is needed.
 
 3. Build any configuration (Debug/Release × Win32/x64/ARM64). The post-build
    `CopyOnnxRuntime` MSBuild target copies `onnxruntime.dll` and the `models/`
@@ -1099,9 +1118,10 @@ to the repo — they are downloaded once into a `models/` folder before the buil
 
 WARP is intentionally lean: a single Win32 executable that talks directly to
 the operating system for capture, to embedded SQLite for persistence, and uses
-the **MiniLM (`all-MiniLM-L6-v2`)** ONNX sentence-encoder for *dynamic* context
-clustering — no fixed taxonomy, no managed runtime, no service host, no
-background broker.
+the **BGE-small (`BAAI/bge-small-en-v1.5`)** ONNX sentence-encoder for *dynamic*
+context clustering (with `all-MiniLM-L6-v2` supported as a transparent
+backward-compatibility fallback) — no fixed taxonomy, no managed runtime, no
+service host, no background broker.
 
 ```mermaid
 flowchart TB
@@ -1133,7 +1153,7 @@ flowchart TB
     end
 
     subgraph CTX ["Context inference layer"]
-        CI["ContextInference<br/><sub>MiniLM dynamic clustering · in-process</sub>"]:::ml
+        CI["ContextInference<br/><sub>BGE-small dynamic clustering · in-process</sub>"]:::ml
         CLS["kAppClasses + path heuristics<br/><sub>~80 entries · 3-layer classifier</sub>"]:::ml
         TC["CleanTitle + ComposeOneLiner<br/><sub>UTF-8 normaliser · adaptive top-N</sub>"]:::ml
     end
@@ -1168,7 +1188,7 @@ flowchart TB
 | **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
 | **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
 | **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
-| **Context**      | `ContextInference` (MiniLM clustering) | 60-sec rolling 15-min summarizer; emits a one-liner + clustered `items[]`        |
+| **Context**      | `ContextInference` (BGE-small clustering) | 60-sec rolling 15-min summarizer; emits a one-liner + clustered `items[]`        |
 | **Context**      | `kAppClasses` + path heuristics      | 3-layer exe classifier (~80 known apps + JetBrains/Office/browsers)    |
 | **Context**      | `CleanTitle` + `ComposeOneLiner`     | UTF-8 separator normaliser, suffix stripper, adaptive top-N composer   |
 
@@ -1208,12 +1228,15 @@ flowchart TB
    database. Confidence-weighted rolling counts are recomputed from the
    raw event tables (`SUM(COALESCE(confidence, 1.0))`).
 10. The named-pipe server starts accepting connections.
-11. The context inference engine starts: it looks for `models/minilm.onnx` +
+11. The context inference engine starts: it looks for `models/bge-small.onnx`
+    (or, as a backward-compat fallback, `models/minilm.onnx`) plus
     `models/vocab.txt` next to the exe (or under `%LOCALAPPDATA%\WARP\models`)
-    and, if found, loads the `BertTokenizer` plus an ONNX Runtime session for
-    `all-MiniLM-L6-v2`. If the files are absent or the session fails to
-    construct, the engine logs and falls through to deterministic per-app
-    composition. Either way it begins its 60-second cycle.
+    and, if found, loads the `BertTokenizer` plus an ONNX Runtime session
+    pinned to the CPU provider for the discovered model
+    (`bge-small-en-v1.5` or `all-MiniLM-L6-v2`). If the files are absent or
+    the session fails to construct, the engine logs and falls through to
+    deterministic per-app composition. Either way it begins its 60-second
+    cycle.
 12. Every detected event (file, app launch, app focus, or browsing) is
     enriched with an `EventContext` (source / foreground / parent ids,
     `ms_since_input`, `confidence`), inserted into the appropriate
@@ -1222,7 +1245,7 @@ flowchart TB
 13. Every 60 seconds, the context inference engine gathers all activities
     from the last 15 minutes (overlaying the currently-active foreground
     window as a virtual focus row), classifies and cleans them, embeds the
-    per-app phrases (when MiniLM is loaded), runs greedy clustering at
+    per-app phrases (when the sentence-encoder is loaded), runs greedy clustering at
     cosine ≥ 0.65, and composes a one-liner snapshot. The snapshot is
     appended to the rolling history only on material change (different
     one-liner, different dominant app, or a 5-minute heartbeat).
@@ -1436,7 +1459,7 @@ summarizer.
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "all-MiniLM-L6-v2",
+    "model": "bge-small-en-v1.5",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
@@ -1466,7 +1489,7 @@ summarizer.
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app. |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). |
-| `model` | `string` | `"all-MiniLM-L6-v2"` when the ONNX model is loaded; `"deterministic"` when the engine is running in fallback mode. |
+| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX model is loaded, `"all-MiniLM-L6-v2"` when running the legacy fallback model, or `"deterministic"` when no model file is present and the engine is in fallback mode. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the model clustered the activity into (always reflects the **All** clustering). |
 | `signal_types` | `string[]` | Which event categories contributed (`focus`, `file`, `app`, `browsing`). |
 | `items` | `object[]` | Up to 5 per-app breakdowns: `app`, `exe`, `title`, `focus_seconds`, `pct`, `thread_id` (1-based cluster id from the **All** clusterer). |
@@ -1496,8 +1519,8 @@ wants short-term memory of what the user has been doing.
 ```json
 {
   "recent_contexts": [
-    { "timestamp": 1750012345, "category": "all", "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads", "one_liner_documents": "…", "one_liner_websites": "…", "one_liner_apps": "…", "confidence": 0.84, "model": "all-MiniLM-L6-v2", "thread_count": 3, "/* …full snapshot fields… */": null },
-    { "timestamp": 1750012045, "category": "all", "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "model": "all-MiniLM-L6-v2", "thread_count": 2, "/* … */": null }
+    { "timestamp": 1750012345, "category": "all", "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads", "one_liner_documents": "…", "one_liner_websites": "…", "one_liner_apps": "…", "confidence": 0.84, "model": "bge-small-en-v1.5", "thread_count": 3, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012045, "category": "all", "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "model": "bge-small-en-v1.5", "thread_count": 2, "/* … */": null }
   ],
   "category": "all",
   "returned": 2,
@@ -1861,18 +1884,20 @@ WARP!\
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
 |-- InferenceEngine.cpp         Confidence-weighted REAL counters, recency score,
 |                                QueryInferences & GetInferenceDeltas impl
-|-- ContextInference.h          MiniLM-clustered context summarizer interface
+|-- ContextInference.h          BGE-small / sentence-encoder-clustered context summarizer interface
 |-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + Embed/CosineSim
 |                                + greedy clustering + semantic theme distillation
 |                                (token bag + stop/brand/ext filter + cosine-weighted
 |                                scoring + verb selector); 60-sec rolling 15-min
 |                                summarizer with material-change dedup
-|-- BertTokenizer.h             Header-only WordPiece tokenizer for MiniLM
+|-- BertTokenizer.h             Header-only WordPiece tokenizer (compatible with both
+|                                BGE-small-en-v1.5 and all-MiniLM-L6-v2)
 |
 |-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.22.0)
 |
-|-- models/                     (gitignored) all-MiniLM-L6-v2 ONNX model + vocab
-|   |-- minilm.onnx             Sentence encoder (384-dim, ~86 MB) - downloaded
+|-- models/                     (gitignored) BGE-small-en-v1.5 ONNX model + vocab
+|   |-- bge-small.onnx          Sentence encoder (384-dim, ~130 MB) - downloaded
+|   |-- minilm.onnx             (optional legacy fallback, ~86 MB) - downloaded
 |   +-- vocab.txt               WordPiece vocab - downloaded
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)

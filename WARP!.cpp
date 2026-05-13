@@ -1278,9 +1278,10 @@ void StartSubsystems()
     g_queryApi.Start(&g_db, &g_inference, &g_contextInference);
 
     // Initialize and start the dynamic context inference engine.  If the
-    // MiniLM model files are present (`models/minilm.onnx` + `models/vocab.txt`)
-    // next to the exe -- or under `%LOCALAPPDATA%\WARP\models` -- the engine
-    // uses MiniLM to **dynamically cluster** the per-app descriptions seen in
+    // sentence-encoder model files are present (`models/bge-small.onnx` or
+    // legacy `models/minilm.onnx`, plus `models/vocab.txt`) next to the exe
+    // -- or under `%LOCALAPPDATA%\WARP\models` -- the engine
+    // uses the model to **dynamically cluster** the per-app descriptions seen in
     // the rolling 15-min window.  No pre-defined topic buckets are involved;
     // clusters emerge from the actual document/tab/app titles.  If the model
     // is absent the engine falls back to a deterministic per-app composition.

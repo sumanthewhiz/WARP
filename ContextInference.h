@@ -27,14 +27,16 @@ class ForegroundMonitor;
 // app-launch / file activity.  The literal one-liner text is built from the
 // actual document, tab, and application titles captured in the window.
 //
-// When the optional MiniLM (all-MiniLM-L6-v2) embedding model is available the
+// When the optional sentence-encoder embedding model is available the
 // composer additionally runs **dynamic semantic clustering** on the per-app
 // descriptions: apps whose embeddings are close in the 384-dim sentence space
 // are merged into one "thread of work" so the one-liner can surface that the
 // user has, e.g., the auth source file open in VS Code AND the Auth PR open in
 // Edge as a single thread instead of two unrelated lines.  The clusters are
 // formed *dynamically from the observed titles* -- there is no fixed bucket
-// list or pre-defined topic taxonomy.
+// list or pre-defined topic taxonomy.  Default model is
+// `BAAI/bge-small-en-v1.5` (`bge-small.onnx`); legacy installations with
+// `minilm.onnx` (all-MiniLM-L6-v2) continue to work transparently.
 //
 // When the model files are absent the composer falls back to a deterministic
 // per-app composition (every app is its own cluster).
@@ -48,7 +50,7 @@ struct ContextSnapshot
     // *projection* of the same 15-min activity window so a consumer can ask
     // "what documents has the user been in?", "what websites?", or "what
     // apps?" without having to mentally separate them out of the combined
-    // line.  All three use the same MiniLM-clustering + theme-distillation
+    // line.  All three use the same dynamic-clustering + theme-distillation
     // pipeline as the combined one -- only the input bag of titles differs.
     //   * Documents -- non-browser content-editor apps (code editors, IDEs,
     //                  Office apps, PDF readers, note-taking apps) +
@@ -68,7 +70,7 @@ struct ContextSnapshot
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
-    std::string   model;                // "all-MiniLM-L6-v2" or "deterministic"
+    std::string   model;                // "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
     // Bounded structured breakdown (top apps by focus seconds, capped at 5).
@@ -86,15 +88,18 @@ struct ContextSnapshot
 
 // =====================================================================
 // Dynamic context-inference engine (replaces the old TopicInference, which
-// used the same MiniLM model to map activities to ~50 *pre-defined* topic
-// buckets).  This engine instead uses MiniLM to **dynamically cluster** the
+// used a MiniLM model to map activities to ~50 *pre-defined* topic
+// buckets).  This engine instead uses a sentence-encoder (BGE-small by
+// default, MiniLM as a backward-compatibility fallback) to **dynamically
+// cluster** the
 // observed titles -- the one-liner is composed from the literal documents,
 // tabs, and apps the user is engaged with, with semantically related items
 // merged into "threads of work".
 //
 // Lifecycle
 //   * Init(modelsDir) -- always returns true.  If the model files
-//     (`vocab.txt` + `minilm.onnx`) are present in `modelsDir` the embedding
+//     (`vocab.txt` + `bge-small.onnx`, or the legacy `minilm.onnx`) are
+//     present in `modelsDir` the embedding
 //     pipeline initializes; otherwise the engine still runs in a
 //     deterministic-only fallback mode.  Pass an empty wstring to skip the
 //     model load entirely.
@@ -147,13 +152,19 @@ private:
     bool                         m_haveLatest = false;
     std::mutex                   m_mutex;
 
-    // ---- MiniLM embedding pipeline (optional) --------------------------
+    // ---- Sentence-encoder embedding pipeline (optional) ----------------
+    // Default model: BAAI/bge-small-en-v1.5 (384-dim, BERT WordPiece
+    // tokenizer, ~33 M params).  Compatible with the previous
+    // all-MiniLM-L6-v2 (same dim, same tokenizer); if `bge-small.onnx`
+    // isn't present, Init() falls back to `minilm.onnx` so legacy
+    // installations keep working without forcing a redownload.
     BertTokenizer        m_tokenizer;
     Ort::Env*            m_ortEnv     = nullptr;
     Ort::SessionOptions* m_ortOpts    = nullptr;
     Ort::Session*        m_ortSession = nullptr;
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
+    std::string          m_modelName;        // e.g. "bge-small-en-v1.5"
 
     // Compute a 384-dim L2-normalized sentence embedding for `text`.
     // Returns an empty vector if the model is not loaded or inference fails.
