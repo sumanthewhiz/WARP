@@ -1445,19 +1445,22 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
         // ---- Per-cluster theme extraction ----------------------------
         auto themeFor = [&](const Cluster& cl) -> std::string {
-            // freq         = total occurrences of a token across the cluster's titles
-            // titlesWith   = number of *distinct* titles in which the token appears
-            //                (used to suppress one-off mentions: a token seen in a
-            //                single title gets scored down vs. one that recurs
-            //                across multiple titles, which is the strongest signal
-            //                of an actual coherent theme).
+            // freq           = total occurrences of a token across the cluster's titles
+            // titlesWith     = number of distinct titles in which the token appears
+            // focusWeight    = sum of totalFocusSecs of titles in which the token
+            //                  appears.  This is the primary signal: a token from
+            //                  a 99%-focus title decisively outweighs a token from
+            //                  a 1%-focus virtual entry, regardless of how many
+            //                  virtual entries it appears in.
             std::unordered_map<std::string, int>          freq;
             std::unordered_map<std::string, int>          titlesWith;
+            std::unordered_map<std::string, int64_t>      focusWeight;
             std::unordered_map<std::string, std::string>  bestSurface;
             std::vector<std::string>                      orderedLowers;
 
             for (size_t mi : cl.members)
             {
+                int memberFocus = (std::max)(0, bag[mi].totalFocusSecs);
                 auto toks = ExtractContentTokens(bag[mi].bestTitle);
                 std::unordered_set<std::string> seenInTitle;
                 for (const auto& t : toks)
@@ -1466,7 +1469,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                         orderedLowers.push_back(t.lower);
                     freq[t.lower] += 1;
                     if (seenInTitle.insert(t.lower).second)
+                    {
                         titlesWith[t.lower] += 1;
+                        focusWeight[t.lower] += memberFocus;
+                    }
                     auto& s = bestSurface[t.lower];
                     if (s.empty() ||
                        (s.size() == t.surface.size() && t.surface > s))
@@ -1476,6 +1482,11 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             if (orderedLowers.empty()) return std::string();
 
             const size_t titleCount = cl.members.size();
+
+            int64_t clusterTotalFocus = 0;
+            for (size_t mi : cl.members)
+                clusterTotalFocus += (std::max)(0, bag[mi].totalFocusSecs);
+            if (clusterTotalFocus <= 0) clusterTotalFocus = 1; // avoid div-by-zero
 
             struct ScoredTok { std::string lower; double score; size_t firstIdx; };
             std::vector<ScoredTok> scored;
@@ -1493,35 +1504,48 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 cleanCentroid = Embed(joined);
             }
 
+            // Order candidates by focus-weighted coverage first; this is
+            // the dominant signal.  Title-coverage and frequency act as
+            // tiebreakers when several tokens share the same focus weight
+            // (typically tokens from the same dominant title).
             std::vector<std::string> candidates = orderedLowers;
             std::sort(candidates.begin(), candidates.end(),
                       [&](const std::string& a, const std::string& b){
-                          // Primary key: cross-title coverage.  Strongly
-                          // prefers tokens that recur across multiple titles
-                          // over high-frequency-but-single-title tokens
-                          // (which are usually random IDs, version numbers,
-                          // or status indicators that bloated one title).
+                          if (focusWeight[a] != focusWeight[b])
+                              return focusWeight[a] > focusWeight[b];
                           if (titlesWith[a] != titlesWith[b])
                               return titlesWith[a] > titlesWith[b];
                           if (freq[a] != freq[b]) return freq[a] > freq[b];
                           return a < b;
                       });
-            if (candidates.size() > 10) candidates.resize(10);
+            if (candidates.size() > 12) candidates.resize(12);
 
             for (size_t ci = 0; ci < candidates.size(); ++ci)
             {
                 const std::string& lc = candidates[ci];
-                // Base score: cross-title coverage dominates frequency.
-                // A token seen in 3 different titles outweighs one that
-                // appeared 5 times in one title.
-                double coverage = static_cast<double>(titlesWith[lc]);
-                double rawFreq  = static_cast<double>(freq[lc]);
-                double s = coverage * 2.0 + std::log1p(rawFreq);
+                // Base score: focus-share coverage dominates.  A token
+                // from a 99%-focus title gets focusCoverage ~= 0.99 and
+                // wins decisively over a token from a 1%-focus title
+                // (~0.01), regardless of how many low-focus titles the
+                // latter appears in.  Title coverage and log-frequency
+                // act as small additive tiebreakers.
+                double focusCoverage =
+                    static_cast<double>(focusWeight[lc])
+                    / static_cast<double>(clusterTotalFocus);
+                double titleCoverage =
+                    static_cast<double>(titlesWith[lc])
+                    / static_cast<double>((std::max)(size_t{1}, titleCount));
+                double rawFreq = static_cast<double>(freq[lc]);
 
-                // When the cluster has multiple titles, demote tokens
-                // that appear in only one of them (single-title noise).
-                if (titleCount >= 3 && titlesWith[lc] == 1)
-                    s *= 0.4;
+                double s = focusCoverage * 5.0
+                         + titleCoverage * 0.5
+                         + std::log1p(rawFreq) * 0.25;
+
+                // Aggressive penalty for tokens that carry essentially
+                // no focus weight (e.g. tokens that only appear in
+                // virtual file-augmentation entries while the real
+                // focus is elsewhere).
+                if (focusCoverage < 0.05) s *= 0.2;
 
                 if (m_modelReady && !cleanCentroid.empty())
                 {
@@ -1704,16 +1728,27 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             if (cl.members.size() >= 2)
             {
                 // Build a deduped friendlyName list for the "(across …)"
-                // suffix.  Without dedup the Websites bag — where every
-                // virtual AppAgg has friendlyName="Browser" — would
-                // render as "(across Browser, Browser & Browser)" and
-                // the Documents bag (where file-virt entries also share
-                // friendlyName="File") would do the same.
+                // suffix.  Two filters:
+                //   1. Dedup (so the Websites bag — every virtual AppAgg
+                //      has friendlyName="Browser" — doesn't render as
+                //      "(across Browser, Browser & Browser)").
+                //   2. Skip the virtual placeholder names "File" /
+                //      "Document" / "Browser" -- they're internal markers
+                //      for the augmentation paths and read awkwardly in
+                //      the user-visible suffix ("across PowerPoint &
+                //      File" doesn't make sense; the user has a real
+                //      PowerPoint deck open, not a "file").  Real app
+                //      friendly names (PowerPoint, Word, VS Code, Edge,
+                //      ...) flow through unchanged.
+                auto isVirtualName = [](const std::string& fn) {
+                    return fn == "File" || fn == "Document" || fn == "Browser";
+                };
                 std::vector<std::string> uniqueNames;
                 uniqueNames.reserve(cl.members.size());
                 for (size_t mi : cl.members)
                 {
                     const std::string& fn = bag[mi].friendlyName;
+                    if (isVirtualName(fn)) continue;
                     bool seen = false;
                     for (const auto& s : uniqueNames)
                         if (s == fn) { seen = true; break; }
