@@ -740,7 +740,20 @@ static const std::unordered_set<std::string>& BrandNoise()
         // Misc ubiquitous
         "app","application","apps","desktop","mobile","beta","alpha","preview",
         "release","stable","portable","setup","installer","login","signin",
-        "signup","sign","register","account","profile","user","admin"
+        "signup","sign","register","account","profile","user","admin",
+        // Windows / *nix path-component noise.  These leak in via file
+        // basenames that capture directory names (e.g. an ETW event for
+        // `C:\Users\sumghosh\Documents\report.docx` would normally give
+        // just `report` as a content token, but when the path itself
+        // becomes part of a basename or a title these tokens flood the
+        // theme.  None of them describe what the user is *doing*.
+        "users","usr","appdata","localdata","roaming","local",
+        "programdata","programs","system32","syswow64","windows",
+        "documents","downloads","pictures","music","videos","music",
+        "onedrive","dropbox","box","gdrive","drive",
+        "temp","tmp","cache","caches","logs","dump","dumps",
+        "data","datafile","content","contents","backup","backups",
+        "default","userdata","public","shared","home"
     };
     return s;
 }
@@ -1944,67 +1957,154 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         else              rankedApps.push_back(a);
     }
 
-    // Augment Files with recently-touched file basenames captured
-    // by FileMonitor.  This catches files that the user looked at
-    // briefly (so they never accumulated significant focus seconds in
-    // an editor) but that still represent a "file the user was
-    // on".  Skip noisy extensions (.dll/.log/.tmp/.bak) and any
-    // basenames already present in rankedFiles (case-insensitive).
+    // Augment Files with recently-touched file basenames captured by
+    // FileMonitor.  Two design constraints:
+    //
+    //   (a) Strict allowlist of user-content extensions only.  The
+    //       previous "deny .dll/.log/.tmp/.bak" was too loose -- it
+    //       let through Outlook .ost/.nst/.pst mail stores, sticky
+    //       notes .sqlite, .config / .xml / .json app data, .lnk
+    //       shortcuts, etc.  Whose basenames frequently include
+    //       directory or user-identity tokens (the user's email
+    //       address, their AppData path components, etc.) that then
+    //       polluted the Files theme.
+    //
+    //   (b) Skip augmentation entirely when a real file app is
+    //       actively in focus.  When the user is sitting in Excel
+    //       editing a spreadsheet, the FileMonitor pool is irrelevant
+    //       background noise -- typing in Excel generates dozens of
+    //       writes to OneDrive caches, Office auto-recover files,
+    //       and similar transient artefacts that we *cannot* fully
+    //       filter at the FileMonitor layer because some of those
+    //       artefacts are real user content (e.g. Outlook .ost).
+    //       Bypassing the augmentation when there's an obvious
+    //       focused-file signal preserves correctness for the
+    //       common case without losing the "briefly-touched file"
+    //       capability for the dormant-app case.
     {
-        std::unordered_set<std::string> seenLowered;
+        // (b): if any real file app has >= 30s of focus, the focused
+        // signal dominates.  Skip augmentation.
+        bool haveFocusedFileApp = false;
         for (const auto& a : rankedFiles)
-            seenLowered.insert(AsciiLower(a.bestTitle));
-
-        struct FileVirt { std::string base; int64_t ts; int hits; };
-        std::unordered_map<std::string, FileVirt> byBase;
-        for (const auto& f : files)
         {
-            std::string p = WideToUtf8(f.path);
-            if (p.empty()) continue;
-            size_t slash = p.find_last_of("/\\");
-            std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-            if (base.empty()) continue;
-            std::string baseLower = AsciiLower(base);
-            if (baseLower.size() >= 4 &&
-                (baseLower.compare(baseLower.size()-4, 4, ".dll") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".log") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".tmp") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".bak") == 0))
-                continue;
-            if (seenLowered.count(baseLower)) continue;
-            auto it = byBase.find(baseLower);
-            if (it == byBase.end())
-                byBase[baseLower] = { base, f.timestampUtc, 1 };
-            else
+            if (a.totalFocusSecs >= 30)
             {
-                it->second.hits += 1;
-                if (f.timestampUtc > it->second.ts) it->second.ts = f.timestampUtc;
+                haveFocusedFileApp = true;
+                break;
             }
         }
-        std::vector<FileVirt> fv;
-        fv.reserve(byBase.size());
-        for (auto& kv : byBase) fv.push_back(std::move(kv.second));
-        std::sort(fv.begin(), fv.end(),
-                  [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
-        if (fv.size() > 6) fv.resize(6);
-        for (auto& v : fv)
+
+        if (!haveFocusedFileApp)
         {
-            AppAgg agg{};
-            agg.friendlyName    = "File";
-            agg.verb            = "Editing";
-            agg.bestTitle       = v.base;
-            agg.rawTitle        = v.base;
-            agg.totalFocusSecs  = (std::max)(5, v.hits * 5);
-            agg.lastSeenTs      = v.ts;
-            agg.isBrowser       = false;
-            rankedFiles.push_back(std::move(agg));
+            // (a): user-content extension allowlist.  Mirrors the
+            // extension set in TitleLooksLikeFileActivity above (the
+            // two should stay in sync).  An empty/missing extension
+            // is rejected -- "anonymous" basenames are almost never
+            // user content.
+            static const std::unordered_set<std::string> kUserContentExt = {
+                "doc","docx","rtf","odt",
+                "xls","xlsx","csv","tsv","ods",
+                "ppt","pptx","odp",
+                "pdf","epub","mobi",
+                "txt","md","rst","tex","one",
+                "jpg","jpeg","png","gif","bmp","tif","tiff",
+                "webp","heic","heif","raw","dng","cr2","nef",
+                "psd","ai","eps","svg","ico",
+                "mp3","wav","flac","m4a","aac",
+                "mp4","mkv","mov","avi","webm",
+                "c","cpp","cc","cxx","h","hpp","hh","hxx",
+                "cs","java","kt","scala","groovy",
+                "py","rb","pl","php","js","mjs","cjs","jsx","ts","tsx",
+                "go","rs","swift","m","mm","dart",
+                "sh","bash","zsh","fish","ps1","psm1","psd1",
+                "html","htm","css","scss","sass","less",
+                "xml","json","yaml","yml","toml","ini","cfg","conf",
+                "sql","graphql","vue","svelte",
+                "r","jl","lua","ex","exs","erl","hs","clj",
+                "zip","rar","7z","tar","gz","tgz"
+            };
+
+            auto extensionOf = [](const std::string& name) -> std::string {
+                size_t dot = name.find_last_of('.');
+                if (dot == std::string::npos || dot + 1 >= name.size())
+                    return std::string();
+                std::string ext = name.substr(dot + 1);
+                // Lowercase ASCII.
+                for (char& c : ext)
+                    if (c >= 'A' && c <= 'Z') c = char(c + 32);
+                return ext;
+            };
+
+            std::unordered_set<std::string> seenLowered;
+            for (const auto& a : rankedFiles)
+                seenLowered.insert(AsciiLower(a.bestTitle));
+
+            struct FileVirt { std::string base; int64_t ts; int hits; };
+            std::unordered_map<std::string, FileVirt> byBase;
+            for (const auto& f : files)
+            {
+                std::string p = WideToUtf8(f.path);
+                if (p.empty()) continue;
+                size_t slash = p.find_last_of("/\\");
+                std::string base = (slash != std::string::npos)
+                                       ? p.substr(slash + 1) : p;
+                if (base.empty()) continue;
+                std::string baseLower = AsciiLower(base);
+
+                // Strip the Excel/Word lockfile prefix "~$" so we don't
+                // treat `~$report.xlsx` as a different file from
+                // `report.xlsx`; the user opened the file, not the
+                // lock.  Also strips a leading "~" which is the Office
+                // auto-recover prefix.
+                std::string keyBase = baseLower;
+                while (!keyBase.empty() && (keyBase[0] == '~' || keyBase[0] == '$'))
+                    keyBase.erase(0, 1);
+
+                std::string ext = extensionOf(keyBase);
+                if (ext.empty() || kUserContentExt.count(ext) == 0)
+                    continue;
+
+                if (seenLowered.count(keyBase)) continue;
+
+                auto it = byBase.find(keyBase);
+                if (it == byBase.end())
+                    byBase[keyBase] = { base, f.timestampUtc, 1 };
+                else
+                {
+                    it->second.hits += 1;
+                    if (f.timestampUtc > it->second.ts) it->second.ts = f.timestampUtc;
+                }
+            }
+            std::vector<FileVirt> fv;
+            fv.reserve(byBase.size());
+            for (auto& kv : byBase) fv.push_back(std::move(kv.second));
+            std::sort(fv.begin(), fv.end(),
+                      [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
+            if (fv.size() > 6) fv.resize(6);
+            for (auto& v : fv)
+            {
+                AppAgg agg{};
+                agg.friendlyName    = "File";
+                agg.verb            = "Editing";
+                agg.bestTitle       = v.base;
+                agg.rawTitle        = v.base;
+                // Cap synthetic focus at 15 s per virt regardless of
+                // FileMonitor hit volume.  Real foreground sessions
+                // (typically 30 s -- many minutes) thus dominate the
+                // theme even when several virts are present.
+                int synth = (std::min)(15, (std::max)(3, v.hits * 3));
+                agg.totalFocusSecs  = synth;
+                agg.lastSeenTs      = v.ts;
+                agg.isBrowser       = false;
+                rankedFiles.push_back(std::move(agg));
+            }
+            std::sort(rankedFiles.begin(), rankedFiles.end(),
+                      [](const AppAgg& a, const AppAgg& b){
+                          if (a.totalFocusSecs != b.totalFocusSecs)
+                              return a.totalFocusSecs > b.totalFocusSecs;
+                          return a.lastSeenTs > b.lastSeenTs;
+                      });
         }
-        std::sort(rankedFiles.begin(), rankedFiles.end(),
-                  [](const AppAgg& a, const AppAgg& b){
-                      if (a.totalFocusSecs != b.totalFocusSecs)
-                          return a.totalFocusSecs > b.totalFocusSecs;
-                      return a.lastSeenTs > b.lastSeenTs;
-                  });
     }
 
     // Build the Websites bag from BrowsingMonitor records.  Each
