@@ -84,6 +84,66 @@ static bool GetProcessInfo(DWORD pid, std::wstring& outExeName, std::wstring& ou
     return true;
 }
 
+// EnumChildWindows callback: walks the immediate children of an
+// ApplicationFrameHost HWND looking for the UWP/packaged-app's
+// CoreWindow.  The first one whose PID is *different* from the
+// outer host PID is the actual UWP app process (Photos, Camera,
+// Calculator, Microsoft Store, etc.).
+struct AfhDrillState
+{
+    DWORD hostPid    = 0;
+    DWORD childPid   = 0;
+    HWND  childHwnd  = nullptr;
+};
+
+static BOOL CALLBACK AfhDrillEnumProc(HWND hwnd, LPARAM lParam)
+{
+    auto* state = reinterpret_cast<AfhDrillState*>(lParam);
+
+    wchar_t cls[256] = {};
+    int n = GetClassNameW(hwnd, cls, 256);
+    if (n <= 0) return TRUE;
+
+    // The UWP host window class.  Matches both legacy
+    // `Windows.UI.Core.CoreWindow` and the newer
+    // `ApplicationFrameInputSinkWindow` sometimes seen on Win11.
+    std::wstring cn(cls, n);
+    if (cn != L"Windows.UI.Core.CoreWindow" &&
+        cn != L"ApplicationFrameInputSinkWindow")
+        return TRUE;
+
+    DWORD childPid = 0;
+    GetWindowThreadProcessId(hwnd, &childPid);
+    if (childPid != 0 && childPid != state->hostPid)
+    {
+        state->childPid  = childPid;
+        state->childHwnd = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// For ApplicationFrameHost.exe foreground windows, drill into the
+// children and find the actual UWP app PID + its CoreWindow HWND.
+// Returns true if a real child was found.  Photos, Camera,
+// Calculator, the legacy Microsoft Store, etc., all rely on this --
+// without it they're indistinguishable from generic system shell
+// chrome and would be filtered.
+static bool ResolveAppFrameHostChild(HWND hostHwnd,
+                                     DWORD hostPid,
+                                     HWND& outChildHwnd,
+                                     DWORD& outChildPid)
+{
+    if (!hostHwnd || hostPid == 0) return false;
+    AfhDrillState state{};
+    state.hostPid = hostPid;
+    EnumChildWindows(hostHwnd, AfhDrillEnumProc, reinterpret_cast<LPARAM>(&state));
+    if (state.childPid == 0) return false;
+    outChildHwnd = state.childHwnd ? state.childHwnd : hostHwnd;
+    outChildPid  = state.childPid;
+    return true;
+}
+
 ForegroundMonitor::ForegroundMonitor()
 {
 }
@@ -148,6 +208,30 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
     if (!m_running || m_paused) return;
     if (!hwnd || pid == 0)      return;
 
+    // Drill through ApplicationFrameHost to find the real UWP app
+    // process (Photos, Camera, Calculator, etc.) -- without this we'd
+    // filter them out as system shell chrome and lose all file/image
+    // context for the user's Photos / Paint / image-viewer sessions.
+    {
+        std::wstring hostExe, hostPath;
+        if (GetProcessInfo(pid, hostExe, hostPath))
+        {
+            std::wstring hostExeLower = hostExe;
+            std::transform(hostExeLower.begin(), hostExeLower.end(),
+                           hostExeLower.begin(), ::towlower);
+            if (hostExeLower == L"applicationframehost.exe")
+            {
+                HWND  childHwnd = nullptr;
+                DWORD childPid  = 0;
+                if (ResolveAppFrameHostChild(hwnd, pid, childHwnd, childPid))
+                {
+                    hwnd = childHwnd;
+                    pid  = childPid;
+                }
+            }
+        }
+    }
+
     wchar_t titleBuf[1024] = {};
     int titleLen = GetWindowTextW(hwnd, titleBuf, 1024);
     std::wstring title(titleBuf, titleLen > 0 ? titleLen : 0);
@@ -159,6 +243,7 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
         // accidentally extend its duration past the actual focus loss.
         std::lock_guard<std::mutex> lk(m_stateMtx);
         EmitPreviousLocked(GetTickCount64());
+        m_prevHwnd = nullptr;
         m_prevPid = 0;
         m_prevExeName.clear();
         m_prevExePath.clear();
@@ -182,6 +267,7 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
     if (IsSystemForeground(exeLower))
     {
         // Don't track system / shell windows as foreground sessions.
+        m_prevHwnd = nullptr;
         m_prevPid = 0;
         m_prevExeName.clear();
         m_prevExePath.clear();
@@ -191,6 +277,7 @@ void ForegroundMonitor::OnForegroundChanged(HWND hwnd, DWORD pid)
         return;
     }
 
+    m_prevHwnd         = hwnd;
     m_prevPid          = pid;
     m_prevExeName      = exeName;
     m_prevExePath      = exePath;
@@ -205,8 +292,24 @@ void ForegroundMonitor::EmitPreviousLocked(ULONGLONG nowTick)
         return;
     int durationSecs = static_cast<int>((nowTick - m_prevStartTick) / 1000);
     if (durationSecs < 1 || !m_callback) return;
+
+    // Refresh the title from the live HWND if we still hold a valid
+    // handle.  This catches the common case where the user opened a
+    // file (Notepad: Ctrl+O), switched tabs (VS Code / Notepad++ /
+    // Sublime / Word), or navigated within the same app *without*
+    // changing focus -- OnForegroundChanged never fired for those, so
+    // m_prevTitle is stale.  Falls back to the captured-at-focus
+    // title if the HWND is gone (window closed before focus loss).
+    std::wstring titleToEmit = m_prevTitle;
+    if (m_prevHwnd && IsWindow(m_prevHwnd))
+    {
+        wchar_t buf[1024] = {};
+        int n = GetWindowTextW(m_prevHwnd, buf, 1024);
+        if (n > 0) titleToEmit = std::wstring(buf, n);
+    }
+
     EventContext ctx = EventContextUtil::CaptureContext(m_prevPid);
-    m_callback(m_prevExeName, m_prevExePath, m_prevTitle, durationSecs, ctx);
+    m_callback(m_prevExeName, m_prevExePath, titleToEmit, durationSecs, ctx);
 }
 
 bool ForegroundMonitor::GetCurrentSession(ActiveSession& out) const
@@ -218,6 +321,22 @@ bool ForegroundMonitor::GetCurrentSession(ActiveSession& out) const
     out.exeName          = m_prevExeName;
     out.exePath          = m_prevExePath;
     out.windowTitle      = m_prevTitle;
+
+    // Re-read the live window title.  Critical for apps like Notepad,
+    // VS Code, Word, Excel, Acrobat, etc., where the user can open a
+    // file (or switch tabs) *without* changing focus -- in which case
+    // OnForegroundChanged never fires and `m_prevTitle` would be stale.
+    // We capture HWND at the last focus change and ask the window for
+    // its current title here.  IsWindow guards against stale handles
+    // (e.g. the original window was closed and recreated).
+    if (m_prevHwnd && IsWindow(m_prevHwnd))
+    {
+        wchar_t buf[1024] = {};
+        int n = GetWindowTextW(m_prevHwnd, buf, 1024);
+        if (n > 0)
+            out.windowTitle = std::wstring(buf, n);
+    }
+
     out.startedAtUtcSecs = m_prevStartUtcSecs;
     out.durationSoFarSecs =
         static_cast<int>((GetTickCount64() - m_prevStartTick) / 1000);
