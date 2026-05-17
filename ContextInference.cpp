@@ -741,19 +741,20 @@ static const std::unordered_set<std::string>& BrandNoise()
         "app","application","apps","desktop","mobile","beta","alpha","preview",
         "release","stable","portable","setup","installer","login","signin",
         "signup","sign","register","account","profile","user","admin",
-        // Windows / *nix path-component noise.  These leak in via file
-        // basenames that capture directory names (e.g. an ETW event for
-        // `C:\Users\sumghosh\Documents\report.docx` would normally give
-        // just `report` as a content token, but when the path itself
-        // becomes part of a basename or a title these tokens flood the
-        // theme.  None of them describe what the user is *doing*.
-        "users","usr","appdata","localdata","roaming","local",
-        "programdata","programs","system32","syswow64","windows",
-        "documents","downloads","pictures","music","videos","music",
-        "onedrive","dropbox","box","gdrive","drive",
+        // Windows path-component noise.  These are kept tight: only
+        // unambiguous Windows/Unix shell-folder names that almost never
+        // form part of a real document/title content.  Generic words
+        // like "documents", "downloads", "pictures", "music", "videos"
+        // are intentionally NOT here -- they appear all the time in
+        // legitimate file titles ("Quarterly Documents Review.docx",
+        // "Photo Pictures from Trip.jpg", etc.).  The FileMonitor
+        // augmentation now strictly allowlists extensions and skips
+        // when a real file app has focus, so we don't need to nuke
+        // these tokens at the theme layer too.
+        "appdata","localdata","roaming","programdata","programs",
+        "system32","syswow64",
         "temp","tmp","cache","caches","logs","dump","dumps",
-        "data","datafile","content","contents","backup","backups",
-        "default","userdata","public","shared","home"
+        "default","userdata"
     };
     return s;
 }
@@ -1696,22 +1697,49 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             {
                 if (categoryMode)
                 {
-                    // Category-mode fallback: NEVER quote a verbatim
-                    // title (that's how the old "verbatim mish-mash"
-                    // regression happened).  Use the dominant verb of
-                    // the representative entry plus the friendlyName
-                    // (or, for the virtual "File" / "Browser"
-                    // friendly names, a more natural phrase).
+                    // Category-mode fallback: theme extraction produced
+                    // nothing (titles got over-filtered by the brand /
+                    // stop-word / file-extension filters).  Instead of
+                    // emitting verb+friendlyName (`"Drafting Word"`,
+                    // which is useless), surface the actual cleaned
+                    // title of the representative entry.  This handles
+                    // edge cases like a Word doc whose entire title is
+                    // brand-y ("Microsoft Word Document.docx") or a
+                    // file whose stem after the extension strip is
+                    // a single short token rejected as <3 chars.
                     const AppAgg& rep = bag[cl.repIdx];
                     std::string verb = rep.verb.empty() ? std::string("Using") : rep.verb;
                     if (!verb.empty() && verb[0] >= 'a' && verb[0] <= 'z')
                         verb[0] = char(verb[0] - 32);
-                    if (rep.friendlyName == "File")
+
+                    // Prefer the cleaned title with the extension
+                    // stripped (".docx" / ".pdf" etc. just adds noise).
+                    auto stripExt = [](std::string s) {
+                        size_t dot = s.find_last_of('.');
+                        if (dot != std::string::npos && dot > 0 && dot >= s.size() - 6)
+                            s.erase(dot);
+                        return s;
+                    };
+
+                    std::string titleSurface = stripExt(rep.bestTitle);
+                    if (titleSurface.empty()) titleSurface = stripExt(rep.rawTitle);
+
+                    if (!titleSurface.empty())
+                    {
+                        p = verb + " " + titleSurface;
+                    }
+                    else if (rep.friendlyName == "File")
+                    {
                         p = "Working on files";
+                    }
                     else if (rep.friendlyName == "Browser")
+                    {
                         p = "Browsing the web";
+                    }
                     else
+                    {
                         p = verb + " " + rep.friendlyName;
+                    }
                 }
                 else
                 {
