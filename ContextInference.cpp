@@ -1421,6 +1421,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         // ---- Sort clusters by total focus ----------------------------
         struct Cluster
         {
+            size_t               origIdx;     // original index into `centroids` / `clMembers`
             int                  totalFocus;
             size_t               repIdx;
             std::vector<size_t>  members;
@@ -1430,6 +1431,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         for (size_t c = 0; c < clMembers.size(); ++c)
         {
             Cluster cl;
+            cl.origIdx    = c;
             cl.totalFocus = clTotalFocus[c];
             cl.members    = clMembers[c];
             cl.repIdx     = clMembers[c].front();
@@ -1774,61 +1776,265 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             return p;
         };
 
+        // -----------------------------------------------------------------
+        //  Umbrella detection
+        //
+        //  Before emitting per-cluster phrases, check whether the top-K
+        //  clusters share a dominant theme token.  If so, collapse them
+        //  into a single descriptive line of the form
+        //
+        //     "Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"
+        //
+        //  rather than emitting N separate "Working on <FootballPlayers>",
+        //  "Working on <FootballStrategy>", ... lines that the user has to
+        //  mentally re-bundle.
+        //
+        //  Trigger: a single content token (after the brand / stopword
+        //  filter) appears in titles of >= 50% of the top-K (max 5)
+        //  clusters by focus AND those clusters together represent >= 50%
+        //  of bag focus.
+        //
+        //  The "facets" are the most-distinctive non-umbrella theme
+        //  token from each absorbed sub-cluster.
+        // -----------------------------------------------------------------
+        struct Umbrella
+        {
+            std::string                 surface;   // display form of the umbrella token
+            std::string                 lower;     // lowercase key
+            std::vector<std::string>    facets;    // display tokens, ordered
+            std::unordered_set<size_t>  absorbed;  // indices into `clusters` covered
+            int                         focus = 0;
+        };
+
+        // Token set per cluster (for cross-cluster coverage analysis).
+        std::vector<std::unordered_set<std::string>>            clusterTokenSets(clusters.size());
+        std::vector<std::unordered_map<std::string, std::string>> clusterTokenSurfaces(clusters.size());
+        std::vector<std::unordered_map<std::string, int>>       clusterTokenCounts(clusters.size());
+        for (size_t i = 0; i < clusters.size(); ++i)
+        {
+            for (size_t mi : clusters[i].members)
+            {
+                auto toks = ExtractContentTokens(bag[mi].bestTitle);
+                for (const auto& t : toks)
+                {
+                    clusterTokenSets[i].insert(t.lower);
+                    clusterTokenCounts[i][t.lower] += 1;
+                    auto& s = clusterTokenSurfaces[i][t.lower];
+                    if (s.empty() ||
+                       (s.size() == t.surface.size() && t.surface > s))
+                        s = t.surface;
+                }
+            }
+        }
+
+        auto detectUmbrella = [&]() -> Umbrella {
+            Umbrella out;
+            if (clusters.size() < 2) return out;
+
+            const size_t topK = (std::min)(clusters.size(), size_t{5});
+
+            // For each token, count how many of the top-K clusters
+            // contain it AND sum the focus of those clusters.
+            std::unordered_map<std::string, int>  tokenCoverage; // cluster count
+            std::unordered_map<std::string, int>  tokenFocus;
+            std::unordered_map<std::string, std::string> tokenSurface;
+            for (size_t i = 0; i < topK; ++i)
+            {
+                for (const auto& lc : clusterTokenSets[i])
+                {
+                    tokenCoverage[lc] += 1;
+                    tokenFocus[lc]   += clusters[i].totalFocus;
+                    auto& s = tokenSurface[lc];
+                    const auto& candSurface = clusterTokenSurfaces[i][lc];
+                    if (s.empty() ||
+                       (s.size() == candSurface.size() && candSurface > s))
+                        s = candSurface;
+                }
+            }
+
+            // Pick the highest-coverage token (focus as tiebreaker).
+            std::string bestLower;
+            int         bestCoverage = 0;
+            int         bestFocus    = 0;
+            for (const auto& kv : tokenCoverage)
+            {
+                if (kv.first.size() < 4) continue;       // tiny tokens are too noisy
+                if (kv.second  > bestCoverage ||
+                   (kv.second == bestCoverage && tokenFocus[kv.first] > bestFocus))
+                {
+                    bestLower    = kv.first;
+                    bestCoverage = kv.second;
+                    bestFocus    = tokenFocus[kv.first];
+                }
+            }
+            if (bestLower.empty()) return out;
+
+            // Trigger conditions:
+            //   * at least 2 absorbed clusters
+            //   * >= 50% of top-K clusters contain the umbrella token
+            //   * >= 50% of bag focus contributed by absorbed clusters
+            if (bestCoverage < 2)              return out;
+            if (bestCoverage * 2 < (int)topK)  return out;
+            if (bagTotalFocus > 0 && bestFocus * 2 < bagTotalFocus) return out;
+
+            out.surface = TitleCase(tokenSurface[bestLower].empty()
+                                        ? bestLower : tokenSurface[bestLower]);
+            out.lower   = bestLower;
+            out.focus   = bestFocus;
+            for (size_t i = 0; i < topK; ++i)
+            {
+                if (clusterTokenSets[i].count(bestLower))
+                    out.absorbed.insert(i);
+            }
+
+            // Build the facet list.  For each absorbed sub-cluster pick
+            // its most-distinctive non-umbrella token: highest local
+            // frequency, but penalize tokens that are widely shared
+            // across other absorbed clusters (those are co-themes, not
+            // facets).  Dedupe + cap at 4.
+            std::unordered_map<std::string, int> facetCrossCluster;
+            for (size_t ci : out.absorbed)
+                for (const auto& lc : clusterTokenSets[ci])
+                    facetCrossCluster[lc] += 1;
+
+            std::unordered_set<std::string> seenFacet;
+            seenFacet.insert(bestLower);
+            std::vector<std::pair<std::string, std::string>> facetsOrdered; // (display, lower)
+            for (size_t ci : out.absorbed)
+            {
+                std::string bestFacet;
+                std::string bestFacetSurface;
+                double      bestScore = -1.0;
+                for (const auto& kv : clusterTokenCounts[ci])
+                {
+                    const std::string& lc = kv.first;
+                    if (lc == bestLower) continue;
+                    if (lc.size() < 4)   continue;
+                    if (seenFacet.count(lc)) continue;
+                    if (lc.find(bestLower) != std::string::npos) continue;
+                    if (bestLower.find(lc) != std::string::npos) continue;
+                    double freq  = static_cast<double>(kv.second);
+                    int    cross = facetCrossCluster[lc];
+                    // Prefer locally frequent + locally distinctive
+                    // tokens.  cross > 1 means another absorbed sub-
+                    // cluster also has this token -- demote it.
+                    double score = freq / (1.0 + 0.6 * (cross - 1));
+                    if (score > bestScore)
+                    {
+                        bestScore        = score;
+                        bestFacet        = lc;
+                        bestFacetSurface = clusterTokenSurfaces[ci][lc];
+                    }
+                }
+                if (bestFacet.empty()) continue;
+                seenFacet.insert(bestFacet);
+                std::string disp = bestFacetSurface.empty() ? bestFacet : bestFacetSurface;
+                facetsOrdered.push_back({ TitleCase(disp), bestFacet });
+                if (facetsOrdered.size() >= 4) break;
+            }
+            for (const auto& f : facetsOrdered) out.facets.push_back(f.first);
+            return out;
+        };
+
+        auto formatUmbrellaPhrase = [&](const Umbrella& u) -> std::string {
+            // Pick a verb that suits the rep-app type of the absorbed
+            // clusters.  Browser-dominant -> "Researching"; editor-
+            // dominant -> "Working on"; mixed -> "Exploring" (default).
+            int browserCount = 0, editorCount = 0;
+            for (size_t ci : u.absorbed)
+            {
+                const AppAgg& rep = bag[clusters[ci].repIdx];
+                if (rep.isBrowser) browserCount++;
+                else
+                {
+                    std::string v = AsciiLower(rep.verb);
+                    if (v.find("editing")  != std::string::npos ||
+                        v.find("drafting") != std::string::npos ||
+                        v.find("working")  != std::string::npos)
+                        editorCount++;
+                }
+            }
+            std::string verb = "Exploring";
+            if (browserCount > 0 && editorCount == 0) verb = "Researching";
+            else if (editorCount > 0 && browserCount == 0) verb = "Working on";
+
+            if (u.facets.size() >= 3)
+            {
+                // "Exploring X and its various aspects like A, B and C"
+                size_t shown = (std::min)(u.facets.size(), size_t{4});
+                std::string tail;
+                for (size_t i = 0; i < shown; ++i)
+                {
+                    if (i == 0)                          tail += u.facets[i];
+                    else if (i + 1 == shown)             tail += " and " + u.facets[i];
+                    else                                 tail += ", "    + u.facets[i];
+                }
+                return verb + " " + u.surface +
+                       " and its various aspects like " + tail;
+            }
+            else if (u.facets.size() == 2)
+            {
+                return verb + " " + u.surface +
+                       " across " + u.facets[0] + " and " + u.facets[1];
+            }
+            else if (u.facets.size() == 1)
+            {
+                return verb + " " + u.surface + " (focus: " + u.facets[0] + ")";
+            }
+            return verb + " " + u.surface;
+        };
+
+        Umbrella umbrella = detectUmbrella();
+        // Require at least 2 facets for the umbrella line to be more
+        // informative than the individual sub-cluster phrases.
+        bool umbrellaActive = (umbrella.facets.size() >= 2);
+
         // ---- Adaptive top-N --------------------------------------
         //
-        // The context "summary" is now a vector of 1-3 short phrase
-        // lines (one per cluster), instead of a single bullet-joined
-        // line.  Guard rails:
+        // Emit at most 3 lines.  If the umbrella fired, line 1 is the
+        // umbrella phrase and we skip all absorbed clusters; the
+        // remaining lines come from clusters not absorbed (subject to
+        // the 5% focus floor in non-category mode).
         //
-        //   1. Hard cap of 3 lines (clusters) in the head.  Anything
-        //      beyond is collapsed into a trailing "+ N other thread(s)"
-        //      line.
-        //   2. Drop clusters whose focus contribution is < 5% of the
-        //      total -- those are typically a tab the user glanced at
-        //      for a few seconds and are pure noise.  Skipped in
-        //      category mode where any cluster is signal.
-        //   3. Stop once we've covered 90% of focus (the prior 80%
-        //      was too tight; 90% lets the second cluster in for users
-        //      with one dominant + one secondary activity).
+        // The trailing "+ N other thread(s)" suffix is **gone** -- the
+        // summary is multi-line now, so either a thread is informative
+        // enough to deserve its own line or it's dropped silently.
         const size_t kMaxSummaryLines     = 3;
         const int    kMinClusterPctOfFocus = 5;
         std::vector<std::string> lines;
         int    covered  = 0;
         size_t included = 0;
+
+        if (umbrellaActive)
+        {
+            std::string ulin = formatUmbrellaPhrase(umbrella);
+            if (!ulin.empty())
+            {
+                lines.push_back(std::move(ulin));
+                included = 1;
+                covered  = umbrella.focus;
+            }
+        }
+
         for (size_t i = 0; i < clusters.size(); ++i)
         {
-            if (!categoryMode)
+            if (included >= kMaxSummaryLines) break;
+            if (umbrellaActive && umbrella.absorbed.count(i)) continue;
+            if (!categoryMode && included >= 1 && bagTotalFocus > 0)
             {
-                if (included >= kMaxSummaryLines) break;
-                if (included >= 1 && bagTotalFocus > 0)
-                {
-                    int clusterPct =
-                        static_cast<int>((clusters[i].totalFocus * 100LL)
-                                         / bagTotalFocus);
-                    if (clusterPct < kMinClusterPctOfFocus) continue;
-                }
+                int clusterPct =
+                    static_cast<int>((clusters[i].totalFocus * 100LL)
+                                     / bagTotalFocus);
+                if (clusterPct < kMinClusterPctOfFocus) continue;
             }
-            else
-            {
-                if (included >= kMaxSummaryLines) break;
-            }
-            std::string phrase = clusterPhrase(clusters[i]);
-            if (phrase.empty()) continue;
-            if (included > 0
-             && bagTotalFocus > 0
+            if (bagTotalFocus > 0
              && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 90)
                 break;
+            std::string phrase = clusterPhrase(clusters[i]);
+            if (phrase.empty()) continue;
             lines.push_back(std::move(phrase));
             covered += clusters[i].totalFocus;
             ++included;
-        }
-        if (!lines.empty() && included < clusters.size())
-        {
-            size_t remaining = clusters.size() - included;
-            std::ostringstream o;
-            const char* label = (remaining == 1) ? " other thread" : " other threads";
-            o << "+ " << remaining << label;
-            lines.back() += std::string(" \xC2\xB7 ") + o.str();
         }
 
         out.lines       = std::move(lines);

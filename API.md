@@ -1709,7 +1709,45 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.7.*
+*This documentation describes WARP API version 5.8.*
+
+*Changes from v5.7:*
+- ***Umbrella detection on cross-cluster shared themes.***  When a single
+  content token appears in titles of at least 50% of the top clusters AND
+  those clusters together carry at least 50% of focus, the composer now
+  collapses them into a single descriptive line of the form
+
+      "Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"
+
+  (with `"Researching"` instead of `"Exploring"` when the absorbed
+  clusters are all browser-side, and `"Working on"` when they're all
+  editor-side).  Each absorbed sub-cluster contributes its most
+  distinctive non-umbrella token as a facet.  Facets are deduped and
+  capped at 4 in the phrase.
+
+  Example: three clusters about `Football Strategy.pdf`,
+  `Football Players.docx`, and `Football Match Broadcasting.pptx`
+  previously emitted three separate lines (`"Working on Football
+  Strategy"` / `"Working on Football Players"` / `"Working on
+  Broadcasting"`).  They now collapse into a single coherent line:
+
+      "Exploring Football and its various aspects like Strategy, Players and Broadcasting"
+
+  When the umbrella fires, the absorbed clusters are skipped in the
+  rest of the summary; remaining (non-absorbed) clusters get their
+  normal `<verb> <theme>` lines up to the 3-line cap.
+
+- ***Dropped the `"… + N other thread(s)"` trailing suffix.***  The
+  summary is now multi-line, so the per-line phrases stand on their
+  own — there's no need to apologize for over-flow with a meaningless
+  tail.  Clusters that don't fit the 3-line cap or don't meet the 5%
+  focus floor are simply dropped from the summary (they're still
+  counted in `thread_count` and visible in `items[]`).
+
+- ***No request- or response-shape changes.***  All field names
+  (`summary`, `summary_files`, `summary_websites`, `summary_apps`)
+  and types are unchanged from v5.7.  Existing consumers see only
+  better, more coherent summary lines.
 
 *Changes from v5.6:*
 - ***Context "one-liner" renamed to "context summary" and reshaped as
