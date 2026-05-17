@@ -1699,30 +1699,67 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 {
                     // Category-mode fallback: theme extraction produced
                     // nothing (titles got over-filtered by the brand /
-                    // stop-word / file-extension filters).  Instead of
-                    // emitting verb+friendlyName (`"Drafting Word"`,
-                    // which is useless), surface the actual cleaned
-                    // title of the representative entry.  This handles
-                    // edge cases like a Word doc whose entire title is
-                    // brand-y ("Microsoft Word Document.docx") or a
-                    // file whose stem after the extension strip is
-                    // a single short token rejected as <3 chars.
+                    // stop-word / file-extension filters).
+                    //
+                    // Strategy: try harder before giving up to a generic
+                    // verb+friendlyName phrase.
+                    //
+                    //   1. cleaned bestTitle with ext stripped
+                    //   2. rawTitle with ext stripped (catches cases
+                    //      where CleanTitle reduced everything to the
+                    //      app name, but the raw form has the doc info)
+                    //   3. union of all member titles (multi-member
+                    //      cluster -- maybe one member has a useful
+                    //      title even if the rep doesn't)
+                    //   4. friendlyName as last resort
+                    //
+                    // A "useful" surface is one that:
+                    //   - is non-empty AND
+                    //   - doesn't equal the friendly name (case-insens.) AND
+                    //   - has at least 4 chars OR contains a space.
                     const AppAgg& rep = bag[cl.repIdx];
                     std::string verb = rep.verb.empty() ? std::string("Using") : rep.verb;
                     if (!verb.empty() && verb[0] >= 'a' && verb[0] <= 'z')
                         verb[0] = char(verb[0] - 32);
 
-                    // Prefer the cleaned title with the extension
-                    // stripped (".docx" / ".pdf" etc. just adds noise).
                     auto stripExt = [](std::string s) {
                         size_t dot = s.find_last_of('.');
                         if (dot != std::string::npos && dot > 0 && dot >= s.size() - 6)
                             s.erase(dot);
                         return s;
                     };
+                    auto isUseful = [&](const std::string& s) -> bool {
+                        if (s.empty()) return false;
+                        std::string lo = AsciiLower(s);
+                        std::string fn = AsciiLower(rep.friendlyName);
+                        if (lo == fn) return false;
+                        if (lo.size() < 4 && s.find(' ') == std::string::npos)
+                            return false;
+                        return true;
+                    };
 
-                    std::string titleSurface = stripExt(rep.bestTitle);
-                    if (titleSurface.empty()) titleSurface = stripExt(rep.rawTitle);
+                    std::string titleSurface;
+                    std::string cand;
+
+                    cand = stripExt(rep.bestTitle);
+                    if (isUseful(cand)) titleSurface = cand;
+
+                    if (titleSurface.empty())
+                    {
+                        cand = stripExt(rep.rawTitle);
+                        if (isUseful(cand)) titleSurface = cand;
+                    }
+
+                    if (titleSurface.empty())
+                    {
+                        for (size_t mi : cl.members)
+                        {
+                            cand = stripExt(bag[mi].bestTitle);
+                            if (isUseful(cand)) { titleSurface = cand; break; }
+                            cand = stripExt(bag[mi].rawTitle);
+                            if (isUseful(cand)) { titleSurface = cand; break; }
+                        }
+                    }
 
                     if (!titleSurface.empty())
                     {
@@ -1738,7 +1775,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     }
                     else
                     {
-                        p = verb + " " + rep.friendlyName;
+                        // Genuinely no useful title anywhere -- avoid
+                        // "Drafting Word"; emit "Working in Word"
+                        // (slightly less wrong as a status line).
+                        p = "Working in " + rep.friendlyName;
                     }
                 }
                 else
@@ -2202,19 +2242,33 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     //       common case without losing the "briefly-touched file"
     //       capability for the dormant-app case.
     {
-        // (b): if any real file app has >= 30s of focus, the focused
-        // signal dominates.  Skip augmentation.
-        bool haveFocusedFileApp = false;
+        // (b): refined "skip augmentation" gate.  The old gate skipped
+        // augmentation whenever any real file app had >= 30 s of focus.
+        // That backfired when Word/Excel/PowerPoint had a generic
+        // title like "Word" (no document name visible in the title
+        // bar -- happens with certain Office 365 modes), because the
+        // focused app's title yielded ZERO content tokens AND the
+        // augmentation that would have surfaced the actual filename
+        // was suppressed.
+        //
+        // Refined gate: only skip augmentation when the focused file
+        // apps already provide a usable signal -- defined as at least
+        // one extractable content token across their titles.  When
+        // they don't (titles like "Word", "Excel", "PowerPoint"
+        // alone), let augmentation through so the actual filename
+        // from FileMonitor surfaces in the summary.
+        bool haveFocusedFileApp        = false;
+        bool focusedAppHasUsefulTitle  = false;
         for (const auto& a : rankedFiles)
         {
-            if (a.totalFocusSecs >= 30)
-            {
-                haveFocusedFileApp = true;
-                break;
-            }
+            if (a.totalFocusSecs < 30) continue;
+            haveFocusedFileApp = true;
+            auto toks = ExtractContentTokens(a.bestTitle);
+            if (!toks.empty()) { focusedAppHasUsefulTitle = true; break; }
         }
+        bool skipAugmentation = haveFocusedFileApp && focusedAppHasUsefulTitle;
 
-        if (!haveFocusedFileApp)
+        if (!skipAugmentation)
         {
             // (a): user-content extension allowlist.  Mirrors the
             // extension set in TitleLooksLikeFileActivity above (the
