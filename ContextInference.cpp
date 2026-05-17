@@ -1145,10 +1145,10 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 
     // Append on material change: different one-liner (combined or any of
     // the per-category lines) OR different dominant app.
-    if (snap.oneLiner          != prev.oneLiner)          return true;
-    if (snap.oneLinerFiles != prev.oneLinerFiles) return true;
-    if (snap.oneLinerWebsites  != prev.oneLinerWebsites)  return true;
-    if (snap.oneLinerApps      != prev.oneLinerApps)      return true;
+    if (snap.summary         != prev.summary)         return true;
+    if (snap.summaryFiles    != prev.summaryFiles)    return true;
+    if (snap.summaryWebsites != prev.summaryWebsites) return true;
+    if (snap.summaryApps     != prev.summaryApps)     return true;
     if (!snap.items.empty() && !prev.items.empty()
      && snap.items.front().exe != prev.items.front().exe)
         return true;
@@ -1329,9 +1329,9 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     // -----------------------------------------------------------------
     struct OneLinerBuild
     {
-        std::string      text;
-        std::vector<int> clusterOf;     // per-bag-entry cluster id, 0-based
-        int              threadCount = 0;
+        std::vector<std::string> lines;
+        std::vector<int>         clusterOf;     // per-bag-entry cluster id, 0-based
+        int                      threadCount = 0;
     };
 
     auto composeOneLinerFromBag = [&](const std::vector<AppAgg>& bag,
@@ -1347,32 +1347,16 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         int                              bagTotalFocus = 0;
         for (const auto& a : bag) bagTotalFocus += (std::max)(0, a.totalFocusSecs);
 
-        if (categoryMode)
+        if (m_modelReady && bag.size() >= 2)
         {
-            // Per-category bags (Documents / Websites / Apps) tend to be
-            // small (2-16 entries) and topic-diverse.  Sentence-encoder clustering
-            // on such a bag produces mostly singleton clusters whose
-            // themes degrade to brand-name-only token sets — yielding
-            // verbatim-title soup once the per-cluster fallback to
-            // `phraseFor` kicks in.  Force every entry into ONE virtual
-            // cluster instead: this pools content tokens across all
-            // titles so `themeFor` has enough material to distill 1-2
-            // genuinely semantic tokens, and gives `clusterPhrase` a
-            // multi-member cluster (so it adds the "across X & Y"
-            // suffix instead of falling back to verbatim).
-            centroids.push_back({});
-            clTotalFocus.push_back(bagTotalFocus);
-            std::vector<size_t> members;
-            members.reserve(bag.size());
-            for (size_t i = 0; i < bag.size(); ++i)
-            {
-                members.push_back(i);
-                clOf[i] = 0;
-            }
-            clMembers.push_back(std::move(members));
-        }
-        else if (m_modelReady && bag.size() >= 2)
-        {
+            // Natural clustering for both "All" and category modes.
+            // The old categoryMode behaviour forced every bag entry
+            // into one virtual cluster as a workaround for the small/
+            // diverse bag -> singleton-cluster -> verbatim-mish-mash
+            // failure mode -- which is now handled by focus-weighted
+            // theme scoring (low-focus titles' tokens get demoted to
+            // 0.2x score below 5% focus coverage).  Natural clusters
+            // give each meaningful sub-thread its own summary line.
             const size_t embedLimit = (std::min)(bag.size(), static_cast<size_t>(8));
             std::vector<std::vector<float>> embs(bag.size());
             for (size_t i = 0; i < embedLimit; ++i)
@@ -1792,30 +1776,30 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
         // ---- Adaptive top-N --------------------------------------
         //
-        // For the combined "All" one-liner we want a coherent
-        // *summary* of what the user is actually doing, not a kitchen
-        // sink of every little cluster.  Three guard rails:
+        // The context "summary" is now a vector of 1-3 short phrase
+        // lines (one per cluster), instead of a single bullet-joined
+        // line.  Guard rails:
         //
-        //   1. Hard cap at 3 clusters in the head.  Anything beyond is
-        //      collapsed into a trailing "+ N other thread(s)".
+        //   1. Hard cap of 3 lines (clusters) in the head.  Anything
+        //      beyond is collapsed into a trailing "+ N other thread(s)"
+        //      line.
         //   2. Drop clusters whose focus contribution is < 5% of the
-        //      total -- these are typically a tab the user glanced at
-        //      for a few seconds and are pure noise.
-        //   3. Stop once we hit ONE_LINER_BUDGET (180 chars) or 80%
-        //      cumulative focus coverage (the prior behaviour).
-        //
-        // In category mode we always force every entry into one
-        // cluster, so guard rails 1 & 2 are no-ops there.
-        const size_t kMaxClustersHead     = 3;
+        //      total -- those are typically a tab the user glanced at
+        //      for a few seconds and are pure noise.  Skipped in
+        //      category mode where any cluster is signal.
+        //   3. Stop once we've covered 90% of focus (the prior 80%
+        //      was too tight; 90% lets the second cluster in for users
+        //      with one dominant + one secondary activity).
+        const size_t kMaxSummaryLines     = 3;
         const int    kMinClusterPctOfFocus = 5;
-        std::string oneLiner;
+        std::vector<std::string> lines;
         int    covered  = 0;
         size_t included = 0;
         for (size_t i = 0; i < clusters.size(); ++i)
         {
             if (!categoryMode)
             {
-                if (included >= kMaxClustersHead) break;
+                if (included >= kMaxSummaryLines) break;
                 if (included >= 1 && bagTotalFocus > 0)
                 {
                     int clusterPct =
@@ -1824,29 +1808,30 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     if (clusterPct < kMinClusterPctOfFocus) continue;
                 }
             }
+            else
+            {
+                if (included >= kMaxSummaryLines) break;
+            }
             std::string phrase = clusterPhrase(clusters[i]);
-            std::string candidate = oneLiner.empty()
-                ? phrase
-                : oneLiner + " \xC2\xB7 " + phrase;
-            if (i > 0
-             && (candidate.size() > ONE_LINER_BUDGET
-              || (bagTotalFocus > 0
-                  && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 80)))
+            if (phrase.empty()) continue;
+            if (included > 0
+             && bagTotalFocus > 0
+             && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 90)
                 break;
-            oneLiner = candidate;
+            lines.push_back(std::move(phrase));
             covered += clusters[i].totalFocus;
             ++included;
         }
-        if (included < clusters.size())
+        if (!lines.empty() && included < clusters.size())
         {
             size_t remaining = clusters.size() - included;
             std::ostringstream o;
             const char* label = (remaining == 1) ? " other thread" : " other threads";
-            o << oneLiner << " \xC2\xB7 + " << remaining << label;
-            oneLiner = o.str();
+            o << "+ " << remaining << label;
+            lines.back() += std::string(" \xC2\xB7 ") + o.str();
         }
 
-        out.text        = std::move(oneLiner);
+        out.lines       = std::move(lines);
         out.clusterOf   = std::move(clOf);
         out.threadCount = static_cast<int>(clusters.size());
         return out;
@@ -1891,7 +1876,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             std::string p = WideToUtf8(it->path);
             size_t slash = p.find_last_of("/\\");
             std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-            snap.oneLiner = "Editing \"" + base + "\"";
+            snap.summary.push_back("Editing \"" + base + "\"");
             snap.confidence = 0.35;
         }
         else if (!apps.empty())
@@ -1901,23 +1886,24 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     return a.timestampUtc < b.timestampUtc;
                 });
             auto cls = ClassifyApp(it->exeName, it->exePath);
-            snap.oneLiner = "Launched " + cls.first;
+            snap.summary.push_back("Launched " + cls.first);
             snap.confidence = 0.25;
         }
         else
         {
-            snap.oneLiner   = "(no recent user activity)";
+            snap.summary.push_back("(no recent user activity)");
             snap.confidence = 0.0;
         }
         return snap;
     }
 
-    snap.oneLiner = allBuild.text;
+    snap.summary = allBuild.lines;
 
     // -----------------------------------------------------------------
-    // Per-category one-liners.  Each is an *independent* projection of
+    // Per-category summaries.  Each is an *independent* projection of
     // the same activity window, composed through the same pipeline
     // above.  A consumer picks one of {all, files, websites, apps} via
+    // the dropdown to narrow the surface.
     // the dropdown to narrow the surface.
     //
     // Categorization rules (in priority order, first match wins):
@@ -2145,9 +2131,9 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    snap.oneLinerFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).text;
-    snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb,  /*categoryMode=*/true).text;
-    snap.oneLinerApps      = composeOneLinerFromBag(rankedApps, /*categoryMode=*/true).text;
+    snap.summaryFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).lines;
+    snap.summaryWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
+    snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
     // ---- Confidence -----------------------------------------------
     // Heuristic: 0 if no focus, ~0.3 with a small amount of focus, up
@@ -2170,23 +2156,34 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
                                                    const std::string& category)
 {
-    // Resolve the top-level "one_liner" surface based on the requested
+    // Resolve the top-level `summary` surface based on the requested
     // category and decide which per-category fields to emit.
     //
-    //   * category == "all": the combined one-liner is surfaced as
-    //     `one_liner` and the three per-category lines are *also*
+    //   * category == "all": the combined summary is surfaced as
+    //     `summary` and the three per-category summaries are *also*
     //     emitted (so a single "All" round-trip carries the data the
     //     UI dropdown can switch between without re-querying).
     //
     //   * category == "files" / "websites" / "apps": only the
-    //     matching per-category line is emitted -- as the top-level
-    //     `one_liner`.  The other two categories and the combined
-    //     "all" line are *not* serialized, keeping the response
+    //     matching per-category summary is emitted -- as the top-level
+    //     `summary`.  The other two categories and the combined
+    //     "all" summary are *not* serialized, keeping the response
     //     focused on what the consumer asked for.
-    std::string topLine = s.oneLiner;
-    if      (category == "files")     topLine = s.oneLinerFiles;
-    else if (category == "websites")  topLine = s.oneLinerWebsites;
-    else if (category == "apps")      topLine = s.oneLinerApps;
+    auto emitArray = [&](std::ostringstream& out,
+                         const std::vector<std::string>& lines) {
+        out << "[";
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            if (i) out << ",";
+            out << "\"" << EscapeJson(lines[i]) << "\"";
+        }
+        out << "]";
+    };
+
+    const std::vector<std::string>* topSummary = &s.summary;
+    if      (category == "files")     topSummary = &s.summaryFiles;
+    else if (category == "websites")  topSummary = &s.summaryWebsites;
+    else if (category == "apps")      topSummary = &s.summaryApps;
 
     std::ostringstream o;
     o << "{"
@@ -2195,14 +2192,15 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"window_end\":"      << s.windowEndTs
       << ",\"window_seconds\":"  << s.windowSeconds
       << ",\"category\":\""      << EscapeJson(category) << "\""
-      << ",\"one_liner\":\""     << EscapeJson(topLine)  << "\"";
+      << ",\"summary\":";
+    emitArray(o, *topSummary);
 
     if (category == "all")
     {
-        // Emit all three per-category lines alongside the combined one.
-        o << ",\"one_liner_files\":\""    << EscapeJson(s.oneLinerFiles)    << "\""
-          << ",\"one_liner_websites\":\"" << EscapeJson(s.oneLinerWebsites) << "\""
-          << ",\"one_liner_apps\":\""     << EscapeJson(s.oneLinerApps)     << "\"";
+        // Emit all three per-category summaries alongside the combined.
+        o << ",\"summary_files\":";    emitArray(o, s.summaryFiles);
+        o << ",\"summary_websites\":"; emitArray(o, s.summaryWebsites);
+        o << ",\"summary_apps\":";     emitArray(o, s.summaryApps);
     }
 
     o << ",\"activity_count\":" << s.activityCount

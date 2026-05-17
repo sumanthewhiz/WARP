@@ -486,12 +486,12 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
     SendMessageW(g_hBtnInferLookup, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
     // Recent context buttons (latest snapshot + last-N history)
-    g_hBtnRecentContext = CreateWindowW(L"BUTTON", L"Show Recent Context",
+    g_hBtnRecentContext = CreateWindowW(L"BUTTON", L"Show Context Summary",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
         0, 0, 0, 0, hWnd, (HMENU)IDB_RECENT_CONTEXT, hInstance, nullptr);
     SendMessageW(g_hBtnRecentContext, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
-    g_hBtnContextHistory = CreateWindowW(L"BUTTON", L"Show Context History (last 10)",
+    g_hBtnContextHistory = CreateWindowW(L"BUTTON", L"Show Summary History (last 10)",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
         0, 0, 0, 0, hWnd, (HMENU)IDB_CONTEXT_HISTORY, hInstance, nullptr);
     SendMessageW(g_hBtnContextHistory, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);

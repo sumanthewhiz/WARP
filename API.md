@@ -97,7 +97,7 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 | Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
 | Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
-| Dynamic context awareness | Use `GetRecentContext` for the latest one-liner of what the user is doing right now (e.g., *"Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks"*); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
+| Dynamic context awareness | Use `GetRecentContext` for the latest **context summary** (1–3 phrase lines describing what the user is doing right now — e.g., `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
 
 ---
 
@@ -279,14 +279,15 @@ you received in the previous response to get only new/updated records.
 
 #### GetRecentContext
 
-Retrieve the **latest** one-liner snapshot from the `ContextInference`
-summarizer. This operation has no parameters.
+Retrieve the **latest context-summary** snapshot from the `ContextInference`
+summarizer.  The summary is a JSON array of 1–3 short phrase lines (one per
+cluster of activity) that describe what the user is actively doing.
 
-Every 60 seconds, WARP gathers all activities from the last 15-minute window
+Every 60 seconds, WARP gathers all activities from the lookback window
 (overlaying the user's currently-active foreground window as a virtual focus
 row), classifies each app via a layered classifier (~80-entry exact-match table
-→ vendor-path heuristics → exe-name fallback), and composes a single
-human-readable one-liner that names the actual documents, browser tabs, and
+→ vendor-path heuristics → exe-name fallback), and composes a human-readable
+context summary that names the actual documents, browser tabs, and
 apps the user is working with — not a fixed bucket label.
 
 ```json
@@ -299,7 +300,7 @@ apps the user is working with — not a fixed bucket label.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: `"all"` returns the combined line plus all three per-category lines; any other value returns only the matching category's one-liner. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
+| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which summary is surfaced as the top-level `summary` field **and** the response shape: `"all"` returns the combined summary plus all three per-category summaries; any other value returns only the matching category's summary. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
 | `window_seconds` | `integer` | `900` (= 15 min) | Activity lookback span. Snapped to the nearest of: 300, 900, 1800, 3600, 7200, 21600, 86400, 604800, 1296000, 2592000 (5 min, 15 min, 30 min, 1 h, 2 h, 6 h, 24 h, 7 d, 15 d, 30 d). 15 min serves the cached snapshot from the 60-sec timer; any other value composes fresh on demand. |
 
 The response is grounded in observed window titles and tab names, so it stays
@@ -328,7 +329,7 @@ memory for an LLM agent, or rendering a "what was I doing" timeline.
 | `window_seconds` | `integer` | `900` | Filters history to snapshots whose `timestamp` falls within the last `window_seconds`.  Larger values include more historical rows; each row's underlying compute window stays at the rolling-history cadence (15 min). |
 
 History entries are de-duplicated on append: a new snapshot is recorded only on
-**material change** — different one-liner, different dominant app, or a
+**material change** — different summary, different dominant app, or a
 5-minute heartbeat — so the returned list reflects context *transitions*
 rather than 60-second polling artifacts.
 
@@ -553,13 +554,16 @@ Each section has:
 The shape varies with the requested `category`:
 
 * **`category == "all"` (default).** The response carries the **combined**
-  one-liner as `one_liner` plus all three per-category one-liners
-  (`one_liner_files` / `_websites` / `_apps`), so a UI that wants to
+  summary as `summary` plus all three per-category summaries
+  (`summary_files` / `_websites` / `_apps`), so a UI that wants to
   switch facets locally can do so without re-querying.
 * **`category == "files" | "websites" | "apps"`.** Only the matching
-  per-category one-liner is returned (as `one_liner`). The other
-  categories — including the combined "all" line — are **omitted**, keeping
-  the response focused on what the caller asked for.
+  per-category summary is returned (as `summary`). The other
+  categories — including the combined "all" summary — are **omitted**,
+  keeping the response focused on what the caller asked for.
+
+Each `summary` is a JSON **array** of 1–3 short phrase strings (one per
+cluster of activity).  Consumers render them as separate lines.
 
 **Example — `category == "all"`, `window_seconds = 900`:**
 
@@ -571,10 +575,14 @@ The shape varies with the requested `category`:
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "all",
-    "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
-    "one_liner_files":    "Editing Context Inference module · Drafting Daily Standup notes",
-    "one_liner_websites": "Researching React Hooks · Reviewing GitHub PR for ContextInference",
-    "one_liner_apps":     "Discussing in Slack & Teams · Triaging Outlook inbox",
+    "summary": [
+      "Working on Context Inference (across Visual Studio & Edge)",
+      "Discussing Daily Standup (across Teams & Outlook)",
+      "Researching React Hooks"
+    ],
+    "summary_files":    ["Editing Context Inference module", "Drafting Daily Standup notes"],
+    "summary_websites": ["Researching React Hooks", "Reviewing GitHub PR for ContextInference"],
+    "summary_apps":     ["Discussing in Slack & Teams", "Triaging Outlook inbox"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -606,7 +614,7 @@ The shape varies with the requested `category`:
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "files",
-    "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
+    "summary": ["Editing Context Inference module", "Drafting Daily Standup notes"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -628,10 +636,10 @@ The shape varies with the requested `category`:
 | `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds, UTC). |
 | `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` after normalisation to the nearest allowed value. |
 | `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
-| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
-| `one_liner_files` | `string` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
-| `one_liner_websites` | `string` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
-| `one_liner_apps` | `string` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
+| `summary` | `string[]` | Array of 1–3 short phrase lines describing what the user is actively doing. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
+| `summary_files` | `string[]` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
+| `summary_websites` | `string[]` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
+| `summary_apps` | `string[]` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
@@ -639,12 +647,12 @@ The shape varies with the requested `category`:
 | `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the summary shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
-- If no activities occurred in the 15-minute window, `one_liner` will be
-  `"User appears to be idle"` and `items[]` will be empty.
+- If no activities occurred in the lookback window, `summary` will be an
+  array containing `"User appears to be idle"` and `items[]` will be empty.
 - The summarizer runs every 60 seconds. Calling `GetRecentContext` between
   runs returns the result from the most recent completed cycle.
 - Snapshots are stored in memory (not persisted to disk). Restarting WARP
@@ -654,7 +662,7 @@ The shape varies with the requested `category`:
   actual document, tab, and app titles in the window. If `models/bge-small.onnx`
   (or the legacy `models/minilm.onnx`) + `models/vocab.txt` are missing the engine still runs and emits
   `"model": "deterministic"`; consumers should treat both modes as a single
-  interface and just read `one_liner` / `items` / `thread_id` as documented.
+  interface and just read `summary` / `items` / `thread_id` as documented.
 
 ### GetRecentContexts Response
 
@@ -665,7 +673,7 @@ The shape varies with the requested `category`:
       "timestamp": 1750012345,
       "window_start": 1750011445,
       "window_end": 1750012345,
-      "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads",
+      "summary": ["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "+ 2 other threads"],
       "activity_count": 47,
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
@@ -679,7 +687,7 @@ The shape varies with the requested `category`:
       "timestamp": 1750012045,
       "window_start": 1750011145,
       "window_end": 1750012045,
-      "one_liner": "Researching React Hooks · Reading about API Reference",
+      "summary": ["Researching React Hooks", "Reading about API Reference"],
       "activity_count": 31,
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
@@ -734,7 +742,7 @@ The shape varies with the requested `category`:
 | Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
 | `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
 | `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
-| `GetRecentContext` returns an empty `one_liner` and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
+| `GetRecentContext` returns an empty `summary` array and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
 | `GetRecentContexts` returns `"recent_contexts": []` | History is empty (just started, or `ClearAll` was called). `history_count` will also be `0`. |
 | Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
 
@@ -1009,7 +1017,7 @@ int main()
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
 
-    // Latest one-liner snapshot
+    // Latest context summary snapshot
     const char* req1 = R"({"op":"GetRecentContext"})";
     DWORD written = 0;
     WriteFile(hPipe, req1, (DWORD)strlen(req1), &written, nullptr);
@@ -1253,12 +1261,12 @@ data = query_warp({"window": "2h", "types": ["browsing"]})
 for e in data.get("browsing_activities", {}).get("events", []):
     print(f"  [{e['browser']}] {e['title']}")
 
-# --- Example: GetRecentContext (latest one-liner) ---
+# --- Example: GetRecentContext (latest context summary) ---
 context = query_warp({"op": "GetRecentContext"})
 rc = context.get("recent_context", {})
 print(f"\nCurrent context (confidence {rc.get('confidence', 0):.2f}, "
       f"{rc.get('activity_count', 0)} activities):")
-print(f"  {rc.get('one_liner', '(none)')}")
+print('  ' + ' / '.join(rc.get('summary', []) or ['(none)']))
 for item in rc.get("items", []):
     print(f"    - {item['app']}: {item['title']}  ({item['pct']:.0f}%)")
 
@@ -1266,7 +1274,7 @@ for item in rc.get("items", []):
 hist = query_warp({"op": "GetRecentContexts", "count": 20})
 print(f"\nLast {hist.get('returned', 0)} context snapshots:")
 for snap in hist.get("recent_contexts", []):
-    print(f"  [{snap['timestamp']}] {snap['one_liner']}")
+    print(f"  [{snap['timestamp']}] {' / '.join(snap.get('summary', []))}")
 
 # --- Example: QueryInferences for specific files ---
 inference = query_warp({
@@ -1346,7 +1354,7 @@ $browse.browsing_activities.events |
 $context = Query-Warp '{"op":"GetRecentContext"}'
 $rc = $context.recent_context
 Write-Host "`nCurrent context (confidence $([math]::Round($rc.confidence,2)), $($rc.activity_count) activities):"
-Write-Host "  $($rc.one_liner)"
+Write-Host "  $(($rc.summary -join ' / '))"
 foreach ($item in $rc.items) {
     Write-Host "    - $($item.app): $($item.title)  ($([math]::Round($item.pct,0))%)"
 }
@@ -1355,7 +1363,7 @@ foreach ($item in $rc.items) {
 $hist = Query-Warp '{"op":"GetRecentContexts","count":20}'
 Write-Host "`nLast $($hist.returned) context snapshots:"
 foreach ($snap in $hist.recent_contexts) {
-    Write-Host "  [$($snap.timestamp)] $($snap.one_liner)"
+    Write-Host "  [$($snap.timestamp)] $(($snap.summary -join ' / '))"
 }
 
 # QueryInferences for specific files
@@ -1454,7 +1462,7 @@ function queryWarp(request) {
         const context = await queryWarp({ op: 'GetRecentContext' });
         const rc = context.recent_context || {};
         console.log(`\nCurrent context (confidence ${(rc.confidence || 0).toFixed(2)}, ${rc.activity_count || 0} activities):`);
-        console.log(`  ${rc.one_liner || '(none)'}`);
+        console.log(`  ${(rc.summary || []).join(' / ') || '(none)'}`);
         for (const item of (rc.items || [])) {
             console.log(`    - ${item.app}: ${item.title}  (${item.pct.toFixed(0)}%)`);
         }
@@ -1463,7 +1471,7 @@ function queryWarp(request) {
         const hist = await queryWarp({ op: 'GetRecentContexts', count: 20 });
         console.log(`\nLast ${hist.returned || 0} context snapshots:`);
         for (const snap of (hist.recent_contexts || [])) {
-            console.log(`  [${snap.timestamp}] ${snap.one_liner}`);
+            console.log(`  [${snap.timestamp}] ${(snap.summary || []).join(' / ')}`);
         }
 
         // QueryInferences -- get recency scores for specific files
@@ -1701,7 +1709,43 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.6.*
+*This documentation describes WARP API version 5.7.*
+
+*Changes from v5.6:*
+- ***Context "one-liner" renamed to "context summary" and reshaped as
+  an array of 1-3 phrase lines.***  The single-string `one_liner`
+  field is replaced by a JSON-array `summary` field that holds
+  separate phrase strings (one per cluster of activity).  Consumers
+  render each entry on its own line, giving the user a multi-line
+  semantic summary instead of a single bullet-separated line.
+- ***Field renames:***
+  - `one_liner`           → `summary`           (now `string[]`, was `string`)
+  - `one_liner_files`     → `summary_files`     (now `string[]`, was `string`)
+  - `one_liner_websites`  → `summary_websites`  (now `string[]`, was `string`)
+  - `one_liner_apps`      → `summary_apps`      (now `string[]`, was `string`)
+- ***Composer changes:***
+  - Per-category bags (Files / Websites / Apps) no longer force every
+    entry into one virtual cluster.  Natural sentence-encoder
+    clustering runs over them, so each meaningful sub-thread becomes
+    its own summary line.  (The original "force single cluster"
+    workaround was needed because of pre-focus-weighted scoring; the
+    focus-weighted scoring introduced in v5.6 makes it unnecessary
+    and lets us get multi-line per-category summaries.)
+  - Hard cap of 3 lines on the "All" summary (was: "All" was a
+    single-string line of arbitrary length).  Each line is a
+    `<verb> <theme>` phrase optionally followed by an `(across X &
+    Y …)` tail.
+  - Per-cluster phrases are no longer joined with ` · `; each is a
+    separate array element.
+- ***UI button labels:*** "Show Recent Context" → "Show Context
+  Summary"; "Show Context History" → "Show Summary History".  The
+  IPC operation names `GetRecentContext` / `GetRecentContexts` stay
+  the same -- only the rendered field shape changes.
+- ***Backward compatibility:*** **None for the JSON field names.**
+  Consumers that read `one_liner` / `one_liner_files` / etc. must be
+  updated to read `summary` / `summary_files` / etc. and to expect
+  an array rather than a string.  The legacy `category=documents`
+  enum alias for `category=files` is preserved.
 
 *Changes from v5.5:*
 - ***`category` enum renamed: `"documents"` → `"files"`.*** *The

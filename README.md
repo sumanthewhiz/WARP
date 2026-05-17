@@ -60,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a single human-readable **one-liner** describing what the user is actively doing — e.g. `Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the optional **BGE-small (`BAAI/bge-small-en-v1.5`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. (The legacy `all-MiniLM-L6-v2` ONNX is automatically picked up as a backward-compatibility fallback when `bge-small.onnx` isn't present; both produce 384-dim embeddings and share the same BERT WordPiece tokenizer.) For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `cross-title coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–2 tokens (up to 3 for per-category facets with many titles) become the cluster's theme phrase. The combined "All" one-liner is capped at the top 3 clusters and drops any cluster contributing less than 5 % of focus time, so the line stays *coherent* instead of becoming a mish-mash. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined one-liner, the snapshot also carries three independent one-liners — `one_liner_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `one_liner_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `one_liner_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same sentence-encoder cluster→theme pipeline. The UI dropdowns next to the *Show Recent Context* / *Show Context History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different one-liner in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a human-readable **context summary** of 1–3 short phrase lines describing what the user is actively doing — e.g. `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the optional **BGE-small (`BAAI/bge-small-en-v1.5`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. (The legacy `all-MiniLM-L6-v2` ONNX is automatically picked up as a backward-compatibility fallback when `bge-small.onnx` isn't present; both produce 384-dim embeddings and share the same BERT WordPiece tokenizer.) For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `focus-weighted coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–3 tokens become the cluster's theme phrase. The combined "All" summary is capped at 3 lines and drops any cluster contributing less than 5 % of focus time, so each line stays *coherent* instead of becoming a mish-mash. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined summary, the snapshot also carries three independent summaries — `summary_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `summary_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `summary_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same sentence-encoder cluster→theme pipeline. The UI dropdowns next to the *Show Context Summary* / *Show Summary History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different summary in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -664,7 +664,7 @@ cache via `ClearCache()`.
 #### `ContextInference` (`ContextInference.h` / `ContextInference.cpp`)
 
 A **dynamic, sentence-encoder-clustered** context summarizer that reads recent
-activity directly from SQLite and composes a single human-readable **one-liner**
+activity directly from SQLite and composes a multi-line **context summary** (1-3 phrase lines)
 describing what the user is actively doing — using the actual document names,
 browser tab titles, and application titles observed, **not** a fixed list of
 pre-defined topic buckets.
@@ -755,12 +755,12 @@ pre-defined topic buckets.
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
      capped at 0.99.
-4. Snapshots (`ContextSnapshot`: timestamp, window bounds, one-liner,
+4. Snapshots (`ContextSnapshot`: timestamp, window bounds, summary,
    activity count, focus seconds, confidence, dominant percentage, signal types,
    `model`, `thread_count`, top-5 `items[]` each with `thread_id`) are stored in
    a rolling history buffer (up to 1 440 entries = ~24 hours at 60-sec cadence).
 5. **Material-change dedup**: a new snapshot is appended to history only when (a)
-   the one-liner string differs from the last appended, **or** (b) the dominant
+   the summary differs from the last appended, **or** (b) the dominant
    exe changes, **or** (c) at least 5 minutes have elapsed since the last append.
    The "latest snapshot" pointer is refreshed unconditionally on every cycle.
 
@@ -778,9 +778,9 @@ the [GetRecentContext](#getrecentcontext) and
 > direction: it does not classify — it *clusters* the literal phrases
 > observed in the rolling window. Two activities are merged iff they are
 > semantically similar to each other, not to a pre-defined list. The result
-> is a richer, ground-truthful one-liner whose shape adapts to whatever the
+> is a richer, ground-truthful summary whose shape adapts to whatever the
 > user is doing. If the model files are not shipped or fail to load, the
-> engine still produces a per-app one-liner — it just no longer collapses
+> engine still produces a per-app summary — it just no longer collapses
 > related work into a single "thread".
 >
 > **Why BGE-small-en-v1.5 specifically?** `BAAI/bge-small-en-v1.5` is the
@@ -812,7 +812,7 @@ The API accepts four kinds of requests:
 2. **`QueryInferences`** — batch lookup of precomputed inference records.
 3. **`GetInferenceDeltas`** — incremental sync of inference records since a version
    watermark.
-4. **`GetRecentContext`** — retrieve the latest one-liner snapshot from the
+4. **`GetRecentContext`** — retrieve the latest context-summary snapshot from the
    `ContextInference` summarizer.
 5. **`GetRecentContexts`** — retrieve the last *N* snapshots (newest first) from
    the `ContextInference` rolling history buffer.
@@ -1051,7 +1051,7 @@ immediately.
 |                                  [Show Top Inferences]     |
 | [Enter path or URL to look up...                ] [Lookup] |
 |                                                            |
-| [Show Recent Context]                                      |
+| [Show Context Summary]                                     |
 |                                                            |
 | API Response
 | +--------------------------------------------------------+ |
@@ -1188,7 +1188,7 @@ flowchart TB
 | **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
 | **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
 | **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
-| **Context**      | `ContextInference` (BGE-small clustering) | 60-sec rolling 15-min summarizer; emits a one-liner + clustered `items[]`        |
+| **Context**      | `ContextInference` (BGE-small clustering) | 60-sec rolling summarizer; emits a 1–3 line `summary` + clustered `items[]`        |
 | **Context**      | `kAppClasses` + path heuristics      | 3-layer exe classifier (~80 known apps + JetBrains/Office/browsers)    |
 | **Context**      | `CleanTitle` + `ComposeOneLiner`     | UTF-8 separator normaliser, suffix stripper, adaptive top-N composer   |
 
@@ -1246,7 +1246,7 @@ flowchart TB
     from the last 15 minutes (overlaying the currently-active foreground
     window as a virtual focus row), classifies and cleans them, embeds the
     per-app phrases (when the sentence-encoder is loaded), runs greedy clustering at
-    cosine ≥ 0.65, and composes a one-liner snapshot. The snapshot is
+    cosine ≥ 0.65, and composes a context-summary snapshot. The snapshot is
     appended to the rolling history only on material change (different
     one-liner, different dominant app, or a 5-minute heartbeat).
 14. Every 6 hours, records older than 30 days are purged from all event
@@ -1427,8 +1427,8 @@ Returns up to 5 000 records per call, ordered by ascending `version`.
 
 ##### GetRecentContext
 
-Retrieve the **latest** one-liner snapshot from the `ContextInference`
-summarizer.
+Retrieve the **latest context summary** snapshot (1–3 phrase lines) from the
+`ContextInference` summarizer.
 
 ```json
 {
@@ -1440,7 +1440,7 @@ summarizer.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: with `"all"` the response also carries the three per-category one-liners (`one_liner_files` / `_websites` / `_apps`); for any other value only the matching category's one-liner is returned (as `one_liner`) — the other categories are omitted to keep the response focused. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
+| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which summary is surfaced as the top-level `summary` field **and** the response shape: with `"all"` the response also carries the three per-category summaries (`summary_files` / `_websites` / `_apps`); for any other value only the matching category's summary is returned (as `summary`) — the other categories are omitted to keep the response focused. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
 | `window_seconds` | `integer` | `900` (= 15 min) | Activity lookback window. Allowed values (snapped to the nearest match): 300 (5 min), 900 (15 min), 1800 (30 min), 3600 (1 h), 7200 (2 h), 21600 (6 h), 86400 (24 h), 604800 (7 d), 1296000 (15 d), 2592000 (30 d). For 15 min WARP serves the cached snapshot from the 60-sec background timer; for any other value the snapshot is composed fresh on demand against the requested span. |
 
 **Response (when `category == "all"`):**
@@ -1453,10 +1453,14 @@ summarizer.
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "all",
-    "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
-    "one_liner_files":    "Editing Context Inference module · Drafting Daily Standup notes",
-    "one_liner_websites": "Researching React Hooks · Reviewing GitHub PR for ContextInference",
-    "one_liner_apps":     "Discussing in Slack & Teams · Triaging Outlook inbox",
+    "summary": [
+      "Working on Context Inference (across Visual Studio & Edge)",
+      "Discussing Daily Standup (across Teams & Outlook)",
+      "Researching React Hooks"
+    ],
+    "summary_files":    ["Editing Context Inference module", "Drafting Daily Standup notes"],
+    "summary_websites": ["Researching React Hooks", "Reviewing GitHub PR for ContextInference"],
+    "summary_apps":     ["Discussing in Slack & Teams", "Triaging Outlook inbox"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -1488,7 +1492,7 @@ summarizer.
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "files",
-    "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
+    "summary": ["Editing Context Inference module", "Drafting Daily Standup notes"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -1510,10 +1514,10 @@ summarizer.
 | `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds). |
 | `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` (after normalization). |
 | `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
-| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
-| `one_liner_files` | `string` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file — code editors / IDEs / Office apps / OneNote / PDF readers / image viewers / design tools, **plus** any other app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pdf`, `.png`, `.cpp`, `.json`), **plus** recent file basenames from the file monitor. |
-| `one_liner_websites` | `string` | **Only present when `category == "all"`.** One-liner derived from browser tab titles (per-tab aggregation). |
-| `one_liner_apps` | `string` | **Only present when `category == "all"`.** One-liner derived from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Zoom / Webex), media players (Spotify / VLC), terminals, remote desktop, version-control UIs, etc. |
+| `summary` | `string[]` | Array of 1–3 short phrase lines describing what the user is actively doing. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
+| `summary_files` | `string[]` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file — code editors / IDEs / Office apps / OneNote / PDF readers / image viewers / design tools, **plus** any other app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pdf`, `.png`, `.cpp`, `.json`), **plus** recent file basenames from the file monitor. |
+| `summary_websites` | `string[]` | **Only present when `category == "all"`.** Summary derived from browser tab titles (per-tab aggregation). |
+| `summary_apps` | `string[]` | **Only present when `category == "all"`.** Summary derived from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Zoom / Webex), media players (Spotify / VLC), terminals, remote desktop, version-control UIs, etc. |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app. |
@@ -1550,8 +1554,8 @@ wants short-term memory of what the user has been doing.
 ```json
 {
   "recent_contexts": [
-    { "timestamp": 1750012345, "category": "all", "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads", "one_liner_files": "…", "one_liner_websites": "…", "one_liner_apps": "…", "confidence": 0.84, "model": "bge-small-en-v1.5", "thread_count": 3, "/* …full snapshot fields… */": null },
-    { "timestamp": 1750012045, "category": "all", "one_liner": "Reading \"GitHub - dev branch\" in Edge · Editing \"README.md - WARP\" in Visual Studio", "confidence": 0.71, "model": "bge-small-en-v1.5", "thread_count": 2, "/* … */": null }
+    { "timestamp": 1750012345, "category": "all", "summary": ["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "+ 2 other threads"], "summary_files": [ "…" ], "summary_websites": [ "…" ], "summary_apps": [ "…" ], "confidence": 0.84, "model": "bge-small-en-v1.5", "thread_count": 3, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012045, "category": "all", "summary": ["Reading GitHub dev branch in Edge", "Editing README.md in Visual Studio"], "confidence": 0.71, "model": "bge-small-en-v1.5", "thread_count": 2, "/* … */": null }
   ],
   "category": "all",
   "returned": 2,

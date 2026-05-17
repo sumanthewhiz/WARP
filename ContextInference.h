@@ -23,14 +23,16 @@ class ActivityDatabase;
 class ForegroundMonitor;
 
 // One snapshot in the rolling history of "what is the user doing right now?".
-// Each snapshot is composed from the last 15 minutes of foreground / browsing /
-// app-launch / file activity.  The literal one-liner text is built from the
-// actual document, tab, and application titles captured in the window.
+// Each snapshot is composed from the configured lookback window of foreground /
+// browsing / app-launch / file activity (default 15 min, user-selectable from
+// 5 min to 30 days).  The literal **summary** text is built from the actual
+// document, tab, and application titles captured in the window, as a vector
+// of 1-3 short phrase lines (one per cluster of activity).
 //
 // When the optional sentence-encoder embedding model is available the
 // composer additionally runs **dynamic semantic clustering** on the per-app
 // descriptions: apps whose embeddings are close in the 384-dim sentence space
-// are merged into one "thread of work" so the one-liner can surface that the
+// are merged into one "thread of work" so the summary can surface that the
 // user has, e.g., the auth source file open in VS Code AND the Auth PR open in
 // Edge as a single thread instead of two unrelated lines.  The clusters are
 // formed *dynamically from the observed titles* -- there is no fixed bucket
@@ -46,13 +48,18 @@ struct ContextSnapshot
     int64_t       windowStartTs  = 0;   // Inclusive start of the lookback window (epoch s).
     int64_t       windowEndTs    = 0;   // Inclusive end of the lookback window (epoch s).
     int64_t       windowSeconds  = 0;   // Width of the lookback window (= windowEndTs - windowStartTs).
-    std::string   oneLiner;             // Combined "All" one-liner summary.
-    // Category-specific one-liners.  Each is composed independently from a
+    // Multi-line "context summary": 1-3 short lines (one per cluster
+    // of activity) that semantically describe what the user is doing.
+    // Each entry is a separate phrase; consumers render them as
+    // separate lines or join with newlines.  Empty vector means no
+    // usable activity in the window.
+    std::vector<std::string> summary;
+    // Category-specific summaries.  Each is composed independently from a
     // *projection* of the same activity window so a consumer can ask
     // "what files has the user been in?", "what websites?", or "what
-    // apps?" without having to mentally separate them out of the combined
-    // line.  All three use the same dynamic-clustering + theme-distillation
-    // pipeline as the combined one -- only the input bag of titles differs.
+    // apps?" without having to mentally separate them out of the
+    // combined summary.  All three use the same dynamic-clustering +
+    // theme-distillation pipeline -- only the input bag of titles differs.
     //   * Files     -- ANY app where the user is engaged with a file: not
     //                  just whitelisted document-editor apps but ALSO any
     //                  app whose window title contains a recognized file
@@ -68,11 +75,11 @@ struct ContextSnapshot
     //                  desktop, version-control UIs, and anything else that
     //                  isn't engaged with a specific file.  Strictly
     //                  disjoint from Files and Websites.
-    // An empty string here means the category had no usable activity in the
-    // window.
-    std::string   oneLinerFiles;
-    std::string   oneLinerWebsites;
-    std::string   oneLinerApps;
+    // An empty vector here means the category had no usable activity in
+    // the window.
+    std::vector<std::string> summaryFiles;
+    std::vector<std::string> summaryWebsites;
+    std::vector<std::string> summaryApps;
     int           activityCount  = 0;   // Number of raw signals considered.
     int           focusSeconds   = 0;   // Total foreground time in the window.
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
@@ -101,7 +108,7 @@ struct ContextSnapshot
 // buckets).  This engine instead uses a sentence-encoder (BGE-small by
 // default, MiniLM as a backward-compatibility fallback) to **dynamically
 // cluster** the
-// observed titles -- the one-liner is composed from the literal documents,
+// observed titles -- the summary is composed from the literal documents,
 // tabs, and apps the user is engaged with, with semantically related items
 // merged into "threads of work".
 //
@@ -114,7 +121,7 @@ struct ContextSnapshot
 //     model load entirely.
 //   * Start(db, fg) -- spawns a background thread that wakes every 60 s,
 //     reads the last 15 minutes of activity from `db` plus the live
-//     foreground session from `fg`, composes a one-liner, and appends it
+//     foreground session from `fg`, composes a summary, and appends it
 //     to history when it materially changes (or every 5 min as a heartbeat
 //     -- whichever comes first).  The "latest" cache is always refreshed.
 //   * Stop()     -- joins the thread.
@@ -128,7 +135,7 @@ struct ContextSnapshot
 //
 // `category` is one of "all" (default), "files", "websites", "apps".
 // When supplied (and not "all") the response carries ONLY that
-// category's one-liner (as `one_liner`); the other categories are
+// category's summary (as `summary`); the other categories are
 // omitted from the response.  Backward-compat: the legacy value
 // "documents" is accepted and treated as "files".
 //
