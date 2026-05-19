@@ -6,11 +6,14 @@
 #include <mutex>
 #include <cstdint>
 
+#include "EventContext.h"
+
 // --- Event type flags (bitmask for queries) ---
 static const uint32_t EVENT_TYPE_FILE       = 0x01;
 static const uint32_t EVENT_TYPE_APP_LAUNCH = 0x02;
 static const uint32_t EVENT_TYPE_BROWSING   = 0x04;
-static const uint32_t EVENT_TYPE_ALL        = 0x07;
+static const uint32_t EVENT_TYPE_APP_FOCUS  = 0x08;
+static const uint32_t EVENT_TYPE_ALL        = 0x0F;
 
 struct FileActivity
 {
@@ -39,6 +42,16 @@ struct BrowsingActivity
     std::wstring url;            // URL if extractable, else empty
 };
 
+struct AppFocusActivity
+{
+    int64_t      id;
+    int64_t      timestampUtc;   // Unix epoch seconds (when focus started)
+    std::wstring exeName;        // e.g. "OUTLOOK.EXE"
+    std::wstring exePath;        // full path to the executable
+    std::wstring windowTitle;    // foreground window title
+    int          durationSecs;   // how long the app was in the foreground
+};
+
 enum class TimeWindow
 {
     Minutes15,
@@ -64,7 +77,8 @@ public:
     // File activity
     bool InsertActivity(const std::wstring& action,
                         const std::wstring& path,
-                        const std::wstring& oldPath = L"");
+                        const std::wstring& oldPath = L"",
+                        const EventContext& ctx     = EventContext{});
 
     std::vector<FileActivity> QueryFiles(TimeWindow window);
     std::vector<FileActivity> QueryFilesCustomSeconds(int64_t seconds);
@@ -72,7 +86,8 @@ public:
     // App launch activity
     bool InsertAppLaunch(const std::wstring& exeName,
                          const std::wstring& exePath,
-                         DWORD pid);
+                         DWORD               pid,
+                         const EventContext& ctx = EventContext{});
 
     std::vector<AppLaunchActivity> QueryAppLaunches(TimeWindow window);
     std::vector<AppLaunchActivity> QueryAppLaunchesCustomSeconds(int64_t seconds);
@@ -80,10 +95,21 @@ public:
     // Browsing activity
     bool InsertBrowsingActivity(const std::wstring& browser,
                                 const std::wstring& title,
-                                const std::wstring& url = L"");
+                                const std::wstring& url = L"",
+                                const EventContext& ctx = EventContext{});
 
     std::vector<BrowsingActivity> QueryBrowsing(TimeWindow window);
     std::vector<BrowsingActivity> QueryBrowsingCustomSeconds(int64_t seconds);
+
+    // App focus activity (foreground window tracking)
+    bool InsertAppFocusActivity(const std::wstring& exeName,
+                                const std::wstring& exePath,
+                                const std::wstring& windowTitle,
+                                int                 durationSecs,
+                                const EventContext& ctx = EventContext{});
+
+    std::vector<AppFocusActivity> QueryAppFocus(TimeWindow window);
+    std::vector<AppFocusActivity> QueryAppFocusCustomSeconds(int64_t seconds);
 
     void EvictOlderThan30Days();
     void ClearAll();

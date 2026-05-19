@@ -56,7 +56,7 @@ std::string InferenceEngine::NormalizeKey(const std::wstring& widePath)
     return WideToUtf8(lower);
 }
 
-double InferenceEngine::ComputeRecencyScore(int64_t now, int64_t lastOpenTs, int openCount7d)
+double InferenceEngine::ComputeRecencyScore(int64_t now, int64_t lastOpenTs, double openCount7d)
 {
     if (lastOpenTs <= 0) return 0.0;
 
@@ -97,9 +97,9 @@ bool InferenceEngine::LoadFromDb(const std::string& key, InferenceRecord& out)
         out.lastEventTs    = sqlite3_column_int64(stmt, 2);
         out.lastOpenTs     = sqlite3_column_int64(stmt, 3);
         out.lastEditTs     = sqlite3_column_int64(stmt, 4);
-        out.openCount7d    = sqlite3_column_int(stmt, 5);
-        out.openCount30d   = sqlite3_column_int(stmt, 6);
-        out.openCountTotal = sqlite3_column_int(stmt, 7);
+        out.openCount7d    = sqlite3_column_double(stmt, 5);
+        out.openCount30d   = sqlite3_column_double(stmt, 6);
+        out.openCountTotal = sqlite3_column_double(stmt, 7);
         out.recencyScore   = sqlite3_column_double(stmt, 8);
         out.version        = static_cast<uint32_t>(sqlite3_column_int(stmt, 9));
         out.updatedAt      = sqlite3_column_int64(stmt, 10);
@@ -131,9 +131,9 @@ void InferenceEngine::PersistRecord(const InferenceRecord& rec)
     sqlite3_bind_int64(stmt, 3, rec.lastEventTs);
     sqlite3_bind_int64(stmt, 4, rec.lastOpenTs);
     sqlite3_bind_int64(stmt, 5, rec.lastEditTs);
-    sqlite3_bind_int(stmt, 6, rec.openCount7d);
-    sqlite3_bind_int(stmt, 7, rec.openCount30d);
-    sqlite3_bind_int(stmt, 8, rec.openCountTotal);
+    sqlite3_bind_double(stmt, 6, rec.openCount7d);
+    sqlite3_bind_double(stmt, 7, rec.openCount30d);
+    sqlite3_bind_double(stmt, 8, rec.openCountTotal);
     sqlite3_bind_double(stmt, 9, rec.recencyScore);
     sqlite3_bind_int(stmt, 10, static_cast<int>(rec.version));
     sqlite3_bind_int64(stmt, 11, rec.updatedAt);
@@ -172,7 +172,8 @@ InferenceRecord& InferenceEngine::LoadOrCreate(const std::string& key,
 
 void InferenceEngine::OnFileEvent(const std::wstring& action,
                                    const std::wstring& path,
-                                   int64_t eventTs)
+                                   int64_t             eventTs,
+                                   double              confidence)
 {
     if (path.empty()) return;
 
@@ -184,12 +185,21 @@ void InferenceEngine::OnFileEvent(const std::wstring& action,
 
     rec.lastEventTs = eventTs;
 
-    if (actionUtf8 == "OPEN")
+    // Confidence-weighted accumulation: a stream of (n) events with
+    // average confidence c contributes (n * c) to the rolling counts.
+    // The previous threshold-based design (delta = (conf >= 0.5)? 1:0)
+    // dropped low-confidence events entirely; the new design lets
+    // them contribute proportionally so a steady trickle of dim
+    // signal still surfaces in popularity ranking, just at a
+    // commensurate weight.
+    double countDelta = (confidence > 0.0) ? confidence : 0.0;
+
+    if (actionUtf8 == "OPEN" && countDelta > 0.0)
     {
         rec.lastOpenTs = eventTs;
-        rec.openCount7d++;
-        rec.openCount30d++;
-        rec.openCountTotal++;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
     }
     else if (actionUtf8 == "MODIFY" || actionUtf8 == "CREATE")
     {
@@ -207,7 +217,9 @@ void InferenceEngine::OnFileEvent(const std::wstring& action,
     }
 }
 
-void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t eventTs)
+void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath,
+                                        int64_t             eventTs,
+                                        double              confidence)
 {
     if (exePath.empty()) return;
 
@@ -216,11 +228,16 @@ void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t even
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     InferenceRecord& rec = LoadOrCreate(key, "app");
 
+    double countDelta = (confidence > 0.0) ? confidence : 0.0;
+
     rec.lastEventTs    = eventTs;
-    rec.lastOpenTs     = eventTs;
-    rec.openCount7d++;
-    rec.openCount30d++;
-    rec.openCountTotal++;
+    if (countDelta > 0.0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
     rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
     rec.version++;
     rec.updatedAt      = eventTs;
@@ -231,7 +248,9 @@ void InferenceEngine::OnAppLaunchEvent(const std::wstring& exePath, int64_t even
     }
 }
 
-void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
+void InferenceEngine::OnBrowsingEvent(const std::wstring& url,
+                                       int64_t             eventTs,
+                                       double              confidence)
 {
     if (url.empty()) return;
 
@@ -240,11 +259,47 @@ void InferenceEngine::OnBrowsingEvent(const std::wstring& url, int64_t eventTs)
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     InferenceRecord& rec = LoadOrCreate(key, "url");
 
+    double countDelta = (confidence > 0.0) ? confidence : 0.0;
+
     rec.lastEventTs    = eventTs;
-    rec.lastOpenTs     = eventTs;
-    rec.openCount7d++;
-    rec.openCount30d++;
-    rec.openCountTotal++;
+    if (countDelta > 0.0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
+    rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
+    rec.version++;
+    rec.updatedAt      = eventTs;
+
+    {
+        std::lock_guard<std::mutex> dbLock(*m_dbMutex);
+        PersistRecord(rec);
+    }
+}
+
+void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath,
+                                       int64_t             eventTs,
+                                       double              confidence)
+{
+    if (exePath.empty()) return;
+
+    std::string key = NormalizeKey(exePath);
+
+    std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+    InferenceRecord& rec = LoadOrCreate(key, "app");
+
+    double countDelta = (confidence > 0.0) ? confidence : 0.0;
+
+    rec.lastEventTs    = eventTs;
+    if (countDelta > 0.0)
+    {
+        rec.lastOpenTs     = eventTs;
+        rec.openCount7d    += countDelta;
+        rec.openCount30d   += countDelta;
+        rec.openCountTotal += countDelta;
+    }
     rec.recencyScore   = ComputeRecencyScore(eventTs, rec.lastOpenTs, rec.openCount7d);
     rec.version++;
     rec.updatedAt      = eventTs;
@@ -321,9 +376,9 @@ std::string InferenceEngine::HandleQueryInferences(
             if (hasField("last_event_ts"))   { comma(); oss << "\"last_event_ts\":" << rec.lastEventTs; }
             if (hasField("last_open_ts"))    { comma(); oss << "\"last_open_ts\":" << rec.lastOpenTs; }
             if (hasField("last_edit_ts"))    { comma(); oss << "\"last_edit_ts\":" << rec.lastEditTs; }
-            if (hasField("open_count_7d"))   { comma(); oss << "\"open_count_7d\":" << rec.openCount7d; }
-            if (hasField("open_count_30d"))  { comma(); oss << "\"open_count_30d\":" << rec.openCount30d; }
-            if (hasField("open_count_total")){ comma(); oss << "\"open_count_total\":" << rec.openCountTotal; }
+            if (hasField("open_count_7d"))   { comma(); oss << "\"open_count_7d\":"   << static_cast<int64_t>(llround(rec.openCount7d)); }
+            if (hasField("open_count_30d"))  { comma(); oss << "\"open_count_30d\":"  << static_cast<int64_t>(llround(rec.openCount30d)); }
+            if (hasField("open_count_total")){ comma(); oss << "\"open_count_total\":"<< static_cast<int64_t>(llround(rec.openCountTotal)); }
             if (hasField("recency_score"))   { comma(); oss << "\"recency_score\":" << rec.recencyScore; }
             if (hasField("version"))         { comma(); oss << "\"version\":" << rec.version; }
             if (hasField("updated_at"))      { comma(); oss << "\"updated_at\":" << rec.updatedAt; }
@@ -368,9 +423,9 @@ std::string InferenceEngine::HandleGetInferenceDeltas(uint32_t sinceVersion)
             r.lastEventTs    = sqlite3_column_int64(stmt, 2);
             r.lastOpenTs     = sqlite3_column_int64(stmt, 3);
             r.lastEditTs     = sqlite3_column_int64(stmt, 4);
-            r.openCount7d    = sqlite3_column_int(stmt, 5);
-            r.openCount30d   = sqlite3_column_int(stmt, 6);
-            r.openCountTotal = sqlite3_column_int(stmt, 7);
+            r.openCount7d    = sqlite3_column_double(stmt, 5);
+            r.openCount30d   = sqlite3_column_double(stmt, 6);
+            r.openCountTotal = sqlite3_column_double(stmt, 7);
             r.recencyScore   = sqlite3_column_double(stmt, 8);
             r.version        = static_cast<uint32_t>(sqlite3_column_int(stmt, 9));
             r.updatedAt      = sqlite3_column_int64(stmt, 10);
@@ -391,9 +446,9 @@ std::string InferenceEngine::HandleGetInferenceDeltas(uint32_t sinceVersion)
             << ",\"last_event_ts\":" << r.lastEventTs
             << ",\"last_open_ts\":" << r.lastOpenTs
             << ",\"last_edit_ts\":" << r.lastEditTs
-            << ",\"open_count_7d\":" << r.openCount7d
-            << ",\"open_count_30d\":" << r.openCount30d
-            << ",\"open_count_total\":" << r.openCountTotal
+            << ",\"open_count_7d\":"    << static_cast<int64_t>(llround(r.openCount7d))
+            << ",\"open_count_30d\":"   << static_cast<int64_t>(llround(r.openCount30d))
+            << ",\"open_count_total\":" << static_cast<int64_t>(llround(r.openCountTotal))
             << ",\"recency_score\":" << r.recencyScore
             << ",\"version\":" << r.version
             << ",\"updated_at\":" << r.updatedAt
@@ -408,4 +463,188 @@ void InferenceEngine::ClearCache()
 {
     std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
     m_cache.clear();
+}
+
+void InferenceEngine::RefreshRollingCounts()
+{
+    if (!m_dbHandle || !*m_dbHandle || !m_dbMutex)
+        return;
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    int64_t cutoff7d  = now - 7LL * 24 * 3600;
+    int64_t cutoff30d = now - 30LL * 24 * 3600;
+
+    // Collect fresh 7d/30d OPEN counts from the three raw-event tables.
+    // file_activity: count OPEN actions per path (lowercased)
+    // app_launch_activity: every row is an "open" per exe_path (lowercased)
+    // browsing_activity: every row is a "visit" per url or title (lowercased)
+    struct Counts { double c7d = 0.0; double c30d = 0.0; };
+    std::unordered_map<std::string, Counts> freshCounts;
+
+    std::lock_guard<std::mutex> dbLock(*m_dbMutex);
+
+    // --- File OPEN counts (sum of per-event confidence) ---
+    {
+        const char* sql =
+            "SELECT LOWER(path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END) "
+            "FROM file_activity WHERE action = 'OPEN' AND timestamp >= ? "
+            "GROUP BY LOWER(path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_double(stmt, 1);
+                c.c30d = sqlite3_column_double(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- App launch counts (sum of per-event confidence) ---
+    {
+        const char* sql =
+            "SELECT LOWER(exe_path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END) "
+            "FROM app_launch_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(exe_path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_double(stmt, 1);
+                c.c30d = sqlite3_column_double(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- App focus counts (sum of per-event confidence; aggregated with launch) ---
+    {
+        const char* sql =
+            "SELECT LOWER(exe_path), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END) "
+            "FROM app_focus_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(exe_path);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  += sqlite3_column_double(stmt, 1);
+                c.c30d += sqlite3_column_double(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- Browsing counts (sum of per-event confidence; key = url else title) ---
+    {
+        const char* sql =
+            "SELECT LOWER(CASE WHEN url IS NOT NULL AND url != '' THEN url ELSE title END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END), "
+            "  SUM(CASE WHEN timestamp >= ? THEN COALESCE(confidence, 1.0) ELSE 0 END) "
+            "FROM browsing_activity WHERE timestamp >= ? "
+            "GROUP BY LOWER(CASE WHEN url IS NOT NULL AND url != '' THEN url ELSE title END);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            sqlite3_bind_int64(stmt, 1, cutoff7d);
+            sqlite3_bind_int64(stmt, 2, cutoff30d);
+            sqlite3_bind_int64(stmt, 3, cutoff30d);
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!k) continue;
+                auto& c = freshCounts[k];
+                c.c7d  = sqlite3_column_double(stmt, 1);
+                c.c30d = sqlite3_column_double(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // --- Walk all inference records and patch counts + recency_score ---
+    {
+        const char* selSql =
+            "SELECT entity_key, entity_type, last_event_ts, last_open_ts, last_edit_ts,"
+            "       open_count_7d, open_count_30d, open_count_total,"
+            "       recency_score, version, updated_at"
+            " FROM inference;";
+        sqlite3_stmt* selStmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, selSql, -1, &selStmt, nullptr) != SQLITE_OK)
+            return;
+
+        const char* updSql =
+            "UPDATE inference SET open_count_7d=?, open_count_30d=?, "
+            "recency_score=?, version=version+1, updated_at=? "
+            "WHERE entity_key=?;";
+        sqlite3_stmt* updStmt = nullptr;
+        if (sqlite3_prepare_v2(*m_dbHandle, updSql, -1, &updStmt, nullptr) != SQLITE_OK)
+        {
+            sqlite3_finalize(selStmt);
+            return;
+        }
+
+        while (sqlite3_step(selStmt) == SQLITE_ROW)
+        {
+            const char* ek = reinterpret_cast<const char*>(sqlite3_column_text(selStmt, 0));
+            if (!ek) continue;
+            std::string key(ek);
+
+            double  old7d  = sqlite3_column_double(selStmt, 5);
+            double  old30d = sqlite3_column_double(selStmt, 6);
+            int64_t lastOpenTs = sqlite3_column_int64(selStmt, 3);
+
+            auto it = freshCounts.find(key);
+            double new7d  = it != freshCounts.end() ? it->second.c7d  : 0.0;
+            double new30d = it != freshCounts.end() ? it->second.c30d : 0.0;
+
+            // Tolerate small drift (rounding noise) before re-writing.
+            const double kEpsilon = 1e-6;
+            if (fabs(new7d - old7d) > kEpsilon || fabs(new30d - old30d) > kEpsilon)
+            {
+                double score = ComputeRecencyScore(now, lastOpenTs, new7d);
+                sqlite3_reset(updStmt);
+                sqlite3_bind_double(updStmt, 1, new7d);
+                sqlite3_bind_double(updStmt, 2, new30d);
+                sqlite3_bind_double(updStmt, 3, score);
+                sqlite3_bind_int64(updStmt, 4, now);
+                sqlite3_bind_text(updStmt, 5, key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(updStmt);
+            }
+        }
+
+        sqlite3_finalize(selStmt);
+        sqlite3_finalize(updStmt);
+    }
+
+    // Invalidate in-memory cache so subsequent queries pick up fresh data
+    {
+        std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+        m_cache.clear();
+    }
 }

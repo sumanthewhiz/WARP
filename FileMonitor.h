@@ -8,10 +8,14 @@
 #include <functional>
 #include <evntrace.h>
 
-// Callback: action (CREATE/OPEN/MODIFY/DELETE/RENAME), path, old_path (for rename)
+#include "EventContext.h"
+
+// Callback: action (CREATE/OPEN/MODIFY/DELETE/RENAME), path, old_path (for
+// rename), and the EventContext describing source/foreground/intent state.
 using FileActivityCallback = std::function<void(const std::wstring& action,
                                                 const std::wstring& path,
-                                                const std::wstring& oldPath)>;
+                                                const std::wstring& oldPath,
+                                                const EventContext&  ctx)>;
 
 class FileMonitor
 {

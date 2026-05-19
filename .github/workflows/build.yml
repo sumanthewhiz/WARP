@@ -24,7 +24,7 @@ jobs:
         else
           RAW="${{ github.ref_name }}"
         fi
-        # main/master -> releasepreview, everything else keeps its branch name
+        # main/master -> releasepreview, else keep its branch name
         if [ "$RAW" = "main" ] || [ "$RAW" = "master" ]; then
           LABEL="releasepreview"
         else
@@ -37,14 +37,42 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
+    - name: Restore NuGet packages
+      run: |
+        nuget restore "WARP!.sln" -PackagesDirectory ../packages
+
+    - name: Download sentence-encoder model files (BGE-small-en-v1.5)
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path "models" -Force | Out-Null
+        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" -OutFile "models/bge-small.onnx"
+        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
+
+    - name: Detect available VC toolset
+      id: toolset
+      shell: pwsh
+      run: |
+        $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+        $installPath = & $vsWhere -latest -property installationPath
+        $vcToolsDir = Join-Path $installPath "VC\Tools\MSVC"
+        $versions = Get-ChildItem $vcToolsDir -Directory | Sort-Object Name -Descending
+        $latestVersion = $versions[0].Name
+        # Derive platform toolset: 14.43.x -> v143, 14.50.x -> v145
+        $parts = $latestVersion.Split('.')
+        $major = $parts[0]
+        $minor = $parts[1]
+        $toolset = "v${major}$($minor[0])"
+        Write-Host "Detected VC tools version: $latestVersion -> PlatformToolset=$toolset"
+        echo "value=$toolset" >> $env:GITHUB_OUTPUT
+
     - name: Build ARM64
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=ARM64 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=ARM64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Build x64
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Build x86
-      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /m
+      run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
     - name: Stage artifacts
       shell: pwsh
@@ -58,7 +86,11 @@ jobs:
         foreach ($p in $platforms) {
           $staging = "artifacts/$($p.arch)/WARP"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
+          Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
+          Copy-Item "$($p.src)/models/bge-small.onnx" "$staging/models/bge-small.onnx" -Force
+          Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Write-Host "Staged $($p.arch): $staging"
         }

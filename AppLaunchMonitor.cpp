@@ -1,6 +1,15 @@
 #include "framework.h"
 #include "AppLaunchMonitor.h"
+#include "EventContext.h"
+#include "LaunchCorrelator.h"
+#include "SystemProcessClassifier.h"
 #include <tlhelp32.h>
+#include <algorithm>
+#include <unordered_set>
+#include <mutex>
+#include <psapi.h>
+#include <evntcons.h>
+#include <vector>
 #include <algorithm>
 #include <unordered_set>
 #include <mutex>
@@ -156,6 +165,26 @@ static bool IsSpawnedByServiceHost(DWORD pid)
     return isServiceHost;
 }
 
+// ---------------------------------------------------------------------------
+// Static state for the ETW callback (must be accessible from a C-style
+// ETW callback that has no `this` pointer).
+// ---------------------------------------------------------------------------
+static AppLaunchMonitor* g_pAppLaunchMonitor = nullptr;
+
+// Microsoft-Windows-Kernel-Process provider GUID
+//   {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
+static const GUID KernelProcessProviderGuid =
+    { 0x22FB2CD6, 0x0E7B, 0x422B, { 0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16 } };
+
+// Keyword bits from the Microsoft-Windows-Kernel-Process manifest
+static const ULONGLONG KERNEL_PROC_KEYWORD_PROCESS = 0x10;
+
+// Per-WARP-instance private session GUID (random GUID, never shipped)
+static const GUID WarpProcSessionGuid =
+    { 0xb8e94a17, 0x4d12, 0x4b88, { 0x83, 0xc2, 0x1c, 0x32, 0x9d, 0x44, 0x88, 0x09 } };
+
+static const wchar_t* const kAppLaunchSessionName = L"WARP-ProcessTrace";
+
 AppLaunchMonitor::AppLaunchMonitor()
 {
     m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -177,7 +206,9 @@ void AppLaunchMonitor::Start()
     if (m_running) return;
     m_running = true;
     ResetEvent(m_stopEvent);
-    m_thread = std::thread(&AppLaunchMonitor::MonitorLoop, this);
+    g_pAppLaunchMonitor = this;
+    // EtwLoop blocks in ProcessTrace, so we own the thread for its lifetime.
+    m_thread = std::thread(&AppLaunchMonitor::EtwLoop, this);
 }
 
 void AppLaunchMonitor::Stop()
@@ -185,7 +216,12 @@ void AppLaunchMonitor::Stop()
     if (!m_running) return;
     m_running = false;
     SetEvent(m_stopEvent);
+
+    // Tear down the trace so ProcessTrace unblocks
+    StopProcessEtwTrace();
+
     if (m_thread.joinable()) m_thread.join();
+    g_pAppLaunchMonitor = nullptr;
 }
 
 void AppLaunchMonitor::Pause()
@@ -198,100 +234,187 @@ void AppLaunchMonitor::Resume()
     m_paused = false;
 }
 
-void AppLaunchMonitor::MonitorLoop()
+// ---------------------------------------------------------------------------
+// EtwLoop
+//
+// Replaces the previous 2-second Toolhelp32 polling loop with a real-time
+// ETW subscription on Microsoft-Windows-Kernel-Process. The polling design
+// was unreliable for two reasons:
+//   1. Short-lived processes (PowerShell one-liners, build tools, certutil
+//      verifications, defender scan helpers) often complete in <2s and were
+//      never observed at all.
+//   2. PID recycling between polls would cause us to miss the new process
+//      AND conflate it with whatever recycled PID was now running.
+//
+// ETW gives us exact creation events with the new PID, parent PID, and the
+// command line, so we get correct attribution for every process start.
+// ---------------------------------------------------------------------------
+void AppLaunchMonitor::EtwLoop()
 {
-    // Track known PIDs; report new ones appearing between polls
-    std::unordered_set<DWORD> knownPids;
+    StartProcessEtwTrace();
+}
 
-    // Seed with current processes (don't report existing ones)
+void AppLaunchMonitor::StartProcessEtwTrace()
+{
+    StopProcessEtwTrace();          // tear down any stale prior session
+
+    const size_t sessionNameBytes = (wcslen(kAppLaunchSessionName) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameBytes + 1024;
+    std::vector<BYTE> propsBuf(bufSize, 0);
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
+
+    props->Wnode.BufferSize    = static_cast<ULONG>(bufSize);
+    props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 1;
+    props->Wnode.Guid          = WarpProcSessionGuid;
+    props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+    props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+    props->BufferSize          = 32;        // KB; process events are tiny
+    props->MinimumBuffers      = 2;
+    props->MaximumBuffers      = 8;
+    props->FlushTimer          = 1;
+
+    ULONG status = StartTraceW(&m_etwSessionHandle, kAppLaunchSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS)
     {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE)
-        {
-            PROCESSENTRY32W pe = {};
-            pe.dwSize = sizeof(pe);
-            if (Process32FirstW(snap, &pe))
-            {
-                do {
-                    knownPids.insert(pe.th32ProcessID);
-                } while (Process32NextW(snap, &pe));
-            }
-            CloseHandle(snap);
-        }
+        ControlTraceW(0, kAppLaunchSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        memset(propsBuf.data(), 0, bufSize);
+        props->Wnode.BufferSize    = static_cast<ULONG>(bufSize);
+        props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+        props->Wnode.ClientContext = 1;
+        props->Wnode.Guid          = WarpProcSessionGuid;
+        props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+        props->BufferSize          = 32;
+        props->MinimumBuffers      = 2;
+        props->MaximumBuffers      = 8;
+        props->FlushTimer          = 1;
+        status = StartTraceW(&m_etwSessionHandle, kAppLaunchSessionName, props);
+    }
+    if (status != ERROR_SUCCESS)
+    {
+        m_etwSessionHandle = 0;
+        return;
     }
 
-    while (m_running)
+    status = EnableTraceEx2(
+        m_etwSessionHandle,
+        &KernelProcessProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATION,
+        KERNEL_PROC_KEYWORD_PROCESS,
+        0, 0, nullptr);
+    if (status != ERROR_SUCCESS)
     {
-        // Poll every 2 seconds
-        DWORD waitResult = WaitForSingleObject(m_stopEvent, 2000);
-        if (waitResult == WAIT_OBJECT_0 || !m_running)
-            break;
+        StopProcessEtwTrace();
+        return;
+    }
 
-        if (m_paused)
-            continue;
+    EVENT_TRACE_LOGFILEW logFile = {};
+    logFile.LoggerName          = const_cast<LPWSTR>(kAppLaunchSessionName);
+    logFile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = &AppLaunchMonitor::EtwEventCallback;
 
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE)
-            continue;
+    m_etwTraceHandle = OpenTraceW(&logFile);
+    if (m_etwTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+    {
+        StopProcessEtwTrace();
+        return;
+    }
 
-        std::unordered_set<DWORD> currentPids;
-        PROCESSENTRY32W pe = {};
-        pe.dwSize = sizeof(pe);
+    // Blocks until Stop() tears down the session
+    ProcessTrace(&m_etwTraceHandle, 1, nullptr, nullptr);
 
-        if (Process32FirstW(snap, &pe))
-        {
-            do {
-                currentPids.insert(pe.th32ProcessID);
+    if (m_etwTraceHandle != INVALID_PROCESSTRACE_HANDLE)
+    {
+        CloseTrace(m_etwTraceHandle);
+        m_etwTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+}
 
-                // New process?
-                if (knownPids.find(pe.th32ProcessID) == knownPids.end())
-                {
-                    DWORD pid = pe.th32ProcessID;
-                    if (pid == 0 || pid == 4)
-                        continue;
+void AppLaunchMonitor::StopProcessEtwTrace()
+{
+    if (m_etwTraceHandle != INVALID_PROCESSTRACE_HANDLE)
+    {
+        CloseTrace(m_etwTraceHandle);
+        m_etwTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    const size_t sessionNameBytes = (wcslen(kAppLaunchSessionName) + 1) * sizeof(wchar_t);
+    const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + sessionNameBytes + 1024;
+    std::vector<BYTE> propsBuf(bufSize, 0);
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
+    props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
+    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    ControlTraceW(0, kAppLaunchSessionName, props, EVENT_TRACE_CONTROL_STOP);
+    m_etwSessionHandle = 0;
+}
 
-                    // Check session -- only interactive sessions
-                    DWORD sessionId = 0;
-                    if (!ProcessIdToSessionId(pid, &sessionId) || sessionId == 0)
-                        continue;
+void WINAPI AppLaunchMonitor::EtwEventCallback(PEVENT_RECORD pEvent)
+{
+    if (!pEvent) return;
+    AppLaunchMonitor* self = g_pAppLaunchMonitor;
+    if (!self || !self->m_running) return;
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, KernelProcessProviderGuid))
+        return;
 
-                    std::wstring exeName(pe.szExeFile);
-                    std::wstring exeLower = exeName;
-                    std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::towlower);
+    const USHORT id = pEvent->EventHeader.EventDescriptor.Id;
+    if (id == 1)
+    {
+        // ProcessStart
+        if (!self->m_callback) return;
+        if (self->m_paused) return;
 
-                    if (IsSystemProcess(exeLower))
-                        continue;
+        DWORD pid = pEvent->EventHeader.ProcessId;
+        if (pid == 0 || pid == 4) return;
+        if (pid == GetCurrentProcessId()) return;
 
-                    // Get full path
-                    std::wstring exePath;
-                    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (hProc)
-                    {
-                        wchar_t path[MAX_PATH] = {};
-                        DWORD pathLen = MAX_PATH;
-                        if (QueryFullProcessImageNameW(hProc, 0, path, &pathLen) && pathLen > 0)
-                            exePath.assign(path, pathLen);
-                        CloseHandle(hProc);
-                    }
+        std::wstring exePath = EventContextUtil::GetExePathByPid(pid);
+        if (exePath.empty()) return;
 
-                    if (exePath.empty())
-                        exePath = exeName;
+        std::wstring exeName;
+        size_t bs = exePath.find_last_of(L"\\/");
+        exeName = (bs == std::wstring::npos) ? exePath : exePath.substr(bs + 1);
+        std::wstring exeLower = exeName;
+        std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::towlower);
 
-                    // Filter out processes running from system directories
-                    if (IsSystemExePath(exePath))
-                        continue;
+        if (IsSystemProcess(exeLower))   return;            // cheap blocklist pre-filter
+        // The composite SystemProcessClassifier replaces the previous
+        // OR-of-(IsSystemExePath | IsSpawnedByServiceHost) decision with a
+        // multi-signal vote (path, parent, session, integrity, MS signature,
+        // name). It is strictly more discriminating: a process needs to fail
+        // multiple independent checks to be classified as system, so genuine
+        // user apps that happen to live in a Windows tree or are MS-signed
+        // (e.g. notepad.exe launched from cmd) are no longer falsely
+        // suppressed.
+        WARP::ClassificationResult cls =
+            WARP::SystemProcessClassifier::Instance().Classify(exePath, pid);
+        if (cls.isSystem)                return;
 
-                    // Filter out processes spawned by services.exe / svchost.exe
-                    if (IsSpawnedByServiceHost(pid))
-                        continue;
+        DWORD sessionId = 0;
+        if (!ProcessIdToSessionId(pid, &sessionId) || sessionId == 0) return;
 
-                    if (m_callback)
-                        m_callback(exeName, exePath, pid);
-                }
-            } while (Process32NextW(snap, &pe));
-        }
+        EventContext ctx = EventContextUtil::CaptureContext(pid);
+        ctx.parentPid = EventContextUtil::GetParentPid(pid);
+        if (ctx.parentPid != 0)
+            ctx.parentExe = EventContextUtil::GetExePathByPid(ctx.parentPid);
 
-        CloseHandle(snap);
-        knownPids = std::move(currentPids);
+        // Park the launch in the correlator. It will fire `m_callback`
+        // either when a top-level window appears for `pid` (confidence=1.0)
+        // or when the 5s budget elapses (confidence=0.3). The parking is
+        // strictly additive -- if the correlator isn't running yet, the
+        // event passes straight through at full confidence.
+        LaunchCorrelator::Instance().RecordPending(
+            exeName, exePath, pid, ctx,
+            [self](const std::wstring& en, const std::wstring& ep,
+                   DWORD p, const EventContext& finalCtx) {
+                if (self && self->m_callback)
+                    self->m_callback(en, ep, p, finalCtx);
+            });
+    }
+    else if (id == 2)
+    {
+        // ProcessStop -- forget cached image path so a recycled PID doesn't
+        // resolve to the dead image later.
+        EventContextUtil::ForgetPid(pEvent->EventHeader.ProcessId);
     }
 }

@@ -5,11 +5,15 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <evntrace.h>
 
-// Callback: exeName, exePath, pid
+#include "EventContext.h"
+
+// Callback: exeName, exePath, pid, EventContext (parentPid, foreground, etc.)
 using AppLaunchCallback = std::function<void(const std::wstring& exeName,
                                              const std::wstring& exePath,
-                                             DWORD pid)>;
+                                             DWORD                pid,
+                                             const EventContext&  ctx)>;
 
 class AppLaunchMonitor
 {
@@ -25,10 +29,17 @@ public:
 
 private:
     AppLaunchCallback m_callback;
-    std::thread m_thread;
+    std::thread       m_thread;
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_paused{ false };
-    HANDLE m_stopEvent = nullptr;
+    HANDLE            m_stopEvent = nullptr;
 
-    void MonitorLoop();
+    // Private ETW session subscribing to Microsoft-Windows-Kernel-Process.
+    TRACEHANDLE       m_etwSessionHandle = 0;
+    TRACEHANDLE       m_etwTraceHandle   = INVALID_PROCESSTRACE_HANDLE;
+
+    void EtwLoop();
+    void StartProcessEtwTrace();
+    void StopProcessEtwTrace();
+    static void WINAPI EtwEventCallback(PEVENT_RECORD pEvent);
 };

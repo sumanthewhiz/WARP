@@ -44,7 +44,8 @@
 #define IDC_CHK_FILE			420
 #define IDC_CHK_APP_LAUNCH		421
 #define IDC_CHK_BROWSING		422
-#define IDC_FILTER_LABEL        423
+#define IDC_CHK_APP_FOCUS		423
+#define IDC_FILTER_LABEL        424
 
 // Inference exploration
 #define IDB_INFER_TOP			430
@@ -57,6 +58,17 @@
 #define IDB_INFER_LOOKUP		437
 #define IDC_EDIT_INFER_TOPN		438
 #define IDC_INFER_TOPN_LABEL	439
+
+// Recent context inference (dynamic 1-liner summarization)
+#define IDB_RECENT_CONTEXT		440
+#define IDB_CONTEXT_HISTORY		441
+// Category dropdown (All / Files / Websites / Apps) — narrows the
+// ContextInference snapshot returned by the two buttons above.
+#define IDC_CTX_CATEGORY		442
+// Window-length dropdown (Last 5 min ... Last 30 days) — controls the
+// activity lookback span for the two context buttons.
+#define IDC_CTX_WINDOW			443
+#define IDT_TOPIC_TIMER			302
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
