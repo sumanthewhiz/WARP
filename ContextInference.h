@@ -80,12 +80,24 @@ struct ContextSnapshot
     std::vector<std::string> summaryFiles;
     std::vector<std::string> summaryWebsites;
     std::vector<std::string> summaryApps;
+    // Optional LLM-polished "All" summary -- 1-3 lines of natural
+    // prose produced by Qwen2.5-0.5B-Instruct from the structured
+    // summary + items[].  Empty when the LLM polisher isn't
+    // initialized, fails, or produces an ungrounded output.  The
+    // primary `summary` field above is the template-composed source
+    // of truth -- the polished version is purely additive.
+    std::vector<std::string> summaryPolished;
+    // Per-category polished variants, populated under the same rules.
+    std::vector<std::string> summaryFilesPolished;
+    std::vector<std::string> summaryWebsitesPolished;
+    std::vector<std::string> summaryAppsPolished;
     int           activityCount  = 0;   // Number of raw signals considered.
     int           focusSeconds   = 0;   // Total foreground time in the window.
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
     std::string   model;                // "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
+    std::string   modelPolish;          // "qwen2.5-0.5b-instruct" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
     // Bounded structured breakdown (top apps by focus seconds, capped at 5).
@@ -150,6 +162,8 @@ struct ContextSnapshot
 // History cap is 1440 (24 h at one snapshot per minute, with material-
 // change dedup the actual count is usually much smaller).
 // =====================================================================
+class LlmSummarizer;   // optional polishing layer, see LlmSummarizer.h
+
 class ContextInference
 {
 public:
@@ -160,6 +174,13 @@ public:
     bool IsModelLoaded() const { return m_modelReady; }
     void Start(ActivityDatabase* db, ForegroundMonitor* fg);
     void Stop();
+
+    // Wire in (or detach with nullptr) the optional LLM polishing
+    // layer.  Caller retains ownership of the LlmSummarizer instance
+    // and must not destroy it while ContextInference is running.
+    // Calling this AFTER Start() is fine -- the polisher is read
+    // under a lock on every snapshot compose.
+    void SetLlmSummarizer(LlmSummarizer* llm);
 
     void RunOnce();
     std::string GetRecentContext (const std::string& category    = "all",
@@ -194,6 +215,9 @@ private:
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
     std::string          m_modelName;        // e.g. "bge-small-en-v1.5"
+
+    // Optional polishing layer.  Borrowed; not owned.
+    LlmSummarizer*       m_llm = nullptr;
 
     // Compute a 384-dim L2-normalized sentence embedding for `text`.
     // Returns an empty vector if the model is not loaded or inference fails.

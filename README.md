@@ -1104,9 +1104,28 @@ to the repo — they are downloaded once into a `models/` folder before the buil
    > embedding space and the same BERT WordPiece vocab, so no other change
    > is needed.
 
-3. Build any configuration (Debug/Release × Win32/x64/ARM64). The post-build
-   `CopyOnnxRuntime` MSBuild target copies `onnxruntime.dll` and the `models/`
-   folder next to `WARP!.exe` automatically.
+3. *(Optional)* Download the **LLM polishing model** (Qwen2.5-0.5B-Instruct,
+   CPU-INT4, ~330 MB) into `models/qwen/`.  When present the engine adds a
+   natural-prose rewrite of the template summary; when absent the engine
+   still produces the template summary and reports `"model_polish":
+   "(not loaded)"` in the response.
+
+   ```powershell
+   New-Item -ItemType Directory -Path models\qwen -Force | Out-Null
+   $repo = "https://huggingface.co/microsoft/Qwen2.5-0.5B-Instruct-onnx/resolve/main/cpu-int4-rtn-block-32-acc-level-4"
+   foreach ($f in 'added_tokens.json','config.json','genai_config.json','merges.txt','model.onnx','model.onnx.data','special_tokens_map.json','tokenizer.json','tokenizer_config.json','vocab.json') {
+     Invoke-WebRequest -Uri "$repo/$f" -OutFile "models/qwen/$f"
+   }
+   ```
+
+   Note: the `Microsoft.ML.OnnxRuntimeGenAI` NuGet only ships x64 and ARM64
+   binaries.  x86 builds compile without the polishing layer (graceful
+   degrade).
+
+4. Build any configuration (Debug/Release × Win32/x64/ARM64). The post-build
+   `CopyOnnxRuntime` MSBuild target copies `onnxruntime.dll`,
+   `onnxruntime-genai.dll` (x64/ARM64 only), and the `models/` folder
+   next to `WARP!.exe` automatically.
 
 > **Skipping the model download is fine** — the binary will still build and
 > run; `ContextInference::Init()` just falls through to the deterministic

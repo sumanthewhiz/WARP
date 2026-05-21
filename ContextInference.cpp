@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "ContextInference.h"
+#include "LlmSummarizer.h"
 #include "ActivityDatabase.h"
 #include "ForegroundMonitor.h"
 
@@ -1090,6 +1091,12 @@ void ContextInference::Start(ActivityDatabase* db, ForegroundMonitor* fg)
     m_running = true;
     ResetEvent(m_stopEvent);
     m_thread = std::thread(&ContextInference::TimerLoop, this);
+}
+
+void ContextInference::SetLlmSummarizer(LlmSummarizer* llm)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_llm = llm;
 }
 
 void ContextInference::Stop()
@@ -2423,6 +2430,46 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     snap.summaryWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
     snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
+    // ---- Optional LLM polishing ------------------------------------
+    // If a Qwen2.5-0.5B-Instruct polisher is attached and loaded,
+    // produce a natural-prose rewrite of each of the four summaries
+    // (combined + 3 facets).  Always preserves the template-composed
+    // summary above as the source of truth -- the polished version
+    // is purely additive.  Polish() returns an empty vector on any
+    // failure (model not loaded, timeout, ungrounded output, ...),
+    // in which case the corresponding `*Polished` field stays empty.
+    snap.modelPolish = (m_llm && m_llm->IsLoaded())
+                          ? m_llm->ModelName()
+                          : std::string("(not loaded)");
+    if (m_llm && m_llm->IsLoaded())
+    {
+        // Build the LlmActivityItem list once -- shared across the
+        // four Polish() calls (the *category* parameter narrows the
+        // prompt instruction without re-projecting items[]; the LLM
+        // is told via the system message which facets to emphasize).
+        std::vector<LlmActivityItem> llmItems;
+        llmItems.reserve(snap.items.size());
+        for (const auto& it : snap.items)
+        {
+            LlmActivityItem li;
+            li.app          = it.app;
+            li.title        = it.title;
+            li.rawTitle     = it.rawTitle;
+            li.focusSeconds = it.focusSeconds;
+            li.pct          = it.pct;
+            llmItems.push_back(std::move(li));
+        }
+
+        if (!snap.summary.empty())
+            snap.summaryPolished         = m_llm->Polish(snap.summary,         llmItems, "all");
+        if (!snap.summaryFiles.empty())
+            snap.summaryFilesPolished    = m_llm->Polish(snap.summaryFiles,    llmItems, "files");
+        if (!snap.summaryWebsites.empty())
+            snap.summaryWebsitesPolished = m_llm->Polish(snap.summaryWebsites, llmItems, "websites");
+        if (!snap.summaryApps.empty())
+            snap.summaryAppsPolished     = m_llm->Polish(snap.summaryApps,     llmItems, "apps");
+    }
+
     // ---- Confidence -----------------------------------------------
     // Heuristic: 0 if no focus, ~0.3 with a small amount of focus, up
     // to ~0.95 when the dominant app has high focus % AND we have
@@ -2468,10 +2515,23 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
         out << "]";
     };
 
-    const std::vector<std::string>* topSummary = &s.summary;
-    if      (category == "files")     topSummary = &s.summaryFiles;
-    else if (category == "websites")  topSummary = &s.summaryWebsites;
-    else if (category == "apps")      topSummary = &s.summaryApps;
+    const std::vector<std::string>* topSummary         = &s.summary;
+    const std::vector<std::string>* topSummaryPolished = &s.summaryPolished;
+    if (category == "files")
+    {
+        topSummary         = &s.summaryFiles;
+        topSummaryPolished = &s.summaryFilesPolished;
+    }
+    else if (category == "websites")
+    {
+        topSummary         = &s.summaryWebsites;
+        topSummaryPolished = &s.summaryWebsitesPolished;
+    }
+    else if (category == "apps")
+    {
+        topSummary         = &s.summaryApps;
+        topSummaryPolished = &s.summaryAppsPolished;
+    }
 
     std::ostringstream o;
     o << "{"
@@ -2482,6 +2542,11 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"category\":\""      << EscapeJson(category) << "\""
       << ",\"summary\":";
     emitArray(o, *topSummary);
+    // Polished version of the same-category summary, when available.
+    // Always present in the response (possibly empty array) so callers
+    // know whether the polishing layer ran.
+    o << ",\"summary_polished\":";
+    emitArray(o, *topSummaryPolished);
 
     if (category == "all")
     {
@@ -2489,6 +2554,10 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
         o << ",\"summary_files\":";    emitArray(o, s.summaryFiles);
         o << ",\"summary_websites\":"; emitArray(o, s.summaryWebsites);
         o << ",\"summary_apps\":";     emitArray(o, s.summaryApps);
+        // Same for the polished facets.
+        o << ",\"summary_files_polished\":";    emitArray(o, s.summaryFilesPolished);
+        o << ",\"summary_websites_polished\":"; emitArray(o, s.summaryWebsitesPolished);
+        o << ",\"summary_apps_polished\":";     emitArray(o, s.summaryAppsPolished);
     }
 
     o << ",\"activity_count\":" << s.activityCount
@@ -2497,6 +2566,7 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"confidence\":"     << s.confidence
       << ",\"thread_count\":"   << s.threadCount
       << ",\"model\":\""        << EscapeJson(s.model) << "\""
+      << ",\"model_polish\":\"" << EscapeJson(s.modelPolish) << "\""
       << ",\"signal_types\":[";
     for (size_t i = 0; i < s.signalTypes.size(); ++i)
     {

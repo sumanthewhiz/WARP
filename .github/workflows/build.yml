@@ -48,6 +48,36 @@ jobs:
         Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" -OutFile "models/bge-small.onnx"
         Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
 
+    - name: Download LLM polishing model (Qwen2.5-0.5B-Instruct, CPU INT4)
+      shell: pwsh
+      run: |
+        # Microsoft publishes ORT-GenAI-compatible bundles on HuggingFace.
+        # We pull the CPU INT4 variant (~330 MB) -- smallest viable
+        # quantization for an LLM at this parameter count.
+        $qwenDir = "models/qwen"
+        New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
+        $repo = "https://huggingface.co/microsoft/Qwen2.5-0.5B-Instruct-onnx/resolve/main/cpu-int4-rtn-block-32-acc-level-4"
+        $files = @(
+          "added_tokens.json",
+          "config.json",
+          "genai_config.json",
+          "merges.txt",
+          "model.onnx",
+          "model.onnx.data",
+          "special_tokens_map.json",
+          "tokenizer.json",
+          "tokenizer_config.json",
+          "vocab.json"
+        )
+        foreach ($f in $files) {
+          try {
+            Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f" -ErrorAction Stop
+            Write-Host "Downloaded $f"
+          } catch {
+            Write-Warning "Optional Qwen file $f missing on the remote (HTTP error). Continuing -- LLM polishing will be unavailable if a required file is missing."
+          }
+        }
+
     - name: Detect available VC toolset
       id: toolset
       shell: pwsh
@@ -89,8 +119,17 @@ jobs:
           New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
           Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
+          # ORT-GenAI runtime DLL (x64/ARM64 only; x86 is not provided by the package).
+          if (Test-Path "$($p.src)/onnxruntime-genai.dll") {
+            Copy-Item "$($p.src)/onnxruntime-genai.dll" "$staging/onnxruntime-genai.dll" -Force
+          }
           Copy-Item "$($p.src)/models/bge-small.onnx" "$staging/models/bge-small.onnx" -Force
           Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
+          # Bundle the Qwen2.5-0.5B-Instruct model subtree if it was
+          # downloaded and copied alongside the build output.
+          if (Test-Path "$($p.src)/models/qwen") {
+            Copy-Item "$($p.src)/models/qwen" "$staging/models/qwen" -Recurse -Force
+          }
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Write-Host "Staged $($p.arch): $staging"
         }

@@ -13,6 +13,7 @@
 #include "QueryApi.h"
 #include "InferenceEngine.h"
 #include "ContextInference.h"
+#include "LlmSummarizer.h"
 #include "LaunchCorrelator.h"
 #include "ForegroundChangeBroker.h"
 
@@ -111,6 +112,7 @@ IdleDetector        g_idleDetector;
 QueryApi            g_queryApi;
 InferenceEngine     g_inference;
 ContextInference    g_contextInference;
+LlmSummarizer       g_llmSummarizer;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -1367,6 +1369,14 @@ void StartSubsystems()
             }
         }
         g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
+
+        // Best-effort init of the optional LLM polishing layer.  When
+        // the Qwen2.5 model files aren't on disk this returns false
+        // and Polish() calls become no-ops; nothing in the pipeline
+        // regresses.
+        if (g_llmSummarizer.Init(modelsDir))
+            g_contextInference.SetLlmSummarizer(&g_llmSummarizer);
+
         g_contextInference.Start(&g_db, &g_foregroundMonitor);
     }
 }
@@ -1628,6 +1638,7 @@ void OnInferenceButton(HWND hWnd, int id)
 void StopSubsystems()
 {
     g_contextInference.Stop();
+    g_llmSummarizer.Stop();
     g_queryApi.Stop();
     g_idleDetector.Stop();
     g_foregroundMonitor.Stop();

@@ -645,6 +645,11 @@ cluster of activity).  Consumers render them as separate lines.
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
+| `model_polish` | `string` | `"qwen2.5-0.5b-instruct"` when the optional LLM polishing layer is loaded and active; `"(not loaded)"` when the polisher's model files aren't present. |
+| `summary_polished` | `string[]` | LLM-polished natural-prose rewrite of `summary` (or the category-matching summary). Present in every response (possibly empty array). Empty when the LLM isn't loaded, the inference timed out, or the output failed grounding validation. |
+| `summary_files_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_files`. Same emptiness semantics as `summary_polished`. |
+| `summary_websites_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_websites`. |
+| `summary_apps_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_apps`. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
 | `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the summary shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
@@ -1709,7 +1714,44 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.8.*
+*This documentation describes WARP API version 5.9.*
+
+*Changes from v5.8:*
+- ***Optional LLM polishing layer (`Qwen2.5-0.5B-Instruct`).***  Each
+  snapshot now carries a `summary_polished` field alongside the
+  existing template-composed `summary`.  When the LLM model files are
+  present under `models/qwen/` and the polisher is loaded, the
+  template summary + the per-app `items[]` are fed to a CPU-INT4
+  Qwen2.5-0.5B-Instruct as a structured prompt, and the natural-
+  prose rewrite is returned as 1-3 lines.  The polishing is purely
+  additive -- the template summary remains the source of truth and
+  is unchanged.  Polished output is **rejected** (empty array
+  returned) when:
+    - the LLM is not loaded (`model_polish == "(not loaded)"`)
+    - the inference times out (5 s hard limit)
+    - the output exceeds 160 chars per line or hallucinates content
+      not present in the input items (grounding check).
+- ***New fields on the snapshot:***
+    - `summary_polished` (string[]) -- polished version of the
+      category that matches the request.  Present in every response
+      (empty array when polishing was unavailable or rejected).
+    - `summary_files_polished`, `summary_websites_polished`,
+      `summary_apps_polished` (string[]) -- per-category polished
+      facets.  **Only present when `category == "all"`.**
+    - `model_polish` (string) -- `"qwen2.5-0.5b-instruct"` when the
+      polisher is loaded; `"(not loaded)"` otherwise.
+- ***Dependency:*** *`Microsoft.ML.OnnxRuntimeGenAI 0.7.0`* (separate
+  NuGet from `Microsoft.ML.OnnxRuntime`).  Ships its own BPE
+  tokenizer + KV-cache + sampling loop, so the integration is
+  ~200 lines of glue plus a model download.
+- ***Build pipeline:*** CI now downloads the CPU-INT4 Qwen ONNX
+  bundle (~330 MB) from
+  `microsoft/Qwen2.5-0.5B-Instruct-onnx/cpu-int4-rtn-block-32-acc-level-4`
+  on HuggingFace and stages it under `models/qwen/`.  The
+  `CopyOnnxRuntime` MSBuild target copies the entire subtree
+  verbatim to the output folder.  The ORT-GenAI NuGet only ships
+  x64 and ARM64 binaries -- x86 builds compile without the
+  polishing layer (graceful degrade).
 
 *Changes from v5.7:*
 - ***Umbrella detection on cross-cluster shared themes.***  When a single

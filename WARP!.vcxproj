@@ -99,15 +99,24 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <OrtPkgDir>..\packages\Microsoft.ML.OnnxRuntime.1.22.0</OrtPkgDir>
+    <OrtGenAiPkgDir>..\packages\Microsoft.ML.OnnxRuntimeGenAI.0.7.0</OrtGenAiPkgDir>
+    <!-- Was the ORT-GenAI NuGet restored?  Used to compile in the
+         Qwen2.5-0.5B polishing layer when available; otherwise the
+         LlmSummarizer falls back to a no-op stub. -->
+    <HasOrtGenAi Condition="Exists('$(OrtGenAiPkgDir)\build\native\include\ort_genai_c.h')">true</HasOrtGenAi>
+    <HasOrtGenAi Condition="!Exists('$(OrtGenAiPkgDir)\build\native\include\ort_genai_c.h')">false</HasOrtGenAi>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='Win32'">
     <OrtRuntimeDir>$(OrtPkgDir)\runtimes\win-x86\native</OrtRuntimeDir>
+    <OrtGenAiRuntimeDir>$(OrtGenAiPkgDir)\runtimes\win-x86\native</OrtGenAiRuntimeDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='x64'">
     <OrtRuntimeDir>$(OrtPkgDir)\runtimes\win-x64\native</OrtRuntimeDir>
+    <OrtGenAiRuntimeDir>$(OrtGenAiPkgDir)\runtimes\win-x64\native</OrtGenAiRuntimeDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='ARM64'">
     <OrtRuntimeDir>$(OrtPkgDir)\runtimes\win-arm64\native</OrtRuntimeDir>
+    <OrtGenAiRuntimeDir>$(OrtGenAiPkgDir)\runtimes\win-arm64\native</OrtGenAiRuntimeDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -115,14 +124,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -133,14 +143,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -149,14 +160,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -167,14 +179,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
@@ -183,14 +196,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -201,15 +215,25 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(OrtPkgDir)\build\native\include;$(OrtGenAiPkgDir)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OrtRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
+  </ItemDefinitionGroup>
+  <!-- Global conditional: when the ORT-GenAI NuGet has been
+       restored, propagate WARP_HAS_ORT_GENAI to every C++ compile so
+       LlmSummarizer.cpp pulls in the actual ort_genai.h API.
+       Without this define the file compiles a no-op stub. -->
+  <ItemDefinitionGroup Condition="'$(HasOrtGenAi)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>WARP_HAS_ORT_GENAI;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="ActivityDatabase.h" />
@@ -226,6 +250,7 @@
     <ClInclude Include="IdleDetector.h" />
     <ClInclude Include="InferenceEngine.h" />
     <ClInclude Include="LaunchCorrelator.h" />
+    <ClInclude Include="LlmSummarizer.h" />
     <ClInclude Include="SystemProcessClassifier.h" />
     <ClInclude Include="QueryApi.h" />
     <ClInclude Include="Resource.h" />
@@ -244,6 +269,7 @@
     <ClCompile Include="ForegroundChangeBroker.cpp" />
     <ClCompile Include="ForegroundMonitor.cpp" />
     <ClCompile Include="IdleDetector.cpp" />
+    <ClCompile Include="LlmSummarizer.cpp" />
     <ClCompile Include="QueryApi.cpp" />
     <ClCompile Include="InferenceEngine.cpp" />
     <ClCompile Include="LaunchCorrelator.cpp" />
@@ -273,9 +299,20 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="CopyOnnxRuntime" AfterTargets="Build">
     <Copy SourceFiles="$(OrtRuntimeDir)\onnxruntime.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <!-- ORT-GenAI runtime DLL (only when the package was restored). -->
+    <Copy SourceFiles="$(OrtGenAiRuntimeDir)\onnxruntime-genai.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'$(HasOrtGenAi)'=='true' And Exists('$(OrtGenAiRuntimeDir)\onnxruntime-genai.dll')" />
     <Copy SourceFiles="$(ProjectDir)models\bge-small.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\bge-small.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\minilm.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\minilm.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\vocab.txt" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\vocab.txt')" />
+    <!-- Qwen2.5-0.5B-Instruct model files (optional polishing layer).
+         The whole `models\qwen\` subtree is copied verbatim so any
+         ORT-GenAI packaging shape (model.onnx + model.onnx.data,
+         tokenizer.json, genai_config.json, etc.) works without
+         enumerating every file individually. -->
+    <ItemGroup>
+      <QwenModelFiles Include="$(ProjectDir)models\qwen\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(QwenModelFiles)" DestinationFolder="$(OutDir)models\qwen\%(RecursiveDir)" SkipUnchangedFiles="true" Condition="'@(QwenModelFiles)'!=''" />
   </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
