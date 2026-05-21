@@ -100,11 +100,6 @@
   <PropertyGroup>
     <OrtPkgDir>..\packages\Microsoft.ML.OnnxRuntime.1.22.0</OrtPkgDir>
     <OrtGenAiPkgDir>..\packages\Microsoft.ML.OnnxRuntimeGenAI.0.7.0</OrtGenAiPkgDir>
-    <!-- Was the ORT-GenAI NuGet restored?  Used to compile in the
-         Qwen2.5-0.5B polishing layer when available; otherwise the
-         LlmSummarizer falls back to a no-op stub. -->
-    <HasOrtGenAi Condition="Exists('$(OrtGenAiPkgDir)\build\native\include\ort_genai_c.h')">true</HasOrtGenAi>
-    <HasOrtGenAi Condition="!Exists('$(OrtGenAiPkgDir)\build\native\include\ort_genai_c.h')">false</HasOrtGenAi>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='Win32'">
     <OrtRuntimeDir>$(OrtPkgDir)\runtimes\win-x86\native</OrtRuntimeDir>
@@ -117,6 +112,15 @@
   <PropertyGroup Condition="'$(Platform)'=='ARM64'">
     <OrtRuntimeDir>$(OrtPkgDir)\runtimes\win-arm64\native</OrtRuntimeDir>
     <OrtGenAiRuntimeDir>$(OrtGenAiPkgDir)\runtimes\win-arm64\native</OrtGenAiRuntimeDir>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- Was the ORT-GenAI NuGet restored AND does the CURRENT platform
+         have a matching native binary?  The package only ships x64 and
+         ARM64 binaries.  It has no win-x86 runtimes directory at all,
+         so x86 builds must fall back to the no-op LlmSummarizer stub
+         regardless of whether the package was restored. -->
+    <HasOrtGenAi Condition="Exists('$(OrtGenAiRuntimeDir)\onnxruntime-genai.lib')">true</HasOrtGenAi>
+    <HasOrtGenAi Condition="'$(HasOrtGenAi)' != 'true'">false</HasOrtGenAi>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
