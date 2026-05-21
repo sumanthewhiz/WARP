@@ -1112,8 +1112,8 @@ to the repo — they are downloaded once into a `models/` folder before the buil
 
    ```powershell
    New-Item -ItemType Directory -Path models\qwen -Force | Out-Null
-   $repo = "https://huggingface.co/microsoft/Qwen2.5-0.5B-Instruct-onnx/resolve/main/cpu-int4-rtn-block-32-acc-level-4"
-   foreach ($f in 'added_tokens.json','config.json','genai_config.json','merges.txt','model.onnx','model.onnx.data','special_tokens_map.json','tokenizer.json','tokenizer_config.json','vocab.json') {
+   $repo = "https://huggingface.co/xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
+   foreach ($f in 'added_tokens.json','chat_template.jinja','genai_config.json','merges.txt','model.onnx','model.onnx.data','special_tokens_map.json','tokenizer.json','tokenizer_config.json','vocab.json') {
      Invoke-WebRequest -Uri "$repo/$f" -OutFile "models/qwen/$f"
    }
    ```

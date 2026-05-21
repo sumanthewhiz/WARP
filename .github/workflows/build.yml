@@ -51,21 +51,24 @@ jobs:
     - name: Download LLM polishing model (Qwen2.5-0.5B-Instruct, CPU INT4)
       shell: pwsh
       run: |
-        # Microsoft publishes ORT-GenAI-compatible bundles on HuggingFace.
-        # We pull the CPU INT4 variant (~330 MB) -- smallest viable
-        # quantization for an LLM at this parameter count.  All files
-        # listed below are required for the polishing layer to load;
-        # any download failure aborts the build so we never ship a
-        # half-populated artifact.  The x64 / ARM64 staging step below
-        # bundles this directory verbatim into the release zip; x86
-        # builds skip the polishing layer at link time and don't ship
-        # these files.
+        # ORT-GenAI-compatible Qwen2.5-0.5B-Instruct bundle from the
+        # community-maintained `xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai`
+        # repo on HuggingFace.  We pull the CPU INT4 variant (~330 MB)
+        # under the `cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/`
+        # subdirectory, which ships the genai_config.json that
+        # onnxruntime-genai requires plus the model + tokenizer files.
+        # All listed files are required for the polishing layer to
+        # load; any download failure aborts the build so we never ship
+        # a half-populated artifact.  The x64 / ARM64 staging step
+        # below bundles this directory verbatim into the release zip;
+        # x86 builds skip the polishing layer at link time and don't
+        # ship these files.
         $qwenDir = "models/qwen"
         New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
-        $repo = "https://huggingface.co/microsoft/Qwen2.5-0.5B-Instruct-onnx/resolve/main/cpu-int4-rtn-block-32-acc-level-4"
+        $repo = "https://huggingface.co/xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
         $files = @(
           "added_tokens.json",
-          "config.json",
+          "chat_template.jinja",
           "genai_config.json",
           "merges.txt",
           "model.onnx",
