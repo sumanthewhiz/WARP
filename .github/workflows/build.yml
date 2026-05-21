@@ -53,7 +53,13 @@ jobs:
       run: |
         # Microsoft publishes ORT-GenAI-compatible bundles on HuggingFace.
         # We pull the CPU INT4 variant (~330 MB) -- smallest viable
-        # quantization for an LLM at this parameter count.
+        # quantization for an LLM at this parameter count.  All files
+        # listed below are required for the polishing layer to load;
+        # any download failure aborts the build so we never ship a
+        # half-populated artifact.  The x64 / ARM64 staging step below
+        # bundles this directory verbatim into the release zip; x86
+        # builds skip the polishing layer at link time and don't ship
+        # these files.
         $qwenDir = "models/qwen"
         New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
         $repo = "https://huggingface.co/microsoft/Qwen2.5-0.5B-Instruct-onnx/resolve/main/cpu-int4-rtn-block-32-acc-level-4"
@@ -70,12 +76,8 @@ jobs:
           "vocab.json"
         )
         foreach ($f in $files) {
-          try {
-            Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f" -ErrorAction Stop
-            Write-Host "Downloaded $f"
-          } catch {
-            Write-Warning "Optional Qwen file $f missing on the remote (HTTP error). Continuing -- LLM polishing will be unavailable if a required file is missing."
-          }
+          Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f"
+          Write-Host "Downloaded $f"
         }
 
     - name: Detect available VC toolset
@@ -107,10 +109,15 @@ jobs:
     - name: Stage artifacts
       shell: pwsh
       run: |
+        # x64 and ARM64 ship the LLM polishing layer -- bundled
+        # Qwen2.5-0.5B + onnxruntime-genai.dll are required and the
+        # staging step fails if either is missing.  x86 ships without
+        # the polisher (the ORT-GenAI NuGet has no win-x86 binaries),
+        # so its staging skips both.
         $platforms = @(
-          @{ arch = "ARM64"; src = "ARM64/Release" },
-          @{ arch = "x64";   src = "x64/Release"   },
-          @{ arch = "x86";   src = "Release"        }
+          @{ arch = "ARM64"; src = "ARM64/Release"; hasLlm = $true  },
+          @{ arch = "x64";   src = "x64/Release";   hasLlm = $true  },
+          @{ arch = "x86";   src = "Release";       hasLlm = $false }
         )
 
         foreach ($p in $platforms) {
@@ -119,17 +126,30 @@ jobs:
           New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
           Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
-          # ORT-GenAI runtime DLL (x64/ARM64 only; x86 is not provided by the package).
-          if (Test-Path "$($p.src)/onnxruntime-genai.dll") {
-            Copy-Item "$($p.src)/onnxruntime-genai.dll" "$staging/onnxruntime-genai.dll" -Force
-          }
           Copy-Item "$($p.src)/models/bge-small.onnx" "$staging/models/bge-small.onnx" -Force
           Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
-          # Bundle the Qwen2.5-0.5B-Instruct model subtree if it was
-          # downloaded and copied alongside the build output.
-          if (Test-Path "$($p.src)/models/qwen") {
-            Copy-Item "$($p.src)/models/qwen" "$staging/models/qwen" -Recurse -Force
+
+          if ($p.hasLlm) {
+            # Required: ORT-GenAI runtime + Qwen2.5-0.5B model subtree.
+            $genaiDll = "$($p.src)/onnxruntime-genai.dll"
+            if (!(Test-Path $genaiDll)) {
+              throw "Missing $genaiDll -- the LLM polishing layer is mandatory for $($p.arch) but its runtime DLL was not produced by the build."
+            }
+            Copy-Item $genaiDll "$staging/onnxruntime-genai.dll" -Force
+
+            $qwen = "$($p.src)/models/qwen"
+            if (!(Test-Path $qwen)) {
+              throw "Missing $qwen -- the Qwen2.5-0.5B model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download LLM polishing model' step should have populated models/qwen/."
+            }
+            Copy-Item $qwen "$staging/models/qwen" -Recurse -Force
+            Write-Host "Bundled Qwen2.5-0.5B model into $staging/models/qwen"
           }
+          else {
+            # x86: explicitly skip the LLM artefacts even if the
+            # post-build target somehow copied them (defence in depth).
+            Write-Host "Skipping Qwen model bundle for $($p.arch) (LLM polishing layer unavailable on this platform)"
+          }
+
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Write-Host "Staged $($p.arch): $staging"
         }

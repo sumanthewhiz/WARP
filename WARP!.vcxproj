@@ -308,15 +308,17 @@
     <Copy SourceFiles="$(ProjectDir)models\bge-small.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\bge-small.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\minilm.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\minilm.onnx')" />
     <Copy SourceFiles="$(ProjectDir)models\vocab.txt" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\vocab.txt')" />
-    <!-- Qwen2.5-0.5B-Instruct model files (optional polishing layer).
-         The whole `models\qwen\` subtree is copied verbatim so any
-         ORT-GenAI packaging shape (model.onnx + model.onnx.data,
-         tokenizer.json, genai_config.json, etc.) works without
-         enumerating every file individually. -->
-    <ItemGroup>
+    <!-- Qwen2.5-0.5B-Instruct model files.  Bundled as a mandatory
+         component on platforms that link the polishing layer (x64,
+         ARM64); skipped on x86 since the ORT-GenAI NuGet doesn't
+         ship a win-x86 binary.  The whole `models\qwen\` subtree is
+         copied verbatim so any ORT-GenAI packaging shape (model.onnx
+         + model.onnx.data, tokenizer.json, genai_config.json, etc.)
+         works without enumerating every file individually. -->
+    <ItemGroup Condition="'$(HasOrtGenAi)'=='true'">
       <QwenModelFiles Include="$(ProjectDir)models\qwen\**\*.*" />
     </ItemGroup>
-    <Copy SourceFiles="@(QwenModelFiles)" DestinationFolder="$(OutDir)models\qwen\%(RecursiveDir)" SkipUnchangedFiles="true" Condition="'@(QwenModelFiles)'!=''" />
+    <Copy SourceFiles="@(QwenModelFiles)" DestinationFolder="$(OutDir)models\qwen\%(RecursiveDir)" SkipUnchangedFiles="true" Condition="'$(HasOrtGenAi)'=='true' And '@(QwenModelFiles)'!=''" />
   </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

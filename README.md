@@ -1104,11 +1104,11 @@ to the repo — they are downloaded once into a `models/` folder before the buil
    > embedding space and the same BERT WordPiece vocab, so no other change
    > is needed.
 
-3. *(Optional)* Download the **LLM polishing model** (Qwen2.5-0.5B-Instruct,
-   CPU-INT4, ~330 MB) into `models/qwen/`.  When present the engine adds a
-   natural-prose rewrite of the template summary; when absent the engine
-   still produces the template summary and reports `"model_polish":
-   "(not loaded)"` in the response.
+3. Download the **LLM polishing model** (Qwen2.5-0.5B-Instruct, CPU-INT4,
+   ~330 MB) into `models/qwen/`.  This is **required on x64 and ARM64**
+   — the CI build pipeline downloads it automatically and **bundles it
+   into the release artifact** so end users don't have to.  For local
+   development you'll need to fetch it yourself once:
 
    ```powershell
    New-Item -ItemType Directory -Path models\qwen -Force | Out-Null
@@ -1118,18 +1118,25 @@ to the repo — they are downloaded once into a `models/` folder before the buil
    }
    ```
 
-   Note: the `Microsoft.ML.OnnxRuntimeGenAI` NuGet only ships x64 and ARM64
-   binaries.  x86 builds compile without the polishing layer (graceful
-   degrade).
+   **x86 builds skip this step entirely** — the
+   `Microsoft.ML.OnnxRuntimeGenAI` NuGet only ships x64 and ARM64
+   binaries.  The polishing layer is graceful-degrade: when its model
+   files or runtime DLL aren't present, `ContextInference` falls back
+   to the template-composed summary and reports
+   `"model_polish": "(not loaded)"` in the response.
 
-4. Build any configuration (Debug/Release × Win32/x64/ARM64). The post-build
+4. Build any configuration (Debug/Release × Win32/x64/ARM64).  The post-build
    `CopyOnnxRuntime` MSBuild target copies `onnxruntime.dll`,
    `onnxruntime-genai.dll` (x64/ARM64 only), and the `models/` folder
-   next to `WARP!.exe` automatically.
+   (including `models/qwen/` on x64/ARM64) next to `WARP!.exe`
+   automatically.
 
-> **Skipping the model download is fine** — the binary will still build and
-> run; `ContextInference::Init()` just falls through to the deterministic
-> per-app composer and reports `"model": "deterministic"` in every snapshot.
+> **Skipping the BGE-small model download is fine** — the binary will still
+> build and run; `ContextInference::Init()` just falls through to the
+> deterministic per-app composer and reports `"model": "deterministic"` in
+> every snapshot.  The Qwen model download is **mandatory for x64 / ARM64
+> CI builds** but optional for local development (LLM polishing simply
+> stays disabled when its files are missing).
 
 ---
 
