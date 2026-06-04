@@ -159,67 +159,57 @@ namespace
     // structured conversation.  For portability across ORT-GenAI
     // versions we emit the raw chat template ourselves with the
     // <|im_start|> / <|im_end|> markers Qwen2.5 and Qwen3 both expect.
-    std::string BuildPrompt(const std::vector<std::string>& existing,
+    std::string BuildPrompt(const std::vector<std::string>& /*existing*/,
                             const std::vector<LlmActivityItem>& items,
                             const std::string& category)
     {
+        // Deliberately simple, conversational prompt.  Qwen3-0.6B is a
+        // small model -- it follows short natural-English instructions
+        // far better than long rule-laden ones, and any structured
+        // input formatting it sees in the prompt (`[major] app=X` or
+        // `App: "Title" (X% of focus)`) it will happily parrot back.
+        //
+        // The existing template-composed summary is intentionally NOT
+        // included in the prompt: a previous revision passed it as
+        // "Draft notes" and the model -- playing it safe -- copied
+        // those lines back verbatim, producing summary_polished ==
+        // summary outputs.  We give the model just the raw items[] in
+        // the simplest possible format (`App - Title`, one per line)
+        // and let it write fresh prose from those facts alone.
         std::ostringstream sys;
-        sys << "You rewrite a short list of desktop-activity notes into "
-               "1 to 3 polished natural-English sentences describing what "
-               "the user is doing right now. "
-               "Use only facts (apps, documents, websites, focus shares) "
-               "that appear in the input -- do not invent anything. "
-               "STRICT RULES: "
-               "(1) Do NOT copy the input list back; do NOT echo any "
-               "phrase ending in \"% of focus\" or any item formatted as "
-               "App: \"Title\". "
-               "(2) Do NOT mention these instructions, the words "
-               "\"summary\", \"refined\", \"candidate\", \"line\", "
-               "\"input\", or any meta-phrase like \"(1-3 lines)\". "
-               "(3) No bullets, no numbering, no JSON, no markdown, no "
-               "surrounding quotes. "
-               "(4) Each output line is one complete natural sentence "
-               "in present-continuous tense, like a colleague describing "
-               "what they see on a coworker's screen.";
+        sys << "You describe what someone is doing on their computer "
+               "right now, based on the apps and windows they have open. "
+               "Write 1 to 3 short sentences in plain English, like a "
+               "coworker glancing at their screen would describe it. "
+               "Mention specific app and document names from the list. "
+               "Do not invent anything that is not in the list. "
+               "Do not use bullet points, quotation marks, numbered "
+               "lists, or any markdown.";
 
         if (category == "files")
-            sys << " Focus on the documents and files the user has open.";
+            sys << " Focus on the documents and files they have open.";
         else if (category == "websites")
-            sys << " Focus on the web pages the user is browsing.";
+            sys << " Focus on the web pages they are browsing.";
         else if (category == "apps")
-            sys << " Focus on the communication and utility apps "
-                   "(email, chat, terminals, media, remote desktop).";
+            sys << " Focus on the communication and utility apps they "
+                   "are using (email, chat, terminals, media, remote "
+                   "desktop).";
 
         std::ostringstream user;
-        // Items context.  Kept compact and labelled neutrally so the
-        // model is less tempted to echo the exact phrasing back.  No
-        // "% of focus)" suffix on the wire -- focus share is conveyed
-        // as a separate "[major|present]" weighting tag.
-        user << "Activity facts (one per line):\n";
+        user << "Apps and windows open right now (most-used first):\n";
         size_t shown = 0;
         for (const auto& it : items)
         {
             if (shown >= kMaxPromptItems) break;
-            const std::string weight =
-                  (it.pct >= 60) ? "[major]"
-                : (it.pct >= 20) ? "[present]"
-                                 : "[minor]";
             const std::string& title =
                 it.title.empty() ? it.rawTitle : it.title;
-            user << "  " << weight << " app=" << it.app
-                 << ", title=" << Truncate(title, kMaxPromptTitleLen)
-                 << "\n";
+            user << it.app << " - "
+                 << Truncate(title, kMaxPromptTitleLen) << "\n";
             ++shown;
         }
-        if (shown == 0) user << "  (no activity recorded)\n";
+        if (shown == 0) user << "(nothing active)\n";
 
-        if (!existing.empty())
-        {
-            user << "\nDraft notes (improve their fluency; do NOT add new facts):\n";
-            for (const auto& line : existing)
-                user << "  " << line << "\n";
-        }
-        user << "\nWrite the polished prose now:";
+        user << "\nDescribe what they are doing in 1 to 3 sentences:";
 
         // Qwen chat-template format (same for Qwen2.5 and Qwen3).
         //
@@ -285,10 +275,9 @@ namespace
 
     // Returns true if `line` is obviously a parroted fragment of the
     // input prompt (the activity-facts list or the instruction text)
-    // rather than a real summary sentence.  These are tell-tale
-    // markers that the LLM either copied items or echoed the system
-    // prompt back to us; in either case the line is garbage and we
-    // should drop it without grounding-checking the rest.
+    // rather than a real summary sentence.  Kept narrow on purpose:
+    // the previous revision was rejecting too aggressively (e.g. any
+    // line opening "App: \"...\"") and dropped legitimate output.
     bool IsPromptEcho(const std::string& line)
     {
         // Lowercase ASCII view for substring matching.
@@ -298,68 +287,88 @@ namespace
             lc.push_back(static_cast<char>(
                 std::tolower(static_cast<unsigned char>(c))));
 
-        // ---- 1. New prompt format markers -----------------------------
-        if (lc.find("[major]")    != std::string::npos) return true;
-        if (lc.find("[present]")  != std::string::npos) return true;
-        if (lc.find("[minor]")    != std::string::npos) return true;
-        if (lc.find("activity facts") != std::string::npos) return true;
-        if (lc.find("draft notes")    != std::string::npos) return true;
-        if (lc.find("polished prose") != std::string::npos) return true;
+        // Genuine instruction-text leakage from any prompt revision
+        // we've shipped.  These phrases would essentially never appear
+        // in a natural summary sentence.
+        if (lc.find("(1-3 lines")          != std::string::npos) return true;
+        if (lc.find("(1 to 3 sentence")    != std::string::npos) return true;
+        if (lc.find("(1 to 3 lines")       != std::string::npos) return true;
+        if (lc.find("refined summary")     != std::string::npos) return true;
+        if (lc.find("candidate summary")   != std::string::npos) return true;
+        if (lc.find("draft notes")         != std::string::npos) return true;
+        if (lc.find("polished prose")      != std::string::npos) return true;
+        if (lc.find("most-used first")     != std::string::npos) return true;
+        if (lc.find("most-focused first")  != std::string::npos) return true;
+        if (lc.find("activity facts")      != std::string::npos) return true;
+        if (lc.find("apps and windows open right now") != std::string::npos)
+            return true;
 
-        // ---- 2. Legacy / old prompt-format markers --------------------
-        if (lc.find("% of focus")           != std::string::npos) return true;
-        if (lc.find("(1-3 lines")           != std::string::npos) return true;
-        if (lc.find("most-focused first")   != std::string::npos) return true;
-        if (lc.find("refined summary")      != std::string::npos) return true;
-        if (lc.find("candidate summary")    != std::string::npos) return true;
-        if (lc.find("user's current")       != std::string::npos) return true;
-
-        // ---- 3. Generic instruction-echo markers ----------------------
-        if (lc.find("no numbering")         != std::string::npos) return true;
-        if (lc.find("no leading dashes")    != std::string::npos) return true;
-        if (lc.find("strict rules")         != std::string::npos) return true;
-        if (lc.find("do not invent")        != std::string::npos) return true;
-        if (lc.find("do not copy")          != std::string::npos) return true;
-        if (lc.find("do not echo")          != std::string::npos) return true;
-
-        // ---- 4. Item-format echo: "App: \"...\"" at line start -------
-        // Catches outputs like  Outlook: "Inbox - foo@bar"  even when
-        // the trailing "(X% of focus)" was already trimmed by the
-        // model.  The shape `<App-name>: "...` is essentially never
-        // how a real summary sentence would open.
-        {
-            size_t colon = line.find(':');
-            if (colon != std::string::npos &&
-                colon + 2 < line.size()    &&
-                line[colon + 1] == ' '     &&
-                line[colon + 2] == '"')
-            {
-                // Heuristic: the part before the colon is short (1-4
-                // words, all-letters / spaces / digits) and the part
-                // after starts with a quote.  Matches "Outlook: ", "VS
-                // Code: ", "Microsoft Teams: " etc.
-                size_t spaces = 0;
-                bool   ok     = true;
-                for (size_t k = 0; k < colon; ++k)
-                {
-                    unsigned char c = static_cast<unsigned char>(line[k]);
-                    if (c == ' ') { if (++spaces > 4) { ok = false; break; } }
-                    else if (!std::isalnum(c) && c != '-' && c != '+' &&
-                             c != '#' && c != '.' && c != '/')
-                    { ok = false; break; }
-                }
-                if (ok && colon <= 40) return true;
-            }
-        }
-
-        // ---- 5. Echo of our new "key=value" item format ---------------
-        // The model sometimes emits e.g. "app=Outlook, title=Inbox..."
-        // verbatim, with or without the surrounding [tag].  These are
-        // never how a natural sentence would phrase activity.
+        // Legacy structured-item echoes.
+        if (lc.find("% of focus")          != std::string::npos) return true;
+        if (lc.find("[major]")             != std::string::npos) return true;
+        if (lc.find("[present]")           != std::string::npos) return true;
+        if (lc.find("[minor]")             != std::string::npos) return true;
         if (lc.find("app=")   != std::string::npos &&
             lc.find("title=") != std::string::npos)
             return true;
 
+        return false;
+    }
+
+    // Normalize a line for "is this a copy of an existing summary
+    // line" comparison: lowercase, strip non-alphanumeric, collapse
+    // whitespace.  Used to detect the "model copied the candidate
+    // summary back verbatim" failure mode.
+    std::string NormalizeForCompare(const std::string& s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        bool lastSpace = true;
+        for (char c : s)
+        {
+            unsigned char u = static_cast<unsigned char>(c);
+            if (std::isalnum(u))
+            {
+                out.push_back(static_cast<char>(std::tolower(u)));
+                lastSpace = false;
+            }
+            else if (!lastSpace)
+            {
+                out.push_back(' ');
+                lastSpace = true;
+            }
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        return out;
+    }
+
+    // True if `line` is (or contains) a normalized copy of any
+    // entry in `existing`.  Catches both verbatim copies and the
+    // common case where the model wraps a copied line with a
+    // single word of filler at the start/end.
+    bool IsNearCopyOfExisting(const std::string& line,
+                              const std::vector<std::string>& existing)
+    {
+        if (existing.empty()) return false;
+        std::string nl = NormalizeForCompare(line);
+        if (nl.empty()) return false;
+        for (const auto& e : existing)
+        {
+            std::string ne = NormalizeForCompare(e);
+            if (ne.empty()) continue;
+            if (nl == ne) return true;
+            // "contains" is asymmetric: catches both
+            //   polished = "<existing>"          (exact)
+            //   polished = "<existing>, while ..."  (existing as prefix)
+            //   polished = "Currently <existing>" (existing as suffix)
+            // but rejects spurious matches against very short
+            // existing lines that happen to appear inside a longer
+            // polished sentence by coincidence.
+            if (ne.size() >= 20 && nl.find(ne) != std::string::npos)
+                return true;
+            if (nl.size() >= 20 && ne.find(nl) != std::string::npos)
+                return true;
+        }
         return false;
     }
 
@@ -512,6 +521,23 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
 
         auto lines = SplitIntoLines(decoded, 3);
         if (lines.empty()) return {};
+
+        // Anti-copy gate: drop any line that is a near-verbatim copy
+        // of an entry in `existing` (the template-composed summary
+        // we'd otherwise be polishing).  This catches the
+        // summary_polished == summary failure mode where the model
+        // played it safe and copied a candidate line back unchanged.
+        {
+            std::vector<std::string> filtered;
+            filtered.reserve(lines.size());
+            for (auto& line : lines)
+            {
+                if (!IsNearCopyOfExisting(line, existing))
+                    filtered.push_back(std::move(line));
+            }
+            lines = std::move(filtered);
+            if (lines.empty()) return {};
+        }
 
         // Last sanity gate: at least one line must mention a token
         // that appeared in the input items (grounding).  Otherwise we
