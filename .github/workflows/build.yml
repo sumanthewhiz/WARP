@@ -40,6 +40,14 @@ jobs:
     - name: Restore NuGet packages
       run: |
         nuget restore "WARP!.sln" -PackagesDirectory ../packages
+        # ORT 1.23.0 (transitively required by ORT-GenAI 0.14.1) dropped
+        # its win-x86 native binaries, but WARP still builds an x86
+        # configuration (purely for backward compat -- x86 never links
+        # the LLM polisher).  Side-install the last ORT release that
+        # still publishes win-x86 onnxruntime.lib so the x86 link step
+        # has something to point at.  x64 / ARM64 builds continue to
+        # use the version restored by `nuget restore` (1.23.0).
+        nuget install Microsoft.ML.OnnxRuntime -Version 1.22.0 -OutputDirectory ../packages -ExcludeVersion:false
 
     - name: Download sentence-encoder model files (BGE-small-en-v1.5)
       shell: pwsh
