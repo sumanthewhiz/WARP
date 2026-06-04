@@ -2526,24 +2526,33 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
     // ---- Optional LLM polishing ------------------------------------
-    // If a Qwen3-0.6B polisher is attached and loaded,
-    // produce a natural-prose rewrite of each of the four summaries
-    // (combined + 3 facets).  Always preserves the template-composed
-    // summary above as the source of truth -- the polished version
-    // is purely additive.  Polish() returns an empty vector on any
-    // failure (model not loaded, timeout, ungrounded output, ...),
-    // in which case the corresponding `*Polished` field stays empty.
+    // If a Qwen3-0.6B polisher is attached and loaded, produce a
+    // natural-prose rewrite of each of the four summaries (combined +
+    // 3 facets).  Always preserves the template-composed summary above
+    // as the source of truth -- the polished version is purely
+    // additive.  Polish() returns an empty vector on any failure
+    // (model not loaded, timeout, ungrounded output, ...), in which
+    // case the corresponding `*Polished` field stays empty.
+    //
+    // IMPORTANT: each facet's Polish() call receives ONLY the items
+    // that belong to that facet -- we previously passed the merged
+    // `snap.items[]` to all four calls and relied on the system-prompt
+    // category instruction to make the LLM ignore the wrong-category
+    // entries, but the model routinely failed to do so (it would put
+    // Outlook into summary_files_polished, browser tabs into
+    // summary_apps_polished, etc.).  Building per-facet item lists
+    // from the same bags (rankedFiles / rankedWeb / rankedApps) the
+    // template-composer uses guarantees clean source isolation; the
+    // combined `summaryPolished` call is the only one that gets the
+    // merged `snap.items[]`.
     snap.modelPolish = (m_llm && m_llm->IsLoaded())
                           ? m_llm->ModelName()
                           : std::string("(not loaded)");
     if (m_llm && m_llm->IsLoaded())
     {
-        // Build the LlmActivityItem list once -- shared across the
-        // four Polish() calls (the *category* parameter narrows the
-        // prompt instruction without re-projecting items[]; the LLM
-        // is told via the system message which facets to emphasize).
-        std::vector<LlmActivityItem> llmItems;
-        llmItems.reserve(snap.items.size());
+        // Combined "all" -- merged top-N items already in snap.items.
+        std::vector<LlmActivityItem> llmItemsAll;
+        llmItemsAll.reserve(snap.items.size());
         for (const auto& it : snap.items)
         {
             LlmActivityItem li;
@@ -2552,17 +2561,52 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             li.rawTitle     = it.rawTitle;
             li.focusSeconds = it.focusSeconds;
             li.pct          = it.pct;
-            llmItems.push_back(std::move(li));
+            llmItemsAll.push_back(std::move(li));
         }
 
+        // Per-facet projection from the corresponding bag.  `pct` is
+        // recomputed relative to the *facet* total focus so a single
+        // dominant Files entry reads as "100% of files focus" rather
+        // than "12% of global focus".  Cap each facet's item list at
+        // kMaxPromptItems-equivalent (5) so the prompt stays small.
+        auto bagToLlmItems = [](const std::vector<AppAgg>& bag)
+            -> std::vector<LlmActivityItem>
+        {
+            std::vector<LlmActivityItem> out;
+            if (bag.empty()) return out;
+            int64_t total = 0;
+            for (const auto& a : bag) total += a.totalFocusSecs;
+            const size_t cap = (std::min)(bag.size(), static_cast<size_t>(5));
+            out.reserve(cap);
+            for (size_t i = 0; i < cap; ++i)
+            {
+                const AppAgg& a = bag[i];
+                LlmActivityItem li;
+                li.app          = a.friendlyName;
+                li.title        = a.bestTitle;
+                li.rawTitle     = a.rawTitle;
+                li.focusSeconds = a.totalFocusSecs;
+                li.pct = (total > 0)
+                         ? static_cast<int>(
+                               (100.0 * a.totalFocusSecs) / total + 0.5)
+                         : 0;
+                out.push_back(std::move(li));
+            }
+            return out;
+        };
+
+        std::vector<LlmActivityItem> llmItemsFiles    = bagToLlmItems(rankedFiles);
+        std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
+        std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
+
         if (!snap.summary.empty())
-            snap.summaryPolished         = m_llm->Polish(snap.summary,         llmItems, "all");
-        if (!snap.summaryFiles.empty())
-            snap.summaryFilesPolished    = m_llm->Polish(snap.summaryFiles,    llmItems, "files");
-        if (!snap.summaryWebsites.empty())
-            snap.summaryWebsitesPolished = m_llm->Polish(snap.summaryWebsites, llmItems, "websites");
-        if (!snap.summaryApps.empty())
-            snap.summaryAppsPolished     = m_llm->Polish(snap.summaryApps,     llmItems, "apps");
+            snap.summaryPolished         = m_llm->Polish(snap.summary,         llmItemsAll,      "all");
+        if (!snap.summaryFiles.empty() && !llmItemsFiles.empty())
+            snap.summaryFilesPolished    = m_llm->Polish(snap.summaryFiles,    llmItemsFiles,    "files");
+        if (!snap.summaryWebsites.empty() && !llmItemsWebsites.empty())
+            snap.summaryWebsitesPolished = m_llm->Polish(snap.summaryWebsites, llmItemsWebsites, "websites");
+        if (!snap.summaryApps.empty() && !llmItemsApps.empty())
+            snap.summaryAppsPolished     = m_llm->Polish(snap.summaryApps,     llmItemsApps,     "apps");
     }
 
     // ---- Confidence -----------------------------------------------

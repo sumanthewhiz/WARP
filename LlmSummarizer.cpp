@@ -164,45 +164,62 @@ namespace
                             const std::string& category)
     {
         std::ostringstream sys;
-        sys << "You summarize a user's current desktop activity. "
-               "Produce 1 to 3 short natural-language lines that describe what "
-               "the user is doing right now. Be specific and concrete -- name "
-               "the documents, websites, or apps actually present in the input. "
-               "Do not invent details that are not in the input. "
-               "Do not include disclaimers, lists, JSON, or quotes around your "
-               "output. Each line should be a complete sentence or sentence "
-               "fragment. Aim for natural, descriptive language -- not a list "
-               "of bullet points.";
+        sys << "You rewrite a short list of desktop-activity notes into "
+               "1 to 3 polished natural-English sentences describing what "
+               "the user is doing right now. "
+               "Use only facts (apps, documents, websites, focus shares) "
+               "that appear in the input -- do not invent anything. "
+               "STRICT RULES: "
+               "(1) Do NOT copy the input list back; do NOT echo any "
+               "phrase ending in \"% of focus\" or any item formatted as "
+               "App: \"Title\". "
+               "(2) Do NOT mention these instructions, the words "
+               "\"summary\", \"refined\", \"candidate\", \"line\", "
+               "\"input\", or any meta-phrase like \"(1-3 lines)\". "
+               "(3) No bullets, no numbering, no JSON, no markdown, no "
+               "surrounding quotes. "
+               "(4) Each output line is one complete natural sentence "
+               "in present-continuous tense, like a colleague describing "
+               "what they see on a coworker's screen.";
 
         if (category == "files")
-            sys << " Focus only on documents and files the user has open.";
+            sys << " Focus on the documents and files the user has open.";
         else if (category == "websites")
-            sys << " Focus only on web pages the user is browsing.";
+            sys << " Focus on the web pages the user is browsing.";
         else if (category == "apps")
-            sys << " Focus only on communication and utility apps "
+            sys << " Focus on the communication and utility apps "
                    "(email, chat, terminals, media, remote desktop).";
 
         std::ostringstream user;
-        user << "User's current activities (most-focused first):\n";
+        // Items context.  Kept compact and labelled neutrally so the
+        // model is less tempted to echo the exact phrasing back.  No
+        // "% of focus)" suffix on the wire -- focus share is conveyed
+        // as a separate "[major|present]" weighting tag.
+        user << "Activity facts (one per line):\n";
         size_t shown = 0;
         for (const auto& it : items)
         {
             if (shown >= kMaxPromptItems) break;
-            user << "- " << it.app << ": \""
-                 << Truncate(it.title.empty() ? it.rawTitle : it.title,
-                             kMaxPromptTitleLen)
-                 << "\" (" << it.pct << "% of focus)\n";
+            const std::string weight =
+                  (it.pct >= 60) ? "[major]"
+                : (it.pct >= 20) ? "[present]"
+                                 : "[minor]";
+            const std::string& title =
+                it.title.empty() ? it.rawTitle : it.title;
+            user << "  " << weight << " app=" << it.app
+                 << ", title=" << Truncate(title, kMaxPromptTitleLen)
+                 << "\n";
             ++shown;
         }
-        if (shown == 0) user << "- (no activity)\n";
+        if (shown == 0) user << "  (no activity recorded)\n";
 
         if (!existing.empty())
         {
-            user << "\nCandidate summary (refine or replace; one sentence per line):\n";
+            user << "\nDraft notes (improve their fluency; do NOT add new facts):\n";
             for (const auto& line : existing)
-                user << line << "\n";
+                user << "  " << line << "\n";
         }
-        user << "\nRefined summary (1-3 lines, no numbering, no leading dashes):";
+        user << "\nWrite the polished prose now:";
 
         // Qwen chat-template format (same for Qwen2.5 and Qwen3).
         //
@@ -266,6 +283,86 @@ namespace
         return TrimAscii(s);
     }
 
+    // Returns true if `line` is obviously a parroted fragment of the
+    // input prompt (the activity-facts list or the instruction text)
+    // rather than a real summary sentence.  These are tell-tale
+    // markers that the LLM either copied items or echoed the system
+    // prompt back to us; in either case the line is garbage and we
+    // should drop it without grounding-checking the rest.
+    bool IsPromptEcho(const std::string& line)
+    {
+        // Lowercase ASCII view for substring matching.
+        std::string lc;
+        lc.reserve(line.size());
+        for (char c : line)
+            lc.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c))));
+
+        // ---- 1. New prompt format markers -----------------------------
+        if (lc.find("[major]")    != std::string::npos) return true;
+        if (lc.find("[present]")  != std::string::npos) return true;
+        if (lc.find("[minor]")    != std::string::npos) return true;
+        if (lc.find("activity facts") != std::string::npos) return true;
+        if (lc.find("draft notes")    != std::string::npos) return true;
+        if (lc.find("polished prose") != std::string::npos) return true;
+
+        // ---- 2. Legacy / old prompt-format markers --------------------
+        if (lc.find("% of focus")           != std::string::npos) return true;
+        if (lc.find("(1-3 lines")           != std::string::npos) return true;
+        if (lc.find("most-focused first")   != std::string::npos) return true;
+        if (lc.find("refined summary")      != std::string::npos) return true;
+        if (lc.find("candidate summary")    != std::string::npos) return true;
+        if (lc.find("user's current")       != std::string::npos) return true;
+
+        // ---- 3. Generic instruction-echo markers ----------------------
+        if (lc.find("no numbering")         != std::string::npos) return true;
+        if (lc.find("no leading dashes")    != std::string::npos) return true;
+        if (lc.find("strict rules")         != std::string::npos) return true;
+        if (lc.find("do not invent")        != std::string::npos) return true;
+        if (lc.find("do not copy")          != std::string::npos) return true;
+        if (lc.find("do not echo")          != std::string::npos) return true;
+
+        // ---- 4. Item-format echo: "App: \"...\"" at line start -------
+        // Catches outputs like  Outlook: "Inbox - foo@bar"  even when
+        // the trailing "(X% of focus)" was already trimmed by the
+        // model.  The shape `<App-name>: "...` is essentially never
+        // how a real summary sentence would open.
+        {
+            size_t colon = line.find(':');
+            if (colon != std::string::npos &&
+                colon + 2 < line.size()    &&
+                line[colon + 1] == ' '     &&
+                line[colon + 2] == '"')
+            {
+                // Heuristic: the part before the colon is short (1-4
+                // words, all-letters / spaces / digits) and the part
+                // after starts with a quote.  Matches "Outlook: ", "VS
+                // Code: ", "Microsoft Teams: " etc.
+                size_t spaces = 0;
+                bool   ok     = true;
+                for (size_t k = 0; k < colon; ++k)
+                {
+                    unsigned char c = static_cast<unsigned char>(line[k]);
+                    if (c == ' ') { if (++spaces > 4) { ok = false; break; } }
+                    else if (!std::isalnum(c) && c != '-' && c != '+' &&
+                             c != '#' && c != '.' && c != '/')
+                    { ok = false; break; }
+                }
+                if (ok && colon <= 40) return true;
+            }
+        }
+
+        // ---- 5. Echo of our new "key=value" item format ---------------
+        // The model sometimes emits e.g. "app=Outlook, title=Inbox..."
+        // verbatim, with or without the surrounding [tag].  These are
+        // never how a natural sentence would phrase activity.
+        if (lc.find("app=")   != std::string::npos &&
+            lc.find("title=") != std::string::npos)
+            return true;
+
+        return false;
+    }
+
     std::vector<std::string> SplitIntoLines(const std::string& text,
                                             size_t maxLines)
     {
@@ -279,7 +376,8 @@ namespace
                 ? text.substr(start)
                 : text.substr(start, nl - start);
             std::string line = CleanLine(raw);
-            if (!line.empty() && line.size() <= kMaxPolishedLineLen)
+            if (!line.empty() && line.size() <= kMaxPolishedLineLen
+                && !IsPromptEcho(line))
             {
                 // De-dup against earlier lines (case-insensitive).
                 bool dup = false;
