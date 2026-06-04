@@ -205,10 +205,24 @@ namespace
         user << "\nRefined summary (1-3 lines, no numbering, no leading dashes):";
 
         // Qwen chat-template format (same for Qwen2.5 and Qwen3).
+        //
+        // Qwen3 ships a built-in chain-of-thought "thinking" mode that
+        // is enabled by default; when we hand-build the prompt the
+        // model will happily emit a long <think>...</think> reasoning
+        // block before the actual answer, which (a) consumes our 96-
+        // token budget on reasoning instead of the summary itself, so
+        // the answer is never reached, and (b) leaks raw reasoning
+        // ("First, I need to extract the information from the user's
+        // input...") into summary_polished.  The official Qwen3
+        // chat-template handles this by pre-pending an empty
+        // <think></think> block after the assistant header when
+        // `enable_thinking=False`; replicate that pattern here so the
+        // model skips reasoning and goes straight to the summary.
         std::ostringstream prompt;
         prompt << "<|im_start|>system\n" << sys.str() << "<|im_end|>\n"
                << "<|im_start|>user\n"   << user.str() << "<|im_end|>\n"
-               << "<|im_start|>assistant\n";
+               << "<|im_start|>assistant\n"
+               << "<think>\n\n</think>\n\n";
         return prompt.str();
     }
 }
@@ -368,6 +382,30 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
 
         std::string decoded = decodedStr ? std::string(decodedStr) : std::string();
         cleanup();
+
+        // Safety net: strip any <think>...</think> reasoning block
+        // that the model still emits despite the no-think sentinel in
+        // the prompt.  We strip the *paired* form first (open and
+        // matching close tags), then fall back to truncating from any
+        // residual <think> opener with no close (model started
+        // thinking but ran out of token budget -- yields no usable
+        // output, return empty later via the lines.empty() gate).
+        for (;;)
+        {
+            size_t open  = decoded.find("<think>");
+            if (open == std::string::npos) break;
+            size_t close = decoded.find("</think>", open);
+            if (close == std::string::npos)
+            {
+                decoded.erase(open);   // dangling <think> -- drop the rest
+                break;
+            }
+            decoded.erase(open, (close + 8 /* len("</think>") */) - open);
+        }
+        // Also drop any orphan closing tag from a malformed emission.
+        size_t orphanClose = decoded.find("</think>");
+        if (orphanClose != std::string::npos)
+            decoded.erase(0, orphanClose + 8);
 
         size_t imEnd = decoded.find("<|im_end|>");
         if (imEnd != std::string::npos) decoded.erase(imEnd);
