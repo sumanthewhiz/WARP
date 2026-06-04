@@ -99,13 +99,13 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <!-- ORT 1.23.0 dropped its win-x86 native binaries (the package
-         simply doesn't ship runtimes\win-x86\* anymore).  ORT-GenAI
-         0.14.1 transitively requires ORT >= 1.23 so x64 / ARM64 must
-         pin to 1.23; meanwhile the x86 build (which never links the
-         polishing layer) keeps using ORT 1.22.0 -- the last release
-         that still publishes win-x86 binaries.  Both packages are
-         restored side-by-side by the CI 'Restore NuGet packages'
-         step.  Local developers who never build x86 only need 1.23. -->
+         simply no longer ships runtimes\win-x86\*).  ORT-GenAI 0.14.1
+         transitively requires ORT >= 1.23 so x64 / ARM64 must pin to
+         1.23; meanwhile the x86 build (which never links the polishing
+         layer) keeps using ORT 1.22.0, the last release that still
+         publishes win-x86 binaries.  Both packages are restored
+         side-by-side by the CI 'Restore NuGet packages' step.  Local
+         developers who never build x86 only need 1.23. -->
     <OrtPkgDir Condition="'$(Platform)'=='Win32'">..\packages\Microsoft.ML.OnnxRuntime.1.22.0</OrtPkgDir>
     <OrtPkgDir Condition="'$(Platform)'!='Win32'">..\packages\Microsoft.ML.OnnxRuntime.1.23.0</OrtPkgDir>
     <OrtGenAiPkgDir>..\packages\Microsoft.ML.OnnxRuntimeGenAI.0.14.1</OrtGenAiPkgDir>
