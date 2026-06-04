@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "BertTokenizer.h"
+#include "ModernBertTokenizer.h"
 
 // Forward-declare the ONNX Runtime types so callers don't need to pull the
 // header into every translation unit.  All access lives behind opaque pointers.
@@ -96,7 +97,7 @@ struct ContextSnapshot
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
-    std::string   model;                // "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
+    std::string   model;                // "granite-embedding-small-english-r2", "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
     std::string   modelPolish;          // "qwen3-0.6b" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
@@ -203,18 +204,33 @@ private:
     std::mutex                   m_mutex;
 
     // ---- Sentence-encoder embedding pipeline (optional) ----------------
-    // Default model: BAAI/bge-small-en-v1.5 (384-dim, BERT WordPiece
-    // tokenizer, ~33 M params).  Compatible with the previous
-    // all-MiniLM-L6-v2 (same dim, same tokenizer); if `bge-small.onnx`
-    // isn't present, Init() falls back to `minilm.onnx` so legacy
-    // installations keep working without forcing a redownload.
-    BertTokenizer        m_tokenizer;
+    // Preferred model: ibm-granite/granite-embedding-small-english-r2
+    // (ModernBERT-based, 47 M params, byte-level BPE tokenizer, 384-dim,
+    // Apache 2.0, August 2025).  Granite is explicitly trained on code
+    // retrieval (COIR benchmark) so it handles code-y window titles
+    // (`auth.cpp`, `useEffect`, `node_modules`) much better than the
+    // WordPiece-based BGE-small tokenizer that fragments such tokens.
+    // Both models output 384-dim embeddings, so the downstream cluster
+    // threshold and per-cluster scoring logic are unchanged.
+    //
+    // Backward-compat fallbacks if the granite model files are absent:
+    //   1. `bge-small.onnx`  -> BAAI/bge-small-en-v1.5 (BERT WordPiece)
+    //   2. `minilm.onnx`     -> sentence-transformers/all-MiniLM-L6-v2
+    //                          (BERT WordPiece, legacy)
+    //
+    // The granite path uses `ModernBertTokenizer` + the model's
+    // bundled `sentence_embedding` output (pre-pooled); the BGE/MiniLM
+    // fallback uses `BertTokenizer` + a manual mean-pool over
+    // `last_hidden_state`.
+    BertTokenizer        m_tokenizer;       // BGE / MiniLM fallback path
+    ModernBertTokenizer  m_mbTokenizer;     // granite (preferred) path
+    bool                 m_useGranite = false;
     Ort::Env*            m_ortEnv     = nullptr;
     Ort::SessionOptions* m_ortOpts    = nullptr;
     Ort::Session*        m_ortSession = nullptr;
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
-    std::string          m_modelName;        // e.g. "bge-small-en-v1.5"
+    std::string          m_modelName;        // e.g. "granite-embedding-small-english-r2"
 
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;

@@ -933,36 +933,70 @@ ContextInference::~ContextInference()
 
 // =====================================================================
 //  Init -- load the sentence-encoder model + tokenizer if available.
-//  Prefers BAAI/bge-small-en-v1.5 (`bge-small.onnx`); falls back to
-//  the legacy all-MiniLM-L6-v2 (`minilm.onnx`) if BGE isn't present.
-//  This is best-effort:
-//  if any step fails the engine still runs in deterministic-only mode.
+//
+//  Preference order:
+//    1. ibm-granite/granite-embedding-small-english-r2 (ModernBERT,
+//       byte-level BPE, 384-dim, code-aware) under
+//       <modelsDir>\granite\.  Expected files:
+//           model_quantized.onnx (+ model_quantized.onnx_data)
+//           vocab.txt              \
+//           merges.txt              > produced at CI time from
+//           special_tokens.txt     /  tokenizer.json by
+//                                  scripts/extract_modernbert_tokenizer.py
+//    2. BAAI/bge-small-en-v1.5 (BERT WordPiece, 384-dim) -- the legacy
+//       default; reads bge-small.onnx + vocab.txt.
+//    3. sentence-transformers/all-MiniLM-L6-v2 (same dim, same
+//       tokenizer as BGE-small) -- transparent fallback for upgrades.
+//
+//  All three produce 384-dim L2-normalized sentence vectors so the
+//  cosine-clustering threshold and downstream scoring are unchanged.
+//  Best-effort: if every option fails the engine still runs in
+//  deterministic-only mode.
 // =====================================================================
 bool ContextInference::Init(const std::wstring& modelsDir)
 {
     if (modelsDir.empty()) return true;  // explicitly skip model load
 
-    // Tokenizer vocab
-    std::string vocabPath = WideToUtf8(modelsDir) + "\\vocab.txt";
-    if (!m_tokenizer.Load(vocabPath))
-        return true;  // graceful degrade
+    std::wstring modelPath;
+    std::string  modelLabel;
+    bool         useGranite = false;
 
-    std::wstring modelPath  = modelsDir + L"\\bge-small.onnx";
-    std::string  modelLabel = "bge-small-en-v1.5";
-
-    // Backward compat: if the new BGE model file isn't present, fall
-    // back to the legacy MiniLM model (same 384 dim, same tokenizer,
-    // same call surface).  Lets existing installations keep working
-    // through an in-place binary upgrade until the user re-downloads.
+    // ---- Path 1: granite (preferred) -------------------------------
     {
-        DWORD attrs = GetFileAttributesW(modelPath.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES)
+        std::wstring graniteDir = modelsDir + L"\\granite";
+        std::wstring gModel     = graniteDir + L"\\model_quantized.onnx";
+        std::string  gVocab     = WideToUtf8(graniteDir) + "\\vocab.txt";
+        std::string  gMerges    = WideToUtf8(graniteDir) + "\\merges.txt";
+        std::string  gSpecial   = WideToUtf8(graniteDir) + "\\special_tokens.txt";
+        if (GetFileAttributesW(gModel.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            m_mbTokenizer.Load(gVocab, gMerges, gSpecial))
+        {
+            modelPath  = std::move(gModel);
+            modelLabel = "granite-embedding-small-english-r2";
+            useGranite = true;
+        }
+    }
+
+    // ---- Path 2/3: BGE-small / MiniLM fallback ---------------------
+    if (!useGranite)
+    {
+        std::string vocabPath = WideToUtf8(modelsDir) + "\\vocab.txt";
+        if (!m_tokenizer.Load(vocabPath))
+            return true;  // graceful degrade -- nothing else to try
+
+        modelPath  = modelsDir + L"\\bge-small.onnx";
+        modelLabel = "bge-small-en-v1.5";
+        if (GetFileAttributesW(modelPath.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
             std::wstring legacy = modelsDir + L"\\minilm.onnx";
             if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
             {
                 modelPath  = std::move(legacy);
                 modelLabel = "all-MiniLM-L6-v2";
+            }
+            else
+            {
+                return true;  // no model files at all -- deterministic mode
             }
         }
     }
@@ -987,21 +1021,82 @@ bool ContextInference::Init(const std::wstring& modelsDir)
         return true;  // graceful degrade
     }
 
+    m_useGranite = useGranite;
     m_modelReady = true;
     m_modelName  = std::move(modelLabel);
     return true;
 }
 
 // =====================================================================
-//  Sentence embedding (384-dim, mean-pool + L2-normalize).  Works with
-//  either BGE-small-en-v1.5 or all-MiniLM-L6-v2 -- both export the same
-//  tensor shape and tokenization.
-//  Empty vector if the model isn't loaded.
+//  Sentence embedding (384-dim, L2-normalized).
+//
+//  Two model topologies are supported:
+//    - granite (ModernBERT): inputs `input_ids` + `attention_mask`,
+//      output `sentence_embedding` -- the model already mean-pools and
+//      we just L2-normalize.
+//    - BGE-small / MiniLM (BERT): inputs `input_ids` + `attention_mask`
+//      + `token_type_ids`, output `last_hidden_state` -- we mean-pool
+//      over real (non-pad) tokens, then L2-normalize.
+//
+//  Both branches return a 384-dim vector; the rest of the clustering
+//  pipeline doesn't need to know which model produced it.
+//  Empty vector if the model isn't loaded or inference fails.
 // =====================================================================
 std::vector<float> ContextInference::Embed(const std::string& text)
 {
     if (!m_modelReady || !m_ortSession) return {};
 
+    if (m_useGranite)
+    {
+        std::vector<int64_t> inputIds =
+            m_mbTokenizer.Encode(text, MAX_SEQ_LEN);
+        if (inputIds.empty()) return {};
+        std::vector<int64_t> attentionMask(inputIds.size(), 1);
+
+        const int64_t seqLen = static_cast<int64_t>(inputIds.size());
+        std::array<int64_t, 2> shape = { 1, seqLen };
+
+        Ort::Value inputIdsTensor = Ort::Value::CreateTensor<int64_t>(
+            *m_ortMemInfo, inputIds.data(), inputIds.size(),
+            shape.data(), shape.size());
+        Ort::Value attMaskTensor = Ort::Value::CreateTensor<int64_t>(
+            *m_ortMemInfo, attentionMask.data(), attentionMask.size(),
+            shape.data(), shape.size());
+
+        const char* inputNames[]  = { "input_ids", "attention_mask" };
+        const char* outputNames[] = { "sentence_embedding" };
+
+        std::vector<Ort::Value> inputTensors;
+        inputTensors.push_back(std::move(inputIdsTensor));
+        inputTensors.push_back(std::move(attMaskTensor));
+
+        std::vector<Ort::Value> outputTensors;
+        try
+        {
+            outputTensors = m_ortSession->Run(
+                Ort::RunOptions{ nullptr },
+                inputNames, inputTensors.data(), 2,
+                outputNames, 1);
+        }
+        catch (const Ort::Exception&)
+        {
+            return {};
+        }
+
+        const float* raw = outputTensors[0].GetTensorData<float>();
+        std::vector<float> embedding(raw, raw + EMBED_DIM);
+
+        float norm = 0.0f;
+        for (int d = 0; d < EMBED_DIM; ++d) norm += embedding[d] * embedding[d];
+        norm = std::sqrt(norm);
+        if (norm > 1e-9f)
+        {
+            for (int d = 0; d < EMBED_DIM; ++d) embedding[d] /= norm;
+        }
+        return embedding;
+    }
+
+    // ---- BGE-small / MiniLM legacy path ----------------------------
     std::vector<int64_t> inputIds = m_tokenizer.Encode(text, MAX_SEQ_LEN);
     std::vector<int64_t> attentionMask(inputIds.size(), 1);
     std::vector<int64_t> tokenTypeIds(inputIds.size(), 0);
