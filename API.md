@@ -644,7 +644,7 @@ cluster of activity).  Consumers render them as separate lines.
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
+| `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded (preferred); `"bge-small-en-v1.5"` when the legacy BGE-small WordPiece encoder is the only one present; `"all-MiniLM-L6-v2"` when only the older MiniLM model is present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
 | `model_polish` | `string` | `"qwen3-0.6b"` when the optional LLM polishing layer is loaded and active; `"(not loaded)"` when the polisher's model files aren't present. |
 | `summary_polished` | `string[]` | LLM-polished natural-prose rewrite of `summary` (or the category-matching summary). Present in every response (possibly empty array). Empty when the LLM isn't loaded, the inference timed out, or the output failed grounding validation. |
 | `summary_files_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_files`. Same emptiness semantics as `summary_polished`. |
@@ -940,13 +940,16 @@ For short-term memory or context drift over time, call:
 Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
-The composer uses a BERT WordPiece sentence-encoder (`BAAI/bge-small-en-v1.5`
-by default, with `sentence-transformers/all-MiniLM-L6-v2` supported as a
-transparent backward-compat fallback) for **dynamic semantic
-clustering** *and* **theme distillation** — *not* mapping to a fixed
-taxonomy. Two activities are merged into one *thread of work* iff their
-embeddings are similar to each other (cosine ≥ 0.65), and within each
-thread the dominant content tokens (after stripping stop-words, file
+The composer prefers `ibm-granite/granite-embedding-small-english-r2`
+(ModernBERT byte-level BPE, COIR-trained for code retrieval, 384-dim) when
+its files are present, and transparently falls back to
+`BAAI/bge-small-en-v1.5` (BERT WordPiece, 384-dim) and then
+`sentence-transformers/all-MiniLM-L6-v2` (same dim, same tokenizer as BGE)
+when granite isn't available. Whichever encoder is loaded, it drives
+**dynamic semantic clustering** *and* **theme distillation** — *not* mapping
+to a fixed taxonomy. Two activities are merged into one *thread of work*
+iff their embeddings are similar to each other (cosine ≥ 0.65), and within
+each thread the dominant content tokens (after stripping stop-words, file
 extensions, and brand/app names) are scored by `frequency × (1 +
 cosine-to-cluster-centroid)` — the top 1-2 are emitted as the theme
 phrase. The verb is selected from a small fixed set (`Working on`,
@@ -1714,7 +1717,72 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.10.*
+*This documentation describes WARP API version 5.11.*
+
+*Changes from v5.10:*
+- ***Embedding model upgraded from `BAAI/bge-small-en-v1.5` to
+  `ibm-granite/granite-embedding-small-english-r2`.***  The dynamic
+  context-inference clusterer now uses the ModernBERT-based granite
+  encoder (47 M params, 384-dim, Apache 2.0, August 2025) instead of
+  BGE-small.  Granite is explicitly trained on COIR (Code Information
+  Retrieval) so it handles the code-heavy window titles WARP sees
+  (`auth.cpp`, `useEffect`, `node_modules`, `OnnxRuntimeGenAI`)
+  far better than BGE-small's WordPiece tokenizer, which would
+  shatter such tokens into 4-6 sub-pieces and dilute the semantic
+  signal.  Same 384-dim output -> the existing 0.65 cluster cosine
+  threshold and downstream theme/verb scoring are unchanged.
+  BGE-small + MiniLM remain as transparent fallbacks if the granite
+  files aren't present.
+- ***New: hand-rolled `ModernBertTokenizer.h`*** -- a header-only
+  byte-level BPE tokenizer modelled on the existing
+  `BertTokenizer.h` pattern (no JSON parser, no new NuGet packages).
+  Loads three flat artefacts produced at CI time from the upstream
+  `tokenizer.json` via `scripts/extract_modernbert_tokenizer.py`:
+  `vocab.txt` (one byte-level-encoded token per line, line N = id
+  N), `merges.txt` (one space-separated pair per line, in HF rank
+  order), and `special_tokens.txt` (cls/sep/pad/unk/mask IDs).
+  Implements NFC normalisation via Windows `NormalizeString`, the
+  standard 256-entry GPT-2 byte->visible-codepoint map, a
+  GPT-2-style pre-tokenizer hand-coded as a UTF-8 state machine
+  (English contractions, Unicode-block letter/digit/whitespace
+  classifiers, the `\s+(?!\S)` carve-out), and the lowest-rank-merge
+  BPE loop with the `ignore_merges` fast path.  Verified
+  **bit-exact** against `transformers.AutoTokenizer` for 15
+  representative inputs (ASCII code-y titles, contractions, NFC
+  accents, Greek, Japanese, Chinese mixed with English) using
+  `scripts/modernbert_tokenizer_ref.py` (Python spec) +
+  `scripts/tokenizer_test_driver.cpp` (standalone C++ harness).
+- ***`ContextInference::Embed()` is now model-aware:*** for granite
+  it sends `input_ids + attention_mask` (no `token_type_ids`) and
+  reads the model's bundled `sentence_embedding` output directly --
+  the ONNX graph already mean-pools.  The BGE / MiniLM legacy
+  branch still sends the BERT 3-input shape and mean-pools
+  `last_hidden_state` manually.
+- ***Snapshot `model` field*** can now take the value
+  `"granite-embedding-small-english-r2"` in addition to the existing
+  `"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, and `"deterministic"`.
+- ***Fixed: Qwen3 `<think>` block leaking into
+  `summary_polished`.***  Qwen3 ships with chain-of-thought
+  "thinking" mode enabled by default, which caused the polisher to
+  emit reasoning prelude text (`<think>`, `"First, I need to extract
+  the information from the user input..."`, etc.) instead of the
+  actual summary because the 96-token budget was being consumed by
+  the reasoning and never reached the answer.  `LlmSummarizer::
+  BuildPrompt()` now appends the official Qwen3 no-think sentinel
+  `<think>\n\n</think>\n\n` after the assistant header (replicating
+  what `enable_thinking=False` does in the upstream
+  `chat_template.jinja`); `Polish()` also strips any residual
+  `<think>...</think>` block in post-processing as a safety net.
+- ***Build pipeline:*** CI now downloads
+  `onnx-community/granite-embedding-small-english-r2-ONNX`
+  (`model_quantized.onnx` + `model_quantized.onnx_data`, ~52 MB
+  INT8) plus the upstream `tokenizer.json`, runs
+  `extract_modernbert_tokenizer.py` to produce the flat tokenizer
+  files, then drops `tokenizer.json` from the staged artefact to
+  keep the shipped model directory minimal.  The vcxproj copies the
+  entire `models/granite/` subtree at post-build on every platform
+  (x86 included -- granite is a pure ORT-CPU model, no ORT-GenAI
+  dependency).
 
 *Changes from v5.9:*
 - ***LLM polishing model upgraded from Qwen2.5-0.5B-Instruct to

@@ -60,7 +60,7 @@ long as the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a human-readable **context summary** of 1–3 short phrase lines describing what the user is actively doing — e.g. `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the optional **BGE-small (`BAAI/bge-small-en-v1.5`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. (The legacy `all-MiniLM-L6-v2` ONNX is automatically picked up as a backward-compatibility fallback when `bge-small.onnx` isn't present; both produce 384-dim embeddings and share the same BERT WordPiece tokenizer.) For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `focus-weighted coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–3 tokens become the cluster's theme phrase. **Umbrella detection:** if a single content token appears in titles of ≥ 50 % of the top clusters AND those clusters carry ≥ 50 % of focus, those clusters are collapsed into a single descriptive line of the form `"Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"` (with a "Researching"-verb variant for browser-dominant umbrellas and a "Working on"-variant for editor-dominant ones). The combined "All" summary is hard-capped at 3 lines total and drops any non-umbrella cluster contributing less than 5 % of focus time, so each line stays *coherent* — no more `"… + 2 other threads"` noise. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, `Exploring`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined summary, the snapshot also carries three independent summaries — `summary_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `summary_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `summary_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same sentence-encoder cluster→theme pipeline (including umbrella detection). The UI dropdowns next to the *Show Context Summary* / *Show Summary History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different summary in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a human-readable **context summary** of 1–3 short phrase lines describing what the user is actively doing — e.g. `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the optional **granite (`ibm-granite/granite-embedding-small-english-r2`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. (The legacy `BAAI/bge-small-en-v1.5` and `all-MiniLM-L6-v2` ONNX models are automatically picked up as backward-compatibility fallbacks when the granite files aren't present; all three produce 384-dim embeddings — granite uses a byte-level BPE tokenizer that handles code/identifier tokens like `auth.cpp` and `useEffect` cleanly, while BGE and MiniLM share the older BERT WordPiece tokenizer.) For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `focus-weighted coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–3 tokens become the cluster's theme phrase. **Umbrella detection:** if a single content token appears in titles of ≥ 50 % of the top clusters AND those clusters carry ≥ 50 % of focus, those clusters are collapsed into a single descriptive line of the form `"Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"` (with a "Researching"-verb variant for browser-dominant umbrellas and a "Working on"-variant for editor-dominant ones). The combined "All" summary is hard-capped at 3 lines total and drops any non-umbrella cluster contributing less than 5 % of focus time, so each line stays *coherent* — no more `"… + 2 other threads"` noise. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, `Exploring`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"granite-embedding-small-english-r2"`, `"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined summary, the snapshot also carries three independent summaries — `summary_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `summary_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `summary_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same sentence-encoder cluster→theme pipeline (including umbrella detection). The UI dropdowns next to the *Show Context Summary* / *Show Summary History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different summary in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -1087,9 +1087,28 @@ downloaded once into a `models/` folder before the build.
 **Steps:**
 
 1. Open `WARP!.sln` in Visual Studio (or run `nuget restore "WARP!.sln" -PackagesDirectory ..\packages` from the repo root).
-2. Download the sentence-encoder model files into `models/` (one-time, ~130 MB):
+2. Download the sentence-encoder model files into `models/` (one-time, ~55 MB):
 
    ```powershell
+   # Preferred: ibm-granite/granite-embedding-small-english-r2 (ModernBERT
+   # byte-level BPE, 384-dim, COIR code-retrieval trained, Apache 2.0).
+   $graniteDir = "models/granite"
+   New-Item -ItemType Directory -Path $graniteDir -Force | Out-Null
+   Invoke-WebRequest `
+     -Uri "https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main/onnx/model_quantized.onnx" `
+     -OutFile "$graniteDir/model_quantized.onnx"
+   Invoke-WebRequest `
+     -Uri "https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main/onnx/model_quantized.onnx_data" `
+     -OutFile "$graniteDir/model_quantized.onnx_data"
+   Invoke-WebRequest `
+     -Uri "https://huggingface.co/ibm-granite/granite-embedding-small-english-r2/resolve/main/tokenizer.json" `
+     -OutFile "$graniteDir/tokenizer.json"
+   python -m pip install --quiet regex
+   python scripts/extract_modernbert_tokenizer.py "$graniteDir/tokenizer.json" "$graniteDir"
+   Remove-Item "$graniteDir/tokenizer.json" -Force
+
+   # Optional legacy fallback (auto-used when granite/ isn't present):
+   #   BAAI/bge-small-en-v1.5 (BERT WordPiece, 384-dim, ~130 MB).
    New-Item -ItemType Directory -Path models -Force | Out-Null
    Invoke-WebRequest `
      -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" `
@@ -1099,11 +1118,13 @@ downloaded once into a `models/` folder before the build.
      -OutFile "models/vocab.txt"
    ```
 
-   > Legacy `models/minilm.onnx` (all-MiniLM-L6-v2) installations also work —
-   > `ContextInference::Init()` falls back to it automatically when
-   > `bge-small.onnx` isn't present. The two models share the same 384-dim
-   > embedding space and the same BERT WordPiece vocab, so no other change
-   > is needed.
+   > **Granite is the preferred default** — `ContextInference::Init()` tries
+   > `models/granite/` first, then falls through to `bge-small.onnx`, then
+   > `minilm.onnx`, then deterministic mode. All three sentence-encoder
+   > options output the same 384-dim space so the downstream cluster
+   > threshold and theme/verb scoring are unchanged; only the granite
+   > path uses `ModernBertTokenizer` (byte-level BPE) while the BGE / MiniLM
+   > paths stay on the original `BertTokenizer` (WordPiece).
 
 3. Download the **LLM polishing model** (Qwen3-0.6B, CPU-INT4,
    ~430 MB) into `models/qwen/`.  This is **required on x64 and ARM64**
@@ -1145,10 +1166,11 @@ downloaded once into a `models/` folder before the build.
 
 WARP is intentionally lean: a single Win32 executable that talks directly to
 the operating system for capture, to embedded SQLite for persistence, and uses
-the **BGE-small (`BAAI/bge-small-en-v1.5`)** ONNX sentence-encoder for *dynamic*
-context clustering (with `all-MiniLM-L6-v2` supported as a transparent
-backward-compatibility fallback) — no fixed taxonomy, no managed runtime, no
-service host, no background broker.
+the **granite (`ibm-granite/granite-embedding-small-english-r2`)** ModernBERT
+ONNX sentence-encoder for *dynamic* context clustering (with `BAAI/bge-small-en-v1.5`
+and `all-MiniLM-L6-v2` supported as transparent backward-compatibility
+fallbacks) — no fixed taxonomy, no managed runtime, no service host, no
+background broker.
 
 ```mermaid
 flowchart TB
@@ -1946,22 +1968,35 @@ WARP!\
 |-- InferenceEngine.h           Inference engine interface (per-entity analytics)
 |-- InferenceEngine.cpp         Confidence-weighted REAL counters, recency score,
 |                                QueryInferences & GetInferenceDeltas impl
-|-- ContextInference.h          BGE-small / sentence-encoder-clustered context summarizer interface
+|-- ContextInference.h          granite / BGE-small / sentence-encoder-clustered context summarizer interface
 |-- ContextInference.cpp        kAppClasses + classifier + CleanTitle + Embed/CosineSim
 |                                + greedy clustering + semantic theme distillation
 |                                (token bag + stop/brand/ext filter + cosine-weighted
 |                                scoring + verb selector); 60-sec rolling 15-min
 |                                summarizer with material-change dedup
-|-- BertTokenizer.h             Header-only WordPiece tokenizer (compatible with both
-|                                BGE-small-en-v1.5 and all-MiniLM-L6-v2)
+|-- BertTokenizer.h             Header-only WordPiece tokenizer (BGE-small / MiniLM fallback path)
+|-- ModernBertTokenizer.h       Header-only byte-level BPE tokenizer for granite-embedding-small-english-r2
+|                                (NFC norm + GPT-2 pre-tokenizer state machine + BPE merge loop);
+|                                bit-exact with transformers.AutoTokenizer (verified by
+|                                scripts/modernbert_tokenizer_ref.py + tokenizer_test_driver.cpp)
+|-- scripts/
+|   |-- extract_modernbert_tokenizer.py   Build-time: tokenizer.json -> flat vocab.txt + merges.txt + special_tokens.txt
+|   |-- modernbert_tokenizer_ref.py       Python reference implementation (algorithmic spec for the C++ port)
+|   +-- tokenizer_test_driver.cpp         Standalone harness that compares C++ output to HF reference IDs
 |
 |-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.23.0
 |                                + Microsoft.ML.OnnxRuntimeGenAI 0.14.1)
 |
-|-- models/                     (gitignored) BGE-small-en-v1.5 ONNX model + vocab
-|   |-- bge-small.onnx          Sentence encoder (384-dim, ~130 MB) - downloaded
-|   |-- minilm.onnx             (optional legacy fallback, ~86 MB) - downloaded
-|   +-- vocab.txt               WordPiece vocab - downloaded
+|-- models/                     (gitignored) sentence-encoder model files
+|   |-- granite/                Preferred: ibm-granite/granite-embedding-small-english-r2
+|   |   |-- model_quantized.onnx       ModernBERT INT8 ONNX (~600 KB wrapper)
+|   |   |-- model_quantized.onnx_data  external weights (~52 MB)
+|   |   |-- vocab.txt                  byte-level BPE vocab (one token per line, line N = id N)
+|   |   |-- merges.txt                 BPE merge rules (one "a b" pair per line, HF rank order)
+|   |   +-- special_tokens.txt         cls/sep/pad/unk/mask token IDs
+|   |-- bge-small.onnx          (legacy fallback) BAAI/bge-small-en-v1.5 (384-dim, ~130 MB) - downloaded
+|   |-- minilm.onnx             (legacy fallback) sentence-transformers/all-MiniLM-L6-v2 (~86 MB) - downloaded
+|   +-- vocab.txt               WordPiece vocab for bge-small / minilm - downloaded
 |
 |-- sqlite3.c                   SQLite amalgamation (compiled as C)
 +-- sqlite3.h                   SQLite public header
