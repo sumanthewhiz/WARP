@@ -2431,7 +2431,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
     // ---- Optional LLM polishing ------------------------------------
-    // If a Qwen2.5-0.5B-Instruct polisher is attached and loaded,
+    // If a Qwen3-0.6B polisher is attached and loaded,
     // produce a natural-prose rewrite of each of the four summaries
     // (combined + 3 facets).  Always preserves the template-composed
     // summary above as the source of truth -- the polished version

@@ -12,7 +12,7 @@
 //  Optional small-LLM "polishing" layer that takes the structured
 //  output of the existing BGE-small clustering pipeline (per-cluster
 //  themes + verbs + titles + app names) and rewrites it as natural
-//  prose using `Qwen2.5-0.5B-Instruct`.
+//  prose using `Qwen3-0.6B`.
 //
 //  Architecture
 //  ============
@@ -51,7 +51,7 @@
 //          genai_config.json
 //          model.onnx
 //          model.onnx.data        (external weights -- typical for
-//                                  quantized Qwen2.5 packaging)
+//                                  quantized Qwen3 packaging)
 //          tokenizer.json
 //          tokenizer_config.json
 //          special_tokens_map.json
@@ -100,7 +100,7 @@ public:
     bool IsLoaded() const { return m_ready.load(); }
 
     // Name reported in the JSON snapshot, e.g.
-    // "qwen2.5-0.5b-instruct" or "(not loaded)".
+    // "qwen3-0.6b" or "(not loaded)".
     std::string ModelName() const;
 
     // Take the existing structured summary (3 cluster lines for the

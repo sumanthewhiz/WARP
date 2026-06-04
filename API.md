@@ -645,7 +645,7 @@ cluster of activity).  Consumers render them as separate lines.
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
-| `model_polish` | `string` | `"qwen2.5-0.5b-instruct"` when the optional LLM polishing layer is loaded and active; `"(not loaded)"` when the polisher's model files aren't present. |
+| `model_polish` | `string` | `"qwen3-0.6b"` when the optional LLM polishing layer is loaded and active; `"(not loaded)"` when the polisher's model files aren't present. |
 | `summary_polished` | `string[]` | LLM-polished natural-prose rewrite of `summary` (or the category-matching summary). Present in every response (possibly empty array). Empty when the LLM isn't loaded, the inference timed out, or the output failed grounding validation. |
 | `summary_files_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_files`. Same emptiness semantics as `summary_polished`. |
 | `summary_websites_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_websites`. |
@@ -1714,7 +1714,61 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.9.*
+*This documentation describes WARP API version 5.10.*
+
+*Changes from v5.9:*
+- ***LLM polishing model upgraded from Qwen2.5-0.5B-Instruct to
+  `Qwen3-0.6B`.***  The polisher now uses the CPU-INT4 ORT-GenAI
+  bundle `xiaoyao9184/Qwen3-0.6B-onnx-genai`
+  (`cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4`, ~430 MB).
+  Qwen3 is a substantially stronger instruct-tuned model than
+  Qwen2.5 at the sub-1B tier (better instruction following,
+  fewer hallucinations on short structured prompts) while keeping
+  the same `<|im_start|>` / `<|im_end|>` chat template, so the
+  prompt and post-processing pipeline are unchanged.  The
+  `model_polish` field in snapshot responses now reads
+  `"qwen3-0.6b"` when loaded.
+- ***Build pipeline:*** the `Download LLM polishing model` step now
+  fetches the 6-file Qwen3 bundle (`chat_template.jinja`,
+  `genai_config.json`, `model.onnx`, `model.onnx.data`,
+  `tokenizer.json`, `tokenizer_config.json`) instead of the
+  10-file Qwen2.5 layout.  The staging step still bundles the
+  entire `models/qwen/` subtree verbatim, so any future
+  re-packaging works without code changes.
+- ***Dependency bumps required for Qwen3:***
+  `Microsoft.ML.OnnxRuntimeGenAI 0.7.0 -> 0.14.1` (the first
+  release line that registers `"qwen3"` as a supported model type;
+  0.7.0 fails with *unsupported model type* at `OgaCreateModel`)
+  and the transitive `Microsoft.ML.OnnxRuntime 1.22.0 -> 1.23.0`.
+  The C-API surface used by `LlmSummarizer.cpp` (`OgaCreateModel`,
+  `OgaCreateTokenizer`, `OgaTokenizerEncode`,
+  `OgaCreateGeneratorParams`, `OgaCreateGenerator`,
+  `OgaGenerator_AppendTokenSequences`,
+  `OgaGenerator_GenerateNextToken`,
+  `OgaGenerator_GetSequenceData`, `OgaTokenizerDecode` and the
+  matching `OgaDestroy*` entry points) is unchanged across
+  0.7 -> 0.14, and the ORT 1.22 -> 1.23 jump only affects the
+  underlying inference runtime DLL (no source changes needed in
+  `ContextInference.cpp`'s embedding path).
+- ***Embedding model deferred.***  Replacing BGE-small-en-v1.5 with
+  `google/embeddinggemma-300m` was evaluated but **not landed in
+  this revision**.  The architectural incompatibility is real and
+  blocking:
+    - embeddinggemma uses a SentencePiece BPE tokenizer
+      (`tokenizer.model`), whereas the in-tree
+      [`BertTokenizer`](BertTokenizer.h) is a hand-rolled WordPiece
+      implementation that loads `vocab.txt`.
+    - embeddinggemma produces 768-dim Matryoshka vectors;
+      `ContextInference::EMBED_DIM` is hard-coded to 384 and the
+      cluster centroid / cosine-similarity paths assume that size.
+    - The base `google/embeddinggemma-300m` repo is gated
+      (Gemma-license click-through); the community
+      `onnx-community/embeddinggemma-300m-ONNX` mirror is open
+      but still ships only sentencepiece tokenizer assets.
+  Landing the swap cleanly requires either
+  (a) pulling in `onnxruntime-extensions` to get a SentencePiece
+  tokenizer op, or (b) vendoring Google's `sentencepiece` C++
+  library into the build.  Both are tracked as follow-up work.
 
 *Changes from v5.8:*
 - ***Optional LLM polishing layer (`Qwen2.5-0.5B-Instruct`).***  Each

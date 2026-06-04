@@ -48,12 +48,12 @@ jobs:
         Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" -OutFile "models/bge-small.onnx"
         Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
 
-    - name: Download LLM polishing model (Qwen2.5-0.5B-Instruct, CPU INT4)
+    - name: Download LLM polishing model (Qwen3-0.6B, CPU INT4)
       shell: pwsh
       run: |
-        # ORT-GenAI-compatible Qwen2.5-0.5B-Instruct bundle from the
-        # community-maintained `xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai`
-        # repo on HuggingFace.  We pull the CPU INT4 variant (~330 MB)
+        # ORT-GenAI-compatible Qwen3-0.6B bundle from the
+        # community-maintained `xiaoyao9184/Qwen3-0.6B-onnx-genai`
+        # repo on HuggingFace.  We pull the CPU INT4 variant (~430 MB)
         # under the `cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/`
         # subdirectory, which ships the genai_config.json that
         # onnxruntime-genai requires plus the model + tokenizer files.
@@ -65,18 +65,14 @@ jobs:
         # ship these files.
         $qwenDir = "models/qwen"
         New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
-        $repo = "https://huggingface.co/xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
+        $repo = "https://huggingface.co/xiaoyao9184/Qwen3-0.6B-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
         $files = @(
-          "added_tokens.json",
           "chat_template.jinja",
           "genai_config.json",
-          "merges.txt",
           "model.onnx",
           "model.onnx.data",
-          "special_tokens_map.json",
           "tokenizer.json",
-          "tokenizer_config.json",
-          "vocab.json"
+          "tokenizer_config.json"
         )
         foreach ($f in $files) {
           Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f"
@@ -113,7 +109,7 @@ jobs:
       shell: pwsh
       run: |
         # x64 and ARM64 ship the LLM polishing layer -- bundled
-        # Qwen2.5-0.5B + onnxruntime-genai.dll are required and the
+        # Qwen3-0.6B + onnxruntime-genai.dll are required and the
         # staging step fails if either is missing.  x86 ships without
         # the polisher (the ORT-GenAI NuGet has no win-x86 binaries),
         # so its staging skips both.
@@ -133,7 +129,7 @@ jobs:
           Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
 
           if ($p.hasLlm) {
-            # Required: ORT-GenAI runtime + Qwen2.5-0.5B model subtree.
+            # Required: ORT-GenAI runtime + Qwen3-0.6B model subtree.
             $genaiDll = "$($p.src)/onnxruntime-genai.dll"
             if (!(Test-Path $genaiDll)) {
               throw "Missing $genaiDll -- the LLM polishing layer is mandatory for $($p.arch) but its runtime DLL was not produced by the build."
@@ -142,10 +138,10 @@ jobs:
 
             $qwen = "$($p.src)/models/qwen"
             if (!(Test-Path $qwen)) {
-              throw "Missing $qwen -- the Qwen2.5-0.5B model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download LLM polishing model' step should have populated models/qwen/."
+              throw "Missing $qwen -- the Qwen3-0.6B model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download LLM polishing model' step should have populated models/qwen/."
             }
             Copy-Item $qwen "$staging/models/qwen" -Recurse -Force
-            Write-Host "Bundled Qwen2.5-0.5B model into $staging/models/qwen"
+            Write-Host "Bundled Qwen3-0.6B model into $staging/models/qwen"
           }
           else {
             # x86: explicitly skip the LLM artefacts even if the

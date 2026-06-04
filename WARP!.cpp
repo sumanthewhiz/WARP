@@ -1371,7 +1371,7 @@ void StartSubsystems()
         g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
 
         // Best-effort init of the optional LLM polishing layer.  When
-        // the Qwen2.5 model files aren't on disk this returns false
+        // the Qwen3 model files aren't on disk this returns false
         // and Polish() calls become no-ops; nothing in the pipeline
         // regresses.
         if (g_llmSummarizer.Init(modelsDir))

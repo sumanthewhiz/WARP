@@ -81,7 +81,7 @@ struct ContextSnapshot
     std::vector<std::string> summaryWebsites;
     std::vector<std::string> summaryApps;
     // Optional LLM-polished "All" summary -- 1-3 lines of natural
-    // prose produced by Qwen2.5-0.5B-Instruct from the structured
+    // prose produced by Qwen3-0.6B from the structured
     // summary + items[].  Empty when the LLM polisher isn't
     // initialized, fails, or produces an ungrounded output.  The
     // primary `summary` field above is the template-composed source
@@ -97,7 +97,7 @@ struct ContextSnapshot
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
     std::string   model;                // "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
-    std::string   modelPolish;          // "qwen2.5-0.5b-instruct" or "(not loaded)"
+    std::string   modelPolish;          // "qwen3-0.6b" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
     // Bounded structured breakdown (top apps by focus seconds, capped at 5).

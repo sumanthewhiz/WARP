@@ -38,7 +38,7 @@ namespace
     // context window on a single huge title.
     constexpr size_t kMaxPromptTitleLen    = 100;
 
-    constexpr const char*    kModelName        = "qwen2.5-0.5b-instruct";
+    constexpr const char*    kModelName        = "qwen3-0.6b";
     constexpr const wchar_t* kModelSubDir      = L"\\qwen";
 }
 
@@ -153,12 +153,12 @@ namespace
         return s.substr(0, maxLen) + ".";
     }
 
-    // Build the chat-formatted prompt for Qwen2.5-Instruct.
+    // Build the chat-formatted prompt for Qwen3.
     // The model's tokenizer adds its own special tokens via
     // ApplyChatTemplate (when supported); we just hand it the
     // structured conversation.  For portability across ORT-GenAI
     // versions we emit the raw chat template ourselves with the
-    // <|im_start|> / <|im_end|> markers Qwen2.5 expects.
+    // <|im_start|> / <|im_end|> markers Qwen2.5 and Qwen3 both expect.
     std::string BuildPrompt(const std::vector<std::string>& existing,
                             const std::vector<LlmActivityItem>& items,
                             const std::string& category)
@@ -204,7 +204,7 @@ namespace
         }
         user << "\nRefined summary (1-3 lines, no numbering, no leading dashes):";
 
-        // Qwen2.5 chat-template format.
+        // Qwen chat-template format (same for Qwen2.5 and Qwen3).
         std::ostringstream prompt;
         prompt << "<|im_start|>system\n" << sys.str() << "<|im_end|>\n"
                << "<|im_start|>user\n"   << user.str() << "<|im_end|>\n"

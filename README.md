@@ -1079,9 +1079,10 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
   <https://dist.nuget.org/win-x86-commandline/latest/nuget.exe>)
 
 The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
-and pulls **`Microsoft.ML.OnnxRuntime` 1.22.0** via NuGet (declared in
-`packages.config`). The BGE-small sentence-encoder model files are **not** committed
-to the repo — they are downloaded once into a `models/` folder before the build.
+and pulls **`Microsoft.ML.OnnxRuntime` 1.23.0** plus **`Microsoft.ML.OnnxRuntimeGenAI` 0.14.1**
+via NuGet (declared in `packages.config`). The BGE-small sentence-encoder model files
+and the Qwen3-0.6B polishing-model files are **not** committed to the repo — they are
+downloaded once into a `models/` folder before the build.
 
 **Steps:**
 
@@ -1104,16 +1105,16 @@ to the repo — they are downloaded once into a `models/` folder before the buil
    > embedding space and the same BERT WordPiece vocab, so no other change
    > is needed.
 
-3. Download the **LLM polishing model** (Qwen2.5-0.5B-Instruct, CPU-INT4,
-   ~330 MB) into `models/qwen/`.  This is **required on x64 and ARM64**
+3. Download the **LLM polishing model** (Qwen3-0.6B, CPU-INT4,
+   ~430 MB) into `models/qwen/`.  This is **required on x64 and ARM64**
    — the CI build pipeline downloads it automatically and **bundles it
    into the release artifact** so end users don't have to.  For local
    development you'll need to fetch it yourself once:
 
    ```powershell
    New-Item -ItemType Directory -Path models\qwen -Force | Out-Null
-   $repo = "https://huggingface.co/xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
-   foreach ($f in 'added_tokens.json','chat_template.jinja','genai_config.json','merges.txt','model.onnx','model.onnx.data','special_tokens_map.json','tokenizer.json','tokenizer_config.json','vocab.json') {
+   $repo = "https://huggingface.co/xiaoyao9184/Qwen3-0.6B-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
+   foreach ($f in 'chat_template.jinja','genai_config.json','model.onnx','model.onnx.data','tokenizer.json','tokenizer_config.json') {
      Invoke-WebRequest -Uri "$repo/$f" -OutFile "models/qwen/$f"
    }
    ```
@@ -1954,7 +1955,8 @@ WARP!\
 |-- BertTokenizer.h             Header-only WordPiece tokenizer (compatible with both
 |                                BGE-small-en-v1.5 and all-MiniLM-L6-v2)
 |
-|-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.22.0)
+|-- packages.config             NuGet package references (Microsoft.ML.OnnxRuntime 1.23.0
+|                                + Microsoft.ML.OnnxRuntimeGenAI 0.14.1)
 |
 |-- models/                     (gitignored) BGE-small-en-v1.5 ONNX model + vocab
 |   |-- bge-small.onnx          Sentence encoder (384-dim, ~130 MB) - downloaded
