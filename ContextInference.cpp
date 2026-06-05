@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cwctype>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <numeric>
@@ -2525,26 +2526,22 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     snap.summaryWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
     snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
-    // ---- Optional LLM polishing ------------------------------------
-    // If a Qwen3-0.6B polisher is attached and loaded, produce a
-    // natural-prose rewrite of each of the four summaries (combined +
-    // 3 facets).  Always preserves the template-composed summary above
-    // as the source of truth -- the polished version is purely
-    // additive.  Polish() returns an empty vector on any failure
-    // (model not loaded, timeout, ungrounded output, ...), in which
-    // case the corresponding `*Polished` field stays empty.
+    // ---- LLM as brain: generate the canonical summary -------------
+    // When the Qwen3-0.6B "brain" model is loaded, it reads the
+    // window titles and writes the user-facing `summary` lines
+    // directly.  The algorithmic cluster->theme output composed above
+    // stays as the `existing` topic-hint fed into the LLM prompt
+    // (the hint measurably improves output quality versus letting
+    // the model work from raw titles alone -- see
+    // scripts/smoke_test_polish.py).  The LLM's output then
+    // OVERWRITES `summary` / `summaryFiles` / `summaryWebsites` /
+    // `summaryApps` as the single user-facing summary; the
+    // `*Polished` fields become backward-compat aliases (= the same
+    // content) so older clients that read them keep working.
     //
-    // IMPORTANT: each facet's Polish() call receives ONLY the items
-    // that belong to that facet -- we previously passed the merged
-    // `snap.items[]` to all four calls and relied on the system-prompt
-    // category instruction to make the LLM ignore the wrong-category
-    // entries, but the model routinely failed to do so (it would put
-    // Outlook into summary_files_polished, browser tabs into
-    // summary_apps_polished, etc.).  Building per-facet item lists
-    // from the same bags (rankedFiles / rankedWeb / rankedApps) the
-    // template-composer uses guarantees clean source isolation; the
-    // combined `summaryPolished` call is the only one that gets the
-    // merged `snap.items[]`.
+    // When the LLM isn't loaded the algorithmic summary stays as-is
+    // and the `*Polished` fields remain empty (preserving the legacy
+    // "polishing unavailable" signal).
     snap.modelPolish = (m_llm && m_llm->IsLoaded())
                           ? m_llm->ModelName()
                           : std::string("(not loaded)");
@@ -2599,14 +2596,50 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
         std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
 
-        if (!snap.summary.empty())
-            snap.summaryPolished         = m_llm->Polish(snap.summary,         llmItemsAll,      "all");
-        if (!snap.summaryFiles.empty() && !llmItemsFiles.empty())
-            snap.summaryFilesPolished    = m_llm->Polish(snap.summaryFiles,    llmItemsFiles,    "files");
-        if (!snap.summaryWebsites.empty() && !llmItemsWebsites.empty())
-            snap.summaryWebsitesPolished = m_llm->Polish(snap.summaryWebsites, llmItemsWebsites, "websites");
-        if (!snap.summaryApps.empty() && !llmItemsApps.empty())
-            snap.summaryAppsPolished     = m_llm->Polish(snap.summaryApps,     llmItemsApps,     "apps");
+        // Helper: run the LLM for one facet, promote output to be the
+        // canonical summary, fall back to the existing algorithmic
+        // summary on failure (so the user never sees an empty line
+        // when we have valid input).
+        auto runFacet = [&](std::vector<std::string>&        canonical,
+                            std::vector<std::string>&        polishedAlias,
+                            const std::vector<LlmActivityItem>& facetItems,
+                            const char*                       category)
+        {
+            if (facetItems.empty()) return;
+            auto generated = m_llm->Polish(canonical, facetItems, category);
+            if (!generated.empty())
+            {
+                canonical      = generated;
+                polishedAlias  = generated;   // backward-compat alias
+            }
+            // else: keep the algorithmic summary in `canonical` and
+            // leave `polishedAlias` empty -- signals to clients that
+            // the LLM tried but produced nothing usable.
+        };
+
+        runFacet(snap.summary,         snap.summaryPolished,         llmItemsAll,      "all");
+        runFacet(snap.summaryFiles,    snap.summaryFilesPolished,    llmItemsFiles,    "files");
+        runFacet(snap.summaryWebsites, snap.summaryWebsitesPolished, llmItemsWebsites, "websites");
+        runFacet(snap.summaryApps,     snap.summaryAppsPolished,     llmItemsApps,     "apps");
+    }
+
+    // ---- Granite translator: embed the canonical summary -----------
+    // After the brain has produced the final user-facing summary
+    // (LLM-generated when loaded, algorithmic when not), use the
+    // granite embedding model as the "translator" to produce a
+    // 384-dim L2-normalized vector representation of the combined
+    // summary, suitable for similarity search / clustering across
+    // snapshots in downstream consumers.  Empty when the granite
+    // model isn't loaded or the summary is empty.
+    if (m_modelReady && !snap.summary.empty())
+    {
+        std::string joined;
+        for (size_t i = 0; i < snap.summary.size(); ++i)
+        {
+            if (i) joined += ". ";
+            joined += snap.summary[i];
+        }
+        snap.summaryEmbedding = Embed(joined);
     }
 
     // ---- Confidence -----------------------------------------------
@@ -2711,6 +2744,17 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     {
         if (i) o << ",";
         o << "\"" << EscapeJson(s.signalTypes[i]) << "\"";
+    }
+    o << "],\"summary_embedding\":[";
+    // Compact comma-separated floats with 6-decimal precision.  Always
+    // emitted (empty array when the embedding model isn't loaded) so
+    // downstream consumers can rely on the field being present.
+    for (size_t i = 0; i < s.summaryEmbedding.size(); ++i)
+    {
+        if (i) o << ",";
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%.6f", s.summaryEmbedding[i]);
+        o << buf;
     }
     o << "],\"items\":[";
     for (size_t i = 0; i < s.items.size(); ++i)

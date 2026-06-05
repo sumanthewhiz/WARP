@@ -645,8 +645,9 @@ cluster of activity).  Consumers render them as separate lines.
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded (preferred); `"bge-small-en-v1.5"` when the legacy BGE-small WordPiece encoder is the only one present; `"all-MiniLM-L6-v2"` when only the older MiniLM model is present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
-| `model_polish` | `string` | `"qwen3-0.6b"` when the optional LLM polishing layer is loaded and active; `"(not loaded)"` when the polisher's model files aren't present. |
-| `summary_polished` | `string[]` | LLM-polished natural-prose rewrite of `summary` (or the category-matching summary). Present in every response (possibly empty array). Empty when the LLM isn't loaded, the inference timed out, or the output failed grounding validation. |
+| `model_polish` | `string` | `"qwen3-0.6b"` when the LLM "brain" model is loaded -- it generates the canonical `summary`, with the `*_polished` fields acting as backward-compat aliases. `"(not loaded)"` when the brain model isn't present; in that case `summary` falls back to the algorithmic cluster->theme output and the `*_polished` fields stay empty. |
+| `summary_polished` | `string[]` | Backward-compat alias of `summary` when the LLM brain is loaded -- same content. Empty array when the brain isn't loaded (legacy "polishing unavailable" signal). New code should read `summary` directly. |
+| `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
 | `summary_files_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_files`. Same emptiness semantics as `summary_polished`. |
 | `summary_websites_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_websites`. |
 | `summary_apps_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_apps`. |
@@ -1717,7 +1718,44 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.11.*
+*This documentation describes WARP API version 5.12.*
+
+*Changes from v5.11:*
+- ***New architecture: LLM as brain, granite as translator.***  The
+  cluster->theme algorithmic pipeline now runs as an INTERNAL topic
+  hint feeder for the Qwen3-0.6B LLM rather than as the user-facing
+  summary source.  When the LLM is loaded:
+    - The four summary fields (`summary` + per-facet
+      `summary_files` / `summary_websites` / `summary_apps`) are
+      now GENERATED DIRECTLY BY THE LLM from the raw item titles,
+      with the algorithmic cluster->theme output passed as a topic
+      hint to keep grounding tight.
+    - The `summary_polished` / `summary_files_polished` /
+      `summary_websites_polished` / `summary_apps_polished` fields
+      become backward-compat aliases of their non-polished
+      counterparts (same content) so older clients that read them
+      continue to get the LLM output.  When the LLM isn't loaded the
+      `*_polished` fields stay empty (legacy "polishing unavailable"
+      signal) and `summary` falls back to the algorithmic
+      cluster->theme output unchanged -- graceful degradation.
+- ***New field: `summary_embedding` (float[384]).***  After the
+  canonical summary is finalized, the granite encoder produces a
+  384-dim L2-normalized vector representation of the joined summary
+  lines.  Suitable for similarity search / clustering across
+  snapshots in downstream consumers.  Always present in the response
+  (empty array when the granite model isn't loaded or the summary is
+  empty).  Floats are emitted with 6-decimal precision; total payload
+  is ~3-4 KB per snapshot.
+- ***Why this swap solved the previous quality complaints:***  earlier
+  revisions ran a two-stage pipeline (algorithmic `summary` +
+  Qwen3-polished `summary_polished`) where the two stages competed
+  for the user's attention -- if the polished version was
+  app-listing or hallucinated, the algorithmic version next to it
+  highlighted the contrast.  Promoting the LLM output to be the
+  canonical `summary` (with the algorithmic output as an internal
+  topic hint) eliminates that competition: there is one summary, it
+  reads as natural prose, and the topic hint from the cluster
+  pipeline keeps it grounded in the actual titles.
 
 *Changes from v5.10:*
 - ***Embedding model upgraded from `BAAI/bge-small-en-v1.5` to

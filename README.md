@@ -1126,8 +1126,11 @@ downloaded once into a `models/` folder before the build.
    > path uses `ModernBertTokenizer` (byte-level BPE) while the BGE / MiniLM
    > paths stay on the original `BertTokenizer` (WordPiece).
 
-3. Download the **LLM polishing model** (Qwen3-0.6B, CPU-INT4,
-   ~430 MB) into `models/qwen/`.  This is **required on x64 and ARM64**
+3. Download the **LLM "brain" model** (Qwen3-0.6B, CPU-INT4,
+   ~430 MB) into `models/qwen/`.  This is the model that reads the
+   raw window titles and generates the user-facing summary text;
+   when present, its output replaces the algorithmic cluster->theme
+   output in the `summary` field.  **Required on x64 and ARM64**
    — the CI build pipeline downloads it automatically and **bundles it
    into the release artifact** so end users don't have to.  For local
    development you'll need to fetch it yourself once:
@@ -1142,9 +1145,9 @@ downloaded once into a `models/` folder before the build.
 
    **x86 builds skip this step entirely** — the
    `Microsoft.ML.OnnxRuntimeGenAI` NuGet only ships x64 and ARM64
-   binaries.  The polishing layer is graceful-degrade: when its model
+   binaries.  The brain layer is graceful-degrade: when its model
    files or runtime DLL aren't present, `ContextInference` falls back
-   to the template-composed summary and reports
+   to the algorithmic cluster->theme summary and reports
    `"model_polish": "(not loaded)"` in the response.
 
 4. Build any configuration (Debug/Release × Win32/x64/ARM64).  The post-build
@@ -1153,12 +1156,13 @@ downloaded once into a `models/` folder before the build.
    (including `models/qwen/` on x64/ARM64) next to `WARP!.exe`
    automatically.
 
-> **Skipping the BGE-small model download is fine** — the binary will still
+> **Skipping the granite model download is fine** — the binary will still
 > build and run; `ContextInference::Init()` just falls through to the
 > deterministic per-app composer and reports `"model": "deterministic"` in
 > every snapshot.  The Qwen model download is **mandatory for x64 / ARM64
-> CI builds** but optional for local development (LLM polishing simply
-> stays disabled when its files are missing).
+> CI builds** but optional for local development (the LLM brain simply
+> stays disabled when its files are missing and the algorithmic summary
+> path takes over).
 
 ---
 
