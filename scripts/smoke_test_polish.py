@@ -1,11 +1,19 @@
 """
-Live smoke-test of the new LlmSummarizer prompt against Qwen3-0.6B.
+Live smoke-test of the LlmSummarizer topic-first prompt against Qwen3-0.6B.
 
-Runs three representative WARP polish scenarios through the model and
-prints the raw output, so we can sanity-check the prompt produces
-sensible prose rather than (a) a verbatim copy of the items list,
-(b) a verbatim copy of the existing summary, or (c) a leak of the
-instruction text.
+The polished summaries we ship must capture WHAT the user is working on
+(topic / subject), not which apps are open.  Reference good outputs the
+prompt is designed to reproduce:
+  - "User is reading about indexer reliability in their emails and chats
+     (across Outlook and M365 Copilot)"
+  - "User is exploring various websites related to indexing, rollout and
+     feature controls"
+
+`build_prompt_v2` below mirrors the C++ `LlmSummarizer::BuildPrompt`
+(LlmSummarizer.cpp) -- any structural change to the C++ prompt must be
+mirrored here so this script remains a faithful regression test.
+
+Run once: `pip install transformers torch` then `python smoke_test_polish.py`.
 """
 import sys
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -13,31 +21,50 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_ID = "Qwen/Qwen3-0.6B"
 
 
-def build_prompt(items, category="all"):
-    """Mirror of LlmSummarizer::BuildPrompt (C++) for live testing."""
+def build_prompt_v2(items, existing, category="all"):
+    """Topic-first prompt: lead with subject, apps as context."""
     sys_msg = (
-        "You describe what someone is doing on their computer right now, "
-        "based on the apps and windows they have open. "
-        "Write 1 to 3 short sentences in plain English, like a coworker "
-        "glancing at their screen would describe it. "
-        "Mention specific app and document names from the list. "
-        "Do not invent anything that is not in the list. "
-        "Do not use bullet points, quotation marks, numbered lists, or "
-        "any markdown."
+        "You read a snapshot of the window titles on someone's screen "
+        "and write 1 to 3 short sentences describing WHAT THEY ARE "
+        "WORKING ON -- the subject or topic of their work, not which "
+        "apps they have open.\n\n"
+        "Style rules:\n"
+        "- Start with \"User is\" (or \"They are\") followed by what "
+        "they are doing.\n"
+        "- Lead with the TOPIC. Mention apps only briefly at the end, "
+        "e.g. \"...in their emails and chats\" or \"...across Outlook "
+        "and Teams\".\n"
+        "- If multiple titles share a theme, capture that theme; do not "
+        "list every window.\n"
+        "- Do NOT say \"is open\", \"is running\", \"is using\".\n"
+        "- Plain English. No bullets, no numbered lists, no markdown, "
+        "no quotes around the output.\n\n"
+        "Examples of the target style:\n"
+        "  User is reading about indexer reliability across their "
+        "emails and chats (Outlook, Microsoft Teams).\n"
+        "  User is reviewing the auth refactor PR in their browser "
+        "and editing the related source file in Visual Studio.\n"
+        "  User is exploring various websites about React hooks and "
+        "state management."
     )
     extra = {
-        "files":    " Focus on the documents and files they have open.",
-        "websites": " Focus on the web pages they are browsing.",
-        "apps":     (" Focus on the communication and utility apps they "
-                     "are using (email, chat, terminals, media, "
-                     "remote desktop)."),
+        "files":    " The snapshot covers documents and files only.",
+        "websites": " The snapshot covers web pages only.",
+        "apps":     " The snapshot covers communication and utility apps only.",
     }
     sys_msg += extra.get(category, "")
 
-    user = "Apps and windows open right now (most-used first):\n"
+    user = "Window titles on the user's screen (most-used first):\n"
     for app, title in items[:5]:
-        user += f"{app} - {title}\n"
-    user += "\nDescribe what they are doing in 1 to 3 sentences:"
+        user += f"- \"{title}\" ({app})\n"
+
+    if existing:
+        user += "\nTopic hint already extracted from the titles "
+        user += "(use as inspiration, do not copy verbatim):\n"
+        for line in existing:
+            user += f"  {line}\n"
+
+    user += "\nWrite 1-3 sentences describing what they are working on:"
 
     return (
         f"<|im_start|>system\n{sys_msg}<|im_end|>\n"
@@ -46,28 +73,42 @@ def build_prompt(items, category="all"):
     )
 
 
+# Scenarios mirroring the user's reported bad cases.
 SCENARIOS = [
-    ("all", [
-        ("Outlook", "Inbox - Suman.Ghosh@microsoft.com"),
-    ]),
-    ("all", [
-        ("Visual Studio", "ContextInference.cpp - WARP"),
-        ("Edge",          "auth refactor PR #123 - GitHub"),
-        ("Microsoft Teams", "Daily Standup"),
-    ]),
-    ("files", [
-        ("Word",  "Q4 Planning Doc.docx"),
-        ("Excel", "Budget 2026.xlsx"),
-    ]),
+    # 1. Outlook + M365 Copilot, generic-ish titles
     ("apps", [
-        ("Outlook", "Inbox - foo@bar.com"),
-        ("Microsoft Teams", "Daily Standup"),
-        ("Windows Terminal", "PowerShell"),
-    ]),
+        ("Outlook", "Inbox - Suman.Ghosh@microsoft.com"),
+        ("M365 Copilot", "Search Indexer Reliability - status update"),
+    ], ["Reading about Indexer Reliability (in Outlook & M365 Copilot)"]),
+
+    # 2. Many browser tabs on related topics
     ("websites", [
-        ("Browser", "auth refactor PR #123 - GitHub"),
-        ("Browser", "React useEffect docs - reactjs.org"),
-    ]),
+        ("Browser", "Search Indexer Performance - Wiki"),
+        ("Browser", "Indexer Rollout Plan - SharePoint"),
+        ("Browser", "Feature Controls - Confluence"),
+        ("Browser", "Indexer Reliability Dashboard"),
+        ("Browser", "Search Platform Roadmap"),
+    ], ["Exploring Indexer Rollout (across 5 browser tabs)"]),
+
+    # 3. Mixed work: code + PR + standup
+    ("all", [
+        ("Visual Studio",  "ContextInference.cpp - WARP"),
+        ("Edge",           "auth refactor PR #123 - GitHub"),
+        ("Microsoft Teams","Daily Standup"),
+    ], ["Working on auth refactor (across Visual Studio & Edge)",
+        "Discussing Daily Standup in Microsoft Teams"]),
+
+    # 4. Generic: just inbox -- nothing to synthesize topic from
+    ("apps", [
+        ("Outlook", "Inbox - Suman.Ghosh@microsoft.com"),
+    ], ["Checking email in Outlook"]),
+
+    # 5. File work on related docs
+    ("files", [
+        ("Word",  "Indexer Reliability Plan v3.docx"),
+        ("Excel", "Indexer SLO tracking.xlsx"),
+        ("PowerPoint", "Indexer Reliability Review - Q4.pptx"),
+    ], ["Working on Indexer Reliability (across Word, Excel, PowerPoint)"]),
 ]
 
 
@@ -79,24 +120,27 @@ def main():
     )
     print("loaded\n", flush=True)
 
-    for category, items in SCENARIOS:
-        prompt = build_prompt(items, category)
-        ids = tok.encode(prompt, return_tensors="pt")
+    for i, (category, items, existing) in enumerate(SCENARIOS, 1):
+        prompt = build_prompt_v2(items, existing, category)
+        ids = tok(prompt, return_tensors="pt")
         out = model.generate(
-            ids,
+            ids.input_ids,
+            attention_mask=ids.attention_mask,
             max_new_tokens=96,
             do_sample=False,
             temperature=None, top_p=None, top_k=None,
             pad_token_id=tok.eos_token_id,
         )
-        new = out[0][ids.shape[1]:]
+        new = out[0][ids.input_ids.shape[1]:]
         decoded = tok.decode(new, skip_special_tokens=True)
         decoded = decoded.split("<|im_end|>")[0].strip()
 
-        print(f"--- category={category} ---")
-        print("INPUT items:", items)
+        print(f"=== scenario {i} (category={category}) ===")
+        print("ITEMS:    ", items)
+        print("EXISTING: ", existing)
         print("OUTPUT:")
-        print(decoded)
+        for line in decoded.splitlines():
+            print(f"  {line}")
         print()
 
 

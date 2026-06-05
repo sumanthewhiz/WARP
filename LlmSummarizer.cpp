@@ -159,57 +159,94 @@ namespace
     // structured conversation.  For portability across ORT-GenAI
     // versions we emit the raw chat template ourselves with the
     // <|im_start|> / <|im_end|> markers Qwen2.5 and Qwen3 both expect.
-    std::string BuildPrompt(const std::vector<std::string>& /*existing*/,
+    std::string BuildPrompt(const std::vector<std::string>& existing,
                             const std::vector<LlmActivityItem>& items,
                             const std::string& category)
     {
-        // Deliberately simple, conversational prompt.  Qwen3-0.6B is a
-        // small model -- it follows short natural-English instructions
-        // far better than long rule-laden ones, and any structured
-        // input formatting it sees in the prompt (`[major] app=X` or
-        // `App: "Title" (X% of focus)`) it will happily parrot back.
+        // Topic-first prompt design.  The job is NOT to describe which
+        // apps are open ("Outlook is open, Edge is running") -- that
+        // wording is exactly what previous revisions produced and the
+        // user called out as useless.  The job is to capture WHAT the
+        // user is working on -- the subject / topic that connects the
+        // open windows -- with apps appearing only as a brief
+        // grounding clause at the end.  The window TITLES carry the
+        // topic signal; framing items as "<title> (<app>)" with the
+        // title first nudges the model to anchor on titles rather
+        // than apps.
         //
-        // The existing template-composed summary is intentionally NOT
-        // included in the prompt: a previous revision passed it as
-        // "Draft notes" and the model -- playing it safe -- copied
-        // those lines back verbatim, producing summary_polished ==
-        // summary outputs.  We give the model just the raw items[] in
-        // the simplest possible format (`App - Title`, one per line)
-        // and let it write fresh prose from those facts alone.
+        // The template-composed `existing` summary is re-included as
+        // an explicit topic hint (the ContextInference clustering
+        // pipeline already does the cross-app theme distillation; the
+        // LLM's job is to phrase it naturally and ground it in the
+        // titles).  Anti-copy is enforced post-generation by
+        // IsNearCopyOfExisting (verbatim copies are rejected; natural
+        // rewrites are kept).
+        //
+        // The three concrete examples in the system prompt are
+        // critical: Qwen3-0.6B is small enough that a few-shot
+        // pattern in the system message dramatically improves output
+        // quality compared to rule-only instruction.
         std::ostringstream sys;
-        sys << "You describe what someone is doing on their computer "
-               "right now, based on the apps and windows they have open. "
-               "Write 1 to 3 short sentences in plain English, like a "
-               "coworker glancing at their screen would describe it. "
-               "Mention specific app and document names from the list. "
-               "Do not invent anything that is not in the list. "
-               "Do not use bullet points, quotation marks, numbered "
-               "lists, or any markdown.";
+        sys << "You read a snapshot of the window titles on someone's "
+               "screen and write 1 to 3 short sentences describing "
+               "WHAT THEY ARE WORKING ON -- the subject or topic of "
+               "their work, not which apps they have open.\n\n"
+               "Style rules:\n"
+               "- Start with \"User is\" (or \"They are\") followed "
+               "by what they are doing.\n"
+               "- Lead with the TOPIC. Mention apps only briefly at "
+               "the end, e.g. \"...in their emails and chats\" or "
+               "\"...across Outlook and Teams\".\n"
+               "- If multiple titles share a theme, capture that "
+               "theme; do not list every window.\n"
+               "- Do NOT say \"is open\", \"is running\", \"is "
+               "using\".\n"
+               "- Plain English. No bullets, no numbered lists, no "
+               "markdown, no quotes around the output.\n\n"
+               "Examples of the target style:\n"
+               "  User is reading about indexer reliability across "
+               "their emails and chats (Outlook, Microsoft Teams).\n"
+               "  User is reviewing the auth refactor PR in their "
+               "browser and editing the related source file in "
+               "Visual Studio.\n"
+               "  User is exploring various websites about React "
+               "hooks and state management.";
 
         if (category == "files")
-            sys << " Focus on the documents and files they have open.";
+            sys << " The snapshot covers documents and files only.";
         else if (category == "websites")
-            sys << " Focus on the web pages they are browsing.";
+            sys << " The snapshot covers web pages only.";
         else if (category == "apps")
-            sys << " Focus on the communication and utility apps they "
-                   "are using (email, chat, terminals, media, remote "
-                   "desktop).";
+            sys << " The snapshot covers communication and utility "
+                   "apps only.";
 
         std::ostringstream user;
-        user << "Apps and windows open right now (most-used first):\n";
+        user << "Window titles on the user's screen (most-used first):\n";
         size_t shown = 0;
         for (const auto& it : items)
         {
             if (shown >= kMaxPromptItems) break;
             const std::string& title =
                 it.title.empty() ? it.rawTitle : it.title;
-            user << it.app << " - "
-                 << Truncate(title, kMaxPromptTitleLen) << "\n";
+            // Title-first ordering: nudges the model to anchor on the
+            // topic-carrying string rather than the generic app name.
+            user << "- \""
+                 << Truncate(title, kMaxPromptTitleLen)
+                 << "\" (" << it.app << ")\n";
             ++shown;
         }
-        if (shown == 0) user << "(nothing active)\n";
+        if (shown == 0) user << "- (nothing active)\n";
 
-        user << "\nDescribe what they are doing in 1 to 3 sentences:";
+        if (!existing.empty())
+        {
+            user << "\nTopic hint already extracted from the titles "
+                    "(use as inspiration, do NOT copy verbatim):\n";
+            for (const auto& line : existing)
+                user << "  " << line << "\n";
+        }
+
+        user << "\nWrite 1-3 sentences describing what they are "
+                "working on:";
 
         // Qwen chat-template format (same for Qwen2.5 and Qwen3).
         //
@@ -342,32 +379,50 @@ namespace
         return out;
     }
 
-    // True if `line` is (or contains) a normalized copy of any
-    // entry in `existing`.  Catches both verbatim copies and the
-    // common case where the model wraps a copied line with a
-    // single word of filler at the start/end.
+    // True if `line` is essentially a verbatim restatement of one of
+    // the `existing` summary lines, i.e. the model just echoed the
+    // topic hint we provided in the prompt instead of writing fresh
+    // prose.  Tightened from the previous revision (which used a
+    // substring check) so that legitimate natural rewrites are kept:
+    // the new topic-first prompt deliberately invites the model to
+    // rephrase the existing topic hint in fresh English (adding
+    // "User is", grounding it in apps), and a strict substring check
+    // would falsely reject such rewrites.  We now reject only:
+    //   1. exact normalized equality, OR
+    //   2. exact normalized equality after stripping a leading
+    //      "user is " / "they are " / "currently " from the polished
+    //      line (these openers are added by the model template but
+    //      add zero information beyond the existing line).
     bool IsNearCopyOfExisting(const std::string& line,
                               const std::vector<std::string>& existing)
     {
         if (existing.empty()) return false;
         std::string nl = NormalizeForCompare(line);
         if (nl.empty()) return false;
+
+        // Strip a leading discourse marker if present.
+        auto stripOpener = [](const std::string& s) -> std::string {
+            static const char* const openers[] = {
+                "user is ", "they are ", "the user is ",
+                "currently ", "right now ",
+            };
+            for (const char* op : openers)
+            {
+                size_t opLen = std::strlen(op);
+                if (s.size() > opLen &&
+                    s.compare(0, opLen, op) == 0)
+                    return s.substr(opLen);
+            }
+            return s;
+        };
+        std::string nlOpenerless = stripOpener(nl);
+
         for (const auto& e : existing)
         {
             std::string ne = NormalizeForCompare(e);
             if (ne.empty()) continue;
-            if (nl == ne) return true;
-            // "contains" is asymmetric: catches both
-            //   polished = "<existing>"          (exact)
-            //   polished = "<existing>, while ..."  (existing as prefix)
-            //   polished = "Currently <existing>" (existing as suffix)
-            // but rejects spurious matches against very short
-            // existing lines that happen to appear inside a longer
-            // polished sentence by coincidence.
-            if (ne.size() >= 20 && nl.find(ne) != std::string::npos)
-                return true;
-            if (nl.size() >= 20 && ne.find(nl) != std::string::npos)
-                return true;
+            if (nl == ne)            return true;
+            if (nlOpenerless == ne)  return true;
         }
         return false;
     }
