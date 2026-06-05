@@ -2533,15 +2533,16 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     // stays as the `existing` topic-hint fed into the LLM prompt
     // (the hint measurably improves output quality versus letting
     // the model work from raw titles alone -- see
-    // scripts/smoke_test_polish.py).  The LLM's output then
-    // OVERWRITES `summary` / `summaryFiles` / `summaryWebsites` /
-    // `summaryApps` as the single user-facing summary; the
-    // `*Polished` fields become backward-compat aliases (= the same
-    // content) so older clients that read them keep working.
+    // scripts/smoke_test_polish.py).  The LLM's output OVERWRITES
+    // `summary` / `summaryFiles` / `summaryWebsites` / `summaryApps`
+    // in place, so there is only ever one user-facing summary field
+    // per facet -- the brain writes directly, with no separate
+    // "polished" alias.
     //
-    // When the LLM isn't loaded the algorithmic summary stays as-is
-    // and the `*Polished` fields remain empty (preserving the legacy
-    // "polishing unavailable" signal).
+    // When the LLM isn't loaded the algorithmic summary stays as-is.
+    // `modelPolish` reports which brain model produced the summary
+    // ("qwen3-0.6b") or "(not loaded)" so consumers can tell which
+    // pipeline ran.
     snap.modelPolish = (m_llm && m_llm->IsLoaded())
                           ? m_llm->ModelName()
                           : std::string("(not loaded)");
@@ -2596,12 +2597,12 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
         std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
 
-        // Helper: run the LLM for one facet, promote output to be the
-        // canonical summary, fall back to the existing algorithmic
-        // summary on failure (so the user never sees an empty line
-        // when we have valid input).
+        // Helper: run the LLM for one facet and promote its output to
+        // be the canonical summary.  On failure (empty output) we
+        // keep the algorithmic summary already sitting in `canonical`
+        // so the user never sees an empty line when we have valid
+        // input.
         auto runFacet = [&](std::vector<std::string>&        canonical,
-                            std::vector<std::string>&        polishedAlias,
                             const std::vector<LlmActivityItem>& facetItems,
                             const char*                       category)
         {
@@ -2609,18 +2610,14 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             auto generated = m_llm->Polish(canonical, facetItems, category);
             if (!generated.empty())
             {
-                canonical      = generated;
-                polishedAlias  = generated;   // backward-compat alias
+                canonical = generated;
             }
-            // else: keep the algorithmic summary in `canonical` and
-            // leave `polishedAlias` empty -- signals to clients that
-            // the LLM tried but produced nothing usable.
         };
 
-        runFacet(snap.summary,         snap.summaryPolished,         llmItemsAll,      "all");
-        runFacet(snap.summaryFiles,    snap.summaryFilesPolished,    llmItemsFiles,    "files");
-        runFacet(snap.summaryWebsites, snap.summaryWebsitesPolished, llmItemsWebsites, "websites");
-        runFacet(snap.summaryApps,     snap.summaryAppsPolished,     llmItemsApps,     "apps");
+        runFacet(snap.summary,         llmItemsAll,      "all");
+        runFacet(snap.summaryFiles,    llmItemsFiles,    "files");
+        runFacet(snap.summaryWebsites, llmItemsWebsites, "websites");
+        runFacet(snap.summaryApps,     llmItemsApps,     "apps");
     }
 
     // ---- Granite translator: embed the canonical summary -----------
@@ -2688,21 +2685,17 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     };
 
     const std::vector<std::string>* topSummary         = &s.summary;
-    const std::vector<std::string>* topSummaryPolished = &s.summaryPolished;
     if (category == "files")
     {
         topSummary         = &s.summaryFiles;
-        topSummaryPolished = &s.summaryFilesPolished;
     }
     else if (category == "websites")
     {
         topSummary         = &s.summaryWebsites;
-        topSummaryPolished = &s.summaryWebsitesPolished;
     }
     else if (category == "apps")
     {
         topSummary         = &s.summaryApps;
-        topSummaryPolished = &s.summaryAppsPolished;
     }
 
     std::ostringstream o;
@@ -2714,11 +2707,6 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"category\":\""      << EscapeJson(category) << "\""
       << ",\"summary\":";
     emitArray(o, *topSummary);
-    // Polished version of the same-category summary, when available.
-    // Always present in the response (possibly empty array) so callers
-    // know whether the polishing layer ran.
-    o << ",\"summary_polished\":";
-    emitArray(o, *topSummaryPolished);
 
     if (category == "all")
     {
@@ -2726,10 +2714,6 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
         o << ",\"summary_files\":";    emitArray(o, s.summaryFiles);
         o << ",\"summary_websites\":"; emitArray(o, s.summaryWebsites);
         o << ",\"summary_apps\":";     emitArray(o, s.summaryApps);
-        // Same for the polished facets.
-        o << ",\"summary_files_polished\":";    emitArray(o, s.summaryFilesPolished);
-        o << ",\"summary_websites_polished\":"; emitArray(o, s.summaryWebsitesPolished);
-        o << ",\"summary_apps_polished\":";     emitArray(o, s.summaryAppsPolished);
     }
 
     o << ",\"activity_count\":" << s.activityCount

@@ -9,21 +9,30 @@
 // =====================================================================
 //  LlmSummarizer
 //
-//  Optional small-LLM "polishing" layer that takes the structured
-//  output of the existing BGE-small clustering pipeline (per-cluster
-//  themes + verbs + titles + app names) and rewrites it as natural
-//  prose using `Qwen3-0.6B`.
+//  Small-LLM "brain" layer that takes the cluster->theme topic-hint
+//  feed (per-cluster themes + verbs + titles + app names) produced by
+//  the BGE-small / granite / MiniLM clustering pipeline and writes
+//  the user-facing natural-prose summary using `Qwen3-0.6B`.
 //
 //  Architecture
 //  ============
-//  Additive only.  The existing template-based summary in
-//  ContextSnapshot::summary / summaryFiles / etc. is *unchanged* and
-//  remains the source of truth.  When this polisher is initialized
-//  and a polish call succeeds, the snapshot also carries a
-//  `summaryPolished` field with the LLM-rewritten version.  If the
-//  polisher is absent / fails / times out / produces an ungrounded
-//  output, the snapshot still has the template summary -- nothing
-//  regresses.
+//  When this brain layer is loaded and a generation call succeeds,
+//  its output OVERWRITES `ContextSnapshot::summary` (and the per-facet
+//  variants) so there is exactly one user-facing summary string per
+//  facet -- the LLM writes it directly.  The algorithmic
+//  cluster->theme summary that the snapshot composer assembled first
+//  is passed into the prompt as a topic hint to keep the model
+//  grounded, but it is not exposed as a separate field.
+//
+//  When the brain is absent / fails / times out / produces an
+//  ungrounded output, the snapshot keeps the algorithmic
+//  cluster->theme summary that was already in `summary` -- graceful
+//  degradation, nothing regresses.
+//
+//  (Prior versions of this header described a "polishing" stage that
+//  emitted a separate `summaryPolished` field.  That field was
+//  removed in v5.13 once the LLM became the canonical writer and the
+//  polished alias was always identical to `summary`.)
 //
 //  Grounding
 //  =========
@@ -33,8 +42,8 @@
 //    * each line is short (<= ~120 chars)
 //    * the line count is 1..3
 //    * none of the output is the raw prompt template
-//  If validation fails, the polished output is rejected and the
-//  template summary stands alone.
+//  If validation fails, the LLM output is rejected and the
+//  algorithmic summary stands alone.
 //
 //  Dependency
 //  ==========

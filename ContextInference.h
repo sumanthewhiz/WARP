@@ -61,8 +61,8 @@ struct ContextSnapshot
     // as an internal topic-hint feeder for the LLM).  When the LLM
     // isn't loaded, these lines fall back to the algorithmic
     // cluster->theme output unchanged.  Either way `summary` is the
-    // single user-facing summary -- not an intermediate template that
-    // a separate "polished" field rewrites.
+    // single user-facing summary -- there is no separate "polished"
+    // field; the brain writes directly into this one.
     std::vector<std::string> summary;
     // Category-specific summaries.  Each is composed independently from a
     // *projection* of the same activity window so a consumer can ask
@@ -90,19 +90,6 @@ struct ContextSnapshot
     std::vector<std::string> summaryFiles;
     std::vector<std::string> summaryWebsites;
     std::vector<std::string> summaryApps;
-    // Optional LLM-polished "All" summary.  Backward-compat alias: in
-    // the new "LLM as brain" architecture (commit history >= d0d28d6)
-    // the `summary` field above is itself LLM-generated, so
-    // `summaryPolished` is a copy of `summary` when the LLM is
-    // loaded.  Older clients that still read the `_polished` fields
-    // therefore continue to get the LLM output.  When the LLM isn't
-    // loaded these `_polished` fields stay empty (preserving the
-    // legacy "polishing was unavailable" signal).
-    std::vector<std::string> summaryPolished;
-    // Per-category polished variants, populated under the same rules.
-    std::vector<std::string> summaryFilesPolished;
-    std::vector<std::string> summaryWebsitesPolished;
-    std::vector<std::string> summaryAppsPolished;
     // Granite-embedded vector of the combined `summary`, ready for
     // similarity search / clustering across snapshots.  384-dim,
     // L2-normalized, produced by the same

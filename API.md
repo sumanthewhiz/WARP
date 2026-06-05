@@ -645,12 +645,8 @@ cluster of activity).  Consumers render them as separate lines.
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded (preferred); `"bge-small-en-v1.5"` when the legacy BGE-small WordPiece encoder is the only one present; `"all-MiniLM-L6-v2"` when only the older MiniLM model is present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
-| `model_polish` | `string` | `"qwen3-0.6b"` when the LLM "brain" model is loaded -- it generates the canonical `summary`, with the `*_polished` fields acting as backward-compat aliases. `"(not loaded)"` when the brain model isn't present; in that case `summary` falls back to the algorithmic cluster->theme output and the `*_polished` fields stay empty. |
-| `summary_polished` | `string[]` | Backward-compat alias of `summary` when the LLM brain is loaded -- same content. Empty array when the brain isn't loaded (legacy "polishing unavailable" signal). New code should read `summary` directly. |
+| `model_polish` | `string` | `"qwen3-0.6b"` when the LLM "brain" model is loaded -- it generates the canonical `summary` directly. `"(not loaded)"` when the brain model isn't present; in that case `summary` falls back to the algorithmic cluster->theme output. Field name is retained for backward compatibility; the LLM is no longer a separate "polishing" stage on top of the algorithmic summary, it *is* the summary writer. |
 | `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
-| `summary_files_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_files`. Same emptiness semantics as `summary_polished`. |
-| `summary_websites_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_websites`. |
-| `summary_apps_polished` | `string[]` | **Only present when `category == "all"`.** LLM-polished `summary_apps`. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
 | `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the summary shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
@@ -1718,26 +1714,38 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.12.*
+*This documentation describes WARP API version 5.13.*
+
+*Changes from v5.12:*
+- ***Removed the `summary_polished` field (and the per-facet
+  `summary_files_polished` / `summary_websites_polished` /
+  `summary_apps_polished` variants) from the snapshot JSON.***  Under
+  the v5.12 "LLM-as-brain" architecture these fields were just
+  backward-compat aliases that always carried the same content as
+  `summary` / `summary_files` / `summary_websites` / `summary_apps`,
+  doubling the JSON payload for no information gain.  Consumers
+  should now read the canonical `summary*` fields directly.  The
+  `model_polish` string field is retained (still reports
+  `"qwen3-0.6b"` or `"(not loaded)"`) so callers can still tell
+  which pipeline produced the summary.
+- ***No semantic change.***  The summary content, the cluster->theme
+  topic-hint feeder, the LLM-as-brain rewrite step, and the granite
+  `summary_embedding` translator step all behave exactly as in v5.12 --
+  only the redundant alias fields were dropped from the wire format.
 
 *Changes from v5.11:*
 - ***New architecture: LLM as brain, granite as translator.***  The
   cluster->theme algorithmic pipeline now runs as an INTERNAL topic
   hint feeder for the Qwen3-0.6B LLM rather than as the user-facing
-  summary source.  When the LLM is loaded:
-    - The four summary fields (`summary` + per-facet
-      `summary_files` / `summary_websites` / `summary_apps`) are
-      now GENERATED DIRECTLY BY THE LLM from the raw item titles,
-      with the algorithmic cluster->theme output passed as a topic
-      hint to keep grounding tight.
-    - The `summary_polished` / `summary_files_polished` /
-      `summary_websites_polished` / `summary_apps_polished` fields
-      become backward-compat aliases of their non-polished
-      counterparts (same content) so older clients that read them
-      continue to get the LLM output.  When the LLM isn't loaded the
-      `*_polished` fields stay empty (legacy "polishing unavailable"
-      signal) and `summary` falls back to the algorithmic
-      cluster->theme output unchanged -- graceful degradation.
+  summary source.  When the LLM is loaded, the four summary fields
+  (`summary` + per-facet `summary_files` / `summary_websites` /
+  `summary_apps`) are GENERATED DIRECTLY BY THE LLM from the raw item
+  titles, with the algorithmic cluster->theme output passed as a
+  topic hint to keep grounding tight.  When the LLM isn't loaded,
+  `summary` falls back to the algorithmic cluster->theme output
+  unchanged -- graceful degradation.
+  *(In v5.12 these fields were mirrored into legacy `*_polished`
+  aliases; those aliases were removed in v5.13 -- see above.)*
 - ***New field: `summary_embedding` (float[384]).***  After the
   canonical summary is finalized, the granite encoder produces a
   384-dim L2-normalized vector representation of the joined summary

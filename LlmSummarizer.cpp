@@ -257,7 +257,7 @@ namespace
         // token budget on reasoning instead of the summary itself, so
         // the answer is never reached, and (b) leaks raw reasoning
         // ("First, I need to extract the information from the user's
-        // input...") into summary_polished.  The official Qwen3
+        // input...") into the final `summary`.  The official Qwen3
         // chat-template handles this by pre-pending an empty
         // <think></think> block after the assistant header when
         // `enable_thinking=False`; replicate that pattern here so the
@@ -578,10 +578,13 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
         if (lines.empty()) return {};
 
         // Anti-copy gate: drop any line that is a near-verbatim copy
-        // of an entry in `existing` (the template-composed summary
-        // we'd otherwise be polishing).  This catches the
-        // summary_polished == summary failure mode where the model
-        // played it safe and copied a candidate line back unchanged.
+        // of an entry in `existing` (the algorithmic cluster->theme
+        // summary we fed the model as a topic hint).  This catches
+        // the failure mode where the model plays it safe and copies
+        // a candidate line back unchanged -- producing an LLM
+        // "summary" that is just the topic hint reprinted verbatim,
+        // which is no improvement over running without the brain at
+        // all.
         {
             std::vector<std::string> filtered;
             filtered.reserve(lines.size());
