@@ -4,17 +4,36 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
 [![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
-[![Inference](https://img.shields.io/badge/inference-BGE--small%20%C2%B7%20dynamic%20clustering-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
+[![Inference](https://img.shields.io/badge/inference-Qwen3--0.6B%20brain%20%C2%B7%20Granite--R2%20embeddings-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
 
-WARP is a lightweight Windows desktop application that silently monitors file/folder
-activity, application launches, foreground app focus (with window titles and dwell
-time), and browsing activity on the local PC, stores everything in a rolling 30-day
-on-disk database, and exposes a queryable named-pipe API so that other applications
-running on the same machine can programmatically retrieve activity history.
+WARP — the **Windows Activity Reasoning Platform** — is a lightweight Windows desktop
+application that does two things on the local PC:
+
+1. **Captures** raw desktop activity silently and continuously: file/folder activity,
+   application launches, foreground app focus (with window titles and dwell time),
+   and browsing activity. Everything is written to a rolling 30-day on-disk SQLite
+   database and exposed through a queryable named-pipe API.
+
+2. **Reasons** over that raw activity entirely on-device to produce structured,
+   human-readable *context snapshots* of what the user is actually working on.
+   A hybrid pipeline groups recent events into dynamic clusters, distils each
+   cluster into a topic hint, then hands those hints to a small local LLM
+   (**Qwen3-0.6B**, INT4, ONNX Runtime GenAI) that generates the final crisp
+   English narrative for the overall session and for each facet (files,
+   websites, apps). The narrative is then encoded by a sentence-embedding model
+   (**granite-embedding-small-english-r2**, 384-dim ModernBERT) into a vector
+   that ships alongside the text, so downstream consumers can do similarity
+   search, deduplication, or clustering without re-running inference.
+
+The result is exposed through the same named-pipe API: any application on the
+machine can ask WARP "what is the user doing right now?" or "what were they
+working on this morning?" and get back both the underlying events and an
+inferred summary with a confidence score and an embedding vector.
 
 The application starts minimized to the system tray (notification area), requires
-administrator privileges, and is designed to run continuously in the background for as
-long as the PC is actively being used.
+administrator privileges, runs fully offline (no cloud calls, no telemetry leaving
+the device), and is designed to run continuously in the background for as long as
+the PC is actively being used.
 
 ---
 
