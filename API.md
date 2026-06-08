@@ -587,7 +587,7 @@ cluster of activity).  Consumers render them as separate lines.
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "bge-small-en-v1.5",
+    "model": "granite-embedding-small-english-r2",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
@@ -619,7 +619,7 @@ cluster of activity).  Consumers render them as separate lines.
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "bge-small-en-v1.5",
+    "model": "granite-embedding-small-english-r2",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [ /* same shape as above; always reflects the All clustering */ ]
@@ -644,7 +644,7 @@ cluster of activity).  Consumers render them as separate lines.
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded (preferred); `"bge-small-en-v1.5"` when the legacy BGE-small WordPiece encoder is the only one present; `"all-MiniLM-L6-v2"` when only the older MiniLM model is present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
+| `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded; `"deterministic"` when no model file was found. Older BGE-small / MiniLM fallbacks were removed in v5.16. |
 | `model_polish` | `string` | `"qwen3-0.6b"` when the LLM "brain" model is loaded -- it generates the canonical `summary` directly. `"(not loaded)"` when the brain model isn't present; in that case `summary` falls back to the algorithmic cluster->theme output. Field name is retained for backward compatibility; the LLM is no longer a separate "polishing" stage on top of the algorithmic summary, it *is* the summary writer. |
 | `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
@@ -661,8 +661,8 @@ cluster of activity).  Consumers render them as separate lines.
   clears the history.
 - The composer uses the sentence-encoder for **dynamic clustering, not bucket matching** —
   there is no fixed taxonomy of topics. Each cluster is induced from the
-  actual document, tab, and app titles in the window. If `models/bge-small.onnx`
-  (or the legacy `models/minilm.onnx`) + `models/vocab.txt` are missing the engine still runs and emits
+  actual document, tab, and app titles in the window. If the granite model
+  files under `models/granite/` are missing the engine still runs and emits
   `"model": "deterministic"`; consumers should treat both modes as a single
   interface and just read `summary` / `items` / `thread_id` as documented.
 
@@ -680,7 +680,7 @@ cluster of activity).  Consumers render them as separate lines.
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
       "confidence": 0.84,
-      "model": "bge-small-en-v1.5",
+      "model": "granite-embedding-small-english-r2",
       "thread_count": 3,
       "signal_types": ["focus", "file", "browsing"],
       "items": [ /* … same shape as GetRecentContext … */ ]
@@ -694,7 +694,7 @@ cluster of activity).  Consumers render them as separate lines.
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
       "confidence": 0.71,
-      "model": "bge-small-en-v1.5",
+      "model": "granite-embedding-small-english-r2",
       "thread_count": 2,
       "signal_types": ["focus", "browsing"],
       "items": [ /* … */ ]
@@ -937,26 +937,24 @@ For short-term memory or context drift over time, call:
 Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
-The composer prefers `ibm-granite/granite-embedding-small-english-r2`
-(ModernBERT byte-level BPE, COIR-trained for code retrieval, 384-dim) when
-its files are present, and transparently falls back to
-`BAAI/bge-small-en-v1.5` (BERT WordPiece, 384-dim) and then
-`sentence-transformers/all-MiniLM-L6-v2` (same dim, same tokenizer as BGE)
-when granite isn't available. Whichever encoder is loaded, it drives
-**dynamic semantic clustering** *and* **theme distillation** — *not* mapping
-to a fixed taxonomy. Two activities are merged into one *thread of work*
-iff their embeddings are similar to each other (cosine ≥ 0.65), and within
-each thread the dominant content tokens (after stripping stop-words, file
-extensions, and brand/app names) are scored by `frequency × (1 +
-cosine-to-cluster-centroid)` — the top 1-2 are emitted as the theme
-phrase. The verb is selected from a small fixed set (`Working on`,
-`Reviewing`, `Researching`, `Reading about`, `Discussing`, …) based on
-the dominant app type and content keywords. The verbatim per-app titles
-remain available in `items[]` for consumers that want them. If the
-model files are missing the engine still runs and reports
-`"model": "deterministic"` — themes are extracted by frequency alone,
-and clusters that yield no usable content tokens fall back to the
-prior verbatim format `<verb> "<title>" in <app>`.
+The composer uses `ibm-granite/granite-embedding-small-english-r2`
+(ModernBERT byte-level BPE, COIR-trained for code retrieval, 384-dim)
+when its files are present. Older BGE-small / MiniLM fallbacks were
+removed in v5.16; if the granite files are missing the engine still
+runs and reports `"model": "deterministic"`. The encoder drives
+**dynamic semantic clustering** *and* **theme distillation** — *not*
+mapping to a fixed taxonomy. Two activities are merged into one
+*thread of work* iff their embeddings are similar to each other
+(cosine ≥ 0.65), and within each thread the dominant content tokens
+(after stripping stop-words, file extensions, and brand/app names) are
+scored by `frequency × (1 + cosine-to-cluster-centroid)` — the top 1-2
+are emitted as the theme phrase. The verb is selected from a small
+fixed set (`Working on`, `Reviewing`, `Researching`, `Reading about`,
+`Discussing`, …) based on the dominant app type and content keywords.
+The verbatim per-app titles remain available in `items[]` for
+consumers that want them. In deterministic mode themes are extracted
+by frequency alone, and clusters that yield no usable content tokens
+fall back to the prior verbatim format `<verb> "<title>" in <app>`.
 
 ---
 
@@ -1714,7 +1712,50 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.15.*
+*This documentation describes WARP API version 5.16.*
+
+*Changes from v5.15:*
+- ***Removed BGE-small and MiniLM as supported sentence-encoder
+  fallbacks.***  The production stack has been granite + qwen
+  exclusively since v5.11, but the BGE-small and MiniLM fallback code
+  paths were still in `ContextInference::Init()` / `Embed()` and the
+  build pipeline was still downloading + bundling
+  `models/bge-small.onnx` + `models/vocab.txt` into every shipped
+  artefact (~130 MB).  None of this contributed to a customer-visible
+  configuration, but it inflated the test surface (the v5.14
+  fallback matrix had 8 rows), the shipped artefact size, and the
+  CI download time.
+- ***What was removed.***
+    - `BertTokenizer.h` header (WordPiece tokenizer used only by the
+      BGE / MiniLM paths).
+    - `ContextInference::m_tokenizer` (BertTokenizer member) and
+      `ContextInference::m_useGranite` (now always implicitly true
+      when `m_modelReady` is true).
+    - The Path-2 / Path-3 fallback branches in `Init()` -- it now
+      tries granite only.
+    - The BGE / MiniLM branch in `Embed()` (token-type-ids input,
+      manual mean-pool over `last_hidden_state`).
+    - The BGE-small download step in `.github/workflows/build.yml`
+      and the corresponding staging copy.
+    - The `bge-small.onnx` / `minilm.onnx` / `vocab.txt` post-build
+      copy targets in `WARP!.vcxproj`.
+- ***What didn't change (deliberately).***
+    - `model` field on snapshots still uses the same value strings;
+      with this change the only valid values are
+      `"granite-embedding-small-english-r2"` and `"deterministic"`.
+    - When granite is absent the engine still degrades gracefully
+      to deterministic mode (no semantic clustering, no
+      `summary_embedding`) -- identical to the v5.15
+      "no model file at all" behaviour.
+    - `summary_embedding` is still emitted in the same format when
+      granite IS loaded; nothing on the wire changes for normal
+      operation.
+- ***Effect on consumers.***  None for the granite-loaded path.  The
+  only observable change is that snapshots no longer report
+  `"bge-small-en-v1.5"` or `"all-MiniLM-L6-v2"` in the `model`
+  field, and the shipped zip is ~130 MB smaller (the BGE files were
+  the only sub-100-MB-per-platform component still in the bundle
+  after the v5.12 reorg).
 
 *Changes from v5.14:*
 - ***Fixed a recurring hallucination where the LLM-as-brain layer

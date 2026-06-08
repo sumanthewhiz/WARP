@@ -11,7 +11,7 @@
 //
 //  Small-LLM "brain" layer that takes the cluster->theme topic-hint
 //  feed (per-cluster themes + verbs + titles + app names) produced by
-//  the BGE-small / granite / MiniLM clustering pipeline and writes
+//  the granite-driven clustering pipeline and writes
 //  the user-facing natural-prose summary using `Qwen3-0.6B`.
 //
 //  Architecture

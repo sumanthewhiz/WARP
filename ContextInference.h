@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstdint>
 
-#include "BertTokenizer.h"
 #include "ModernBertTokenizer.h"
 
 // Forward-declare the ONNX Runtime types so callers don't need to pull the
@@ -37,9 +36,8 @@ class ForegroundMonitor;
 // user has, e.g., the auth source file open in VS Code AND the Auth PR open in
 // Edge as a single thread instead of two unrelated lines.  The clusters are
 // formed *dynamically from the observed titles* -- there is no fixed bucket
-// list or pre-defined topic taxonomy.  Default model is
-// `BAAI/bge-small-en-v1.5` (`bge-small.onnx`); legacy installations with
-// `minilm.onnx` (all-MiniLM-L6-v2) continue to work transparently.
+// list or pre-defined topic taxonomy.  The supported model is
+// `ibm-granite/granite-embedding-small-english-r2` under `<models>\granite\`.
 //
 // When the model files are absent the composer falls back to a deterministic
 // per-app composition (every app is its own cluster).
@@ -102,7 +100,7 @@ struct ContextSnapshot
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
-    std::string   model;                // "granite-embedding-small-english-r2", "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
+    std::string   model;                // "granite-embedding-small-english-r2" or "deterministic"
     std::string   modelPolish;          // "qwen3-0.6b" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
@@ -121,22 +119,21 @@ struct ContextSnapshot
 };
 
 // =====================================================================
-// Dynamic context-inference engine (replaces the old TopicInference, which
-// used a MiniLM model to map activities to ~50 *pre-defined* topic
-// buckets).  This engine instead uses a sentence-encoder (BGE-small by
-// default, MiniLM as a backward-compatibility fallback) to **dynamically
-// cluster** the
-// observed titles -- the summary is composed from the literal documents,
-// tabs, and apps the user is engaged with, with semantically related items
-// merged into "threads of work".
+// Dynamic context-inference engine.  Uses the granite sentence-encoder
+// (ModernBERT, 384-dim, ibm-granite/granite-embedding-small-english-r2)
+// to **dynamically cluster** the observed window/tab/app titles -- the
+// summary is composed from the literal documents, tabs, and apps the
+// user is engaged with, with semantically related items merged into
+// "threads of work".  No fixed taxonomy / pre-defined topic buckets.
 //
 // Lifecycle
-//   * Init(modelsDir) -- always returns true.  If the model files
-//     (`vocab.txt` + `bge-small.onnx`, or the legacy `minilm.onnx`) are
-//     present in `modelsDir` the embedding
-//     pipeline initializes; otherwise the engine still runs in a
-//     deterministic-only fallback mode.  Pass an empty wstring to skip the
-//     model load entirely.
+//   * Init(modelsDir) -- always returns true.  If the granite files
+//     under `modelsDir\granite\` (`model_quantized.onnx` plus the
+//     `vocab.txt` / `merges.txt` / `special_tokens.txt` extracted at
+//     build time from the upstream `tokenizer.json`) are present the
+//     embedding pipeline initializes; otherwise the engine still runs
+//     in a deterministic-only fallback mode.  Pass an empty wstring
+//     to skip the model load entirely.
 //   * Start(db, fg) -- spawns a background thread that wakes every 60 s,
 //     reads the last 15 minutes of activity from `db` plus the live
 //     foreground session from `fg`, composes a summary, and appends it
@@ -231,33 +228,25 @@ private:
     std::mutex                   m_mutex;
 
     // ---- Sentence-encoder embedding pipeline (optional) ----------------
-    // Preferred model: ibm-granite/granite-embedding-small-english-r2
+    // Single supported model: ibm-granite/granite-embedding-small-english-r2
     // (ModernBERT-based, 47 M params, byte-level BPE tokenizer, 384-dim,
     // Apache 2.0, August 2025).  Granite is explicitly trained on code
     // retrieval (COIR benchmark) so it handles code-y window titles
-    // (`auth.cpp`, `useEffect`, `node_modules`) much better than the
-    // WordPiece-based BGE-small tokenizer that fragments such tokens.
-    // Both models output 384-dim embeddings, so the downstream cluster
-    // threshold and per-cluster scoring logic are unchanged.
+    // (`auth.cpp`, `useEffect`, `node_modules`) robustly.
     //
-    // Backward-compat fallbacks if the granite model files are absent:
-    //   1. `bge-small.onnx`  -> BAAI/bge-small-en-v1.5 (BERT WordPiece)
-    //   2. `minilm.onnx`     -> sentence-transformers/all-MiniLM-L6-v2
-    //                          (BERT WordPiece, legacy)
-    //
-    // The granite path uses `ModernBertTokenizer` + the model's
-    // bundled `sentence_embedding` output (pre-pooled); the BGE/MiniLM
-    // fallback uses `BertTokenizer` + a manual mean-pool over
-    // `last_hidden_state`.
-    BertTokenizer        m_tokenizer;       // BGE / MiniLM fallback path
-    ModernBertTokenizer  m_mbTokenizer;     // granite (preferred) path
-    bool                 m_useGranite = false;
+    // Older BGE-small / MiniLM fallbacks were removed in v5.16 -- the
+    // production stack is granite + qwen exclusively, so the fallback
+    // surface added test/maintenance burden without contributing to a
+    // shipped configuration.  When the granite files are missing the
+    // engine still runs in deterministic-only mode (m_modelReady=false),
+    // exactly as before.
+    ModernBertTokenizer  m_mbTokenizer;
     Ort::Env*            m_ortEnv     = nullptr;
     Ort::SessionOptions* m_ortOpts    = nullptr;
     Ort::Session*        m_ortSession = nullptr;
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
-    std::string          m_modelName;        // e.g. "granite-embedding-small-english-r2"
+    std::string          m_modelName;        // "granite-embedding-small-english-r2" or empty
 
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;

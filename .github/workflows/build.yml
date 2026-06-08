@@ -84,13 +84,6 @@ jobs:
         # carries the flat files the C++ runtime actually loads.
         Remove-Item "$graniteDir/tokenizer.json" -Force
 
-        # Legacy BGE-small + MiniLM fallback artefacts: still produced
-        # so older installations (or local dev setups that skip the
-        # granite download) keep working through the transparent
-        # fallback path in ContextInference::Init().
-        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" -OutFile "models/bge-small.onnx"
-        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt"       -OutFile "models/vocab.txt"
-
     - name: Download LLM polishing model (Qwen3-0.6B, CPU INT4)
       shell: pwsh
       run: |
@@ -168,13 +161,11 @@ jobs:
           New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
           Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
-          Copy-Item "$($p.src)/models/bge-small.onnx" "$staging/models/bge-small.onnx" -Force
-          Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
 
-          # Granite embedding model (preferred over BGE-small).  Required
-          # on every platform -- the post-build target copies the whole
-          # models/granite/ subtree into $(OutDir), so failing here means
-          # the download step never populated it.
+          # Granite embedding model.  Required on every platform -- the
+          # post-build target copies the whole models/granite/ subtree
+          # into $(OutDir), so failing here means the download step
+          # never populated it.
           $granite = "$($p.src)/models/granite"
           if (!(Test-Path $granite)) {
             throw "Missing $granite -- the granite-embedding-small-english-r2 model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download sentence-encoder model' step should have populated models/granite/."

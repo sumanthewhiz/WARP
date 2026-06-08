@@ -251,7 +251,6 @@
   <ItemGroup>
     <ClInclude Include="ActivityDatabase.h" />
     <ClInclude Include="AppLaunchMonitor.h" />
-    <ClInclude Include="BertTokenizer.h" />
     <ClInclude Include="ModernBertTokenizer.h" />
     <ClInclude Include="BrowsingMonitor.h" />
     <ClInclude Include="UrlExtractor.h" />
@@ -315,15 +314,13 @@
     <Copy SourceFiles="$(OrtRuntimeDir)\onnxruntime.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
     <!-- ORT-GenAI runtime DLL (only when the package was restored). -->
     <Copy SourceFiles="$(OrtGenAiRuntimeDir)\onnxruntime-genai.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'$(HasOrtGenAi)'=='true' And Exists('$(OrtGenAiRuntimeDir)\onnxruntime-genai.dll')" />
-    <Copy SourceFiles="$(ProjectDir)models\bge-small.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\bge-small.onnx')" />
-    <Copy SourceFiles="$(ProjectDir)models\minilm.onnx" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\minilm.onnx')" />
-    <Copy SourceFiles="$(ProjectDir)models\vocab.txt" DestinationFolder="$(OutDir)models\" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)models\vocab.txt')" />
-    <!-- Granite embedding model files (preferred, replaces BGE-small).
-         The whole `models\granite\` subtree is copied verbatim so the
-         ModernBERT ONNX (model_quantized.onnx + model_quantized.onnx_data),
-         the flat tokenizer files extracted at CI time from tokenizer.json
-         (vocab.txt + merges.txt + special_tokens.txt) and any auxiliary
-         JSON all ship together with no per-file enumeration. -->
+    <!-- Granite embedding model files.  The whole `models\granite\`
+         subtree is copied verbatim so the ModernBERT ONNX
+         (model_quantized.onnx + model_quantized.onnx_data), the flat
+         tokenizer files extracted at CI time from tokenizer.json
+         (vocab.txt + merges.txt + special_tokens.txt) and any
+         auxiliary JSON all ship together with no per-file
+         enumeration. -->
     <ItemGroup>
       <GraniteModelFiles Include="$(ProjectDir)models\granite\**\*.*" />
     </ItemGroup>
