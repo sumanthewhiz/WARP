@@ -1372,6 +1372,15 @@ void StartSubsystems()
         }
         g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
 
+        // Wire the confidence-weighted per-entity store so the
+        // dynamic context inference can bias its ranking and
+        // clustering by historical recency + 7-day popularity
+        // instead of re-deriving those signals from the raw event
+        // tables.  Best-effort: passing nullptr (or skipping this
+        // call entirely) keeps the legacy in-window-focus-only
+        // behaviour.
+        g_contextInference.SetInferenceEngine(&g_inference);
+
         // Best-effort init of the optional LLM polishing layer.  When
         // the Qwen3 model files aren't on disk this returns false
         // and Polish() calls become no-ops; nothing in the pipeline

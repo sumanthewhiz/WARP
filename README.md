@@ -20,7 +20,13 @@ application that does two things on the local PC:
    cluster into a topic hint, then hands those hints to a small local LLM
    (**Qwen3-0.6B**, INT4, ONNX Runtime GenAI) that generates the final crisp
    English narrative for the overall session and for each facet (files,
-   websites, apps). The narrative is then encoded by a sentence-embedding model
+   websites, apps). Ranking and clustering are biased by a separate
+   **confidence-weighted per-entity inference engine** that accumulates
+   recency + 7-day open counts incrementally on every captured event (with
+   the noise filter's per-event confidence already baked in) — so the
+   dynamic context inference doesn't reinvent popularity / recency signals
+   from scratch and the two layers always agree on which entities matter.
+   The final narrative is then encoded by a sentence-embedding model
    (**granite-embedding-small-english-r2**, 384-dim ModernBERT) into a vector
    that ships alongside the text, so downstream consumers can do similarity
    search, deduplication, or clustering without re-running inference.

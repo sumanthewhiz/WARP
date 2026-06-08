@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "ContextInference.h"
 #include "LlmSummarizer.h"
+#include "InferenceEngine.h"
 #include "ActivityDatabase.h"
 #include "ForegroundMonitor.h"
 
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -628,10 +630,26 @@ struct AppAgg
     std::string  friendlyName;
     std::string  verb;
     int          totalFocusSecs = 0;
+    // Effective focus seconds used for ranking, clustering, and
+    // per-cluster theme weighting.  Defaults to totalFocusSecs but is
+    // boosted by ApplyInferenceBoost() using the InferenceEngine's
+    // recency_score + open_count_7d so the dynamic context inference
+    // pipeline agrees with the per-entity weighted store on which
+    // entries matter.  Raw totalFocusSecs is left untouched so the
+    // user-facing focus_seconds / dominant_focus_pct / items[].pct
+    // JSON fields keep reporting the actual in-window dwell time.
+    double       weightedFocusSecs = 0.0;
     int64_t      lastSeenTs     = 0;
     std::string  bestTitle;         // cleaned, ready for one-liner
     std::string  rawTitle;          // original window title before cleaning
     bool         isBrowser      = false;
+    // Lookup key carriers for InferenceEngine.  Populated only on
+    // entries whose primary identity isn't the exe (FileMonitor virtuals
+    // identify by file path; per-tab website virtuals identify by URL
+    // when available).  Empty on regular focused-app entries -- those
+    // fall back to lowercased(exePath).
+    std::wstring filePath;          // populated for FileMonitor virts only
+    std::wstring webUrl;            // populated for browsing virts only
 };
 
 // =====================================================================
@@ -1195,6 +1213,12 @@ void ContextInference::SetLlmSummarizer(LlmSummarizer* llm)
     m_llm = llm;
 }
 
+void ContextInference::SetInferenceEngine(InferenceEngine* eng)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_inference = eng;
+}
+
 void ContextInference::Stop()
 {
     if (!m_running) return;
@@ -1263,6 +1287,89 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 // =====================================================================
 //  Snapshot composition
 // =====================================================================
+
+// ApplyInferenceBoost
+// ---------------------------------------------------------------------
+// Bias each entry's `weightedFocusSecs` by its historical recency and
+// 7-day open-count, sourced from the confidence-weighted InferenceEngine
+// store.  This is what makes the dynamic context inference and the
+// per-entity inference engine agree on which entries matter, rather
+// than each computing its own popularity / recency signal from scratch.
+//
+// Boost formula (per-entry):
+//
+//     boost = 1.0
+//           + log1p(recency_score / 50.0)     // ~ 0 .. 1.85 (cap 200/255)
+//           + log1p(open_count_7d / 5.0)      // ~ 0 .. 2.40 (cap ~50/7d)
+//     weightedFocusSecs = totalFocusSecs * boost
+//
+// Range: 1.0x (entity unknown to InferenceEngine or never opened)
+//        .. ~5.3x (high-recency, frequently-opened entity).
+//
+// Properties:
+//   * In-window focus seconds remain the dominant signal.  A 5-minute
+//     focused session (300 s) boosted to 5.3x = 1590 still loses to a
+//     10-minute focused session (600 s) at the default 1.0x baseline.
+//     Boost only swings the order when in-window focus is comparable.
+//   * The boost is multiplicative, so an entity with zero in-window
+//     focus (totalFocusSecs == 0) gets weightedFocusSecs == 0 too --
+//     historical signal never *invents* presence, it only re-ranks
+//     entries that are already in the bag.
+//   * No-op when m_inference is null (unit tests / pre-v5.14 wiring).
+//
+// `keyOf` extracts the InferenceEngine entity key from an AppAgg:
+// lowercased(filePath) for file virts, lowercased(webUrl|bestTitle)
+// for browsing virts, lowercased(exePath) for regular focused apps.
+static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
+                                InferenceEngine*                     eng,
+                                std::function<std::string(const AppAgg&)> keyOf)
+{
+    if (!eng || bag.empty())
+    {
+        // Make sure weightedFocusSecs is at least seeded with the raw
+        // value so downstream ranking still has a usable score.
+        for (auto& a : bag)
+            if (a.weightedFocusSecs == 0.0)
+                a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+        return;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(bag.size());
+    std::vector<size_t> keyToIdx;
+    keyToIdx.reserve(bag.size());
+
+    for (size_t i = 0; i < bag.size(); ++i)
+    {
+        std::string k = keyOf(bag[i]);
+        if (k.empty()) continue;
+        keys.push_back(std::move(k));
+        keyToIdx.push_back(i);
+    }
+
+    // Seed weightedFocusSecs with the raw value before applying boost,
+    // so any entries that don't get a key (or come back empty from the
+    // store) still have a sensible default.
+    for (auto& a : bag)
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+
+    if (keys.empty()) return;
+
+    std::vector<InferenceRecord> records = eng->Lookup(keys);
+    for (size_t i = 0; i < records.size() && i < keyToIdx.size(); ++i)
+    {
+        const InferenceRecord& rec = records[i];
+        if (rec.entityKey.empty()) continue;   // unknown to InferenceEngine
+
+        double recBoost  = std::log1p(rec.recencyScore / 50.0);
+        double freqBoost = std::log1p(rec.openCount7d  / 5.0);
+        double boost     = 1.0 + recBoost + freqBoost;
+
+        AppAgg& a = bag[keyToIdx[i]];
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * boost;
+    }
+}
+
 ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
@@ -1399,13 +1506,30 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     std::vector<AppAgg> ranked;
     ranked.reserve(byExe.size());
     for (auto& kv : byExe) ranked.push_back(std::move(kv.second));
+
+    // Apply confidence-weighted historical boost from the InferenceEngine
+    // BEFORE sorting so the order reflects both in-window focus and
+    // historical recency / popularity.  Key: lowercased(exePath); regular
+    // focused-app entries identify by exe, so neither filePath nor
+    // webUrl is set here -- they're populated only on the FileMonitor
+    // and per-tab virtuals built later for the per-facet bags.
+    ApplyInferenceBoost(ranked, m_inference,
+        [](const AppAgg& a) -> std::string {
+            if (a.exePath.empty()) return std::string();
+            return InferenceEngine::NormalizeEntityKey(a.exePath);
+        });
+
     std::sort(ranked.begin(), ranked.end(),
               [](const AppAgg& a, const AppAgg& b){
-                  if (a.totalFocusSecs != b.totalFocusSecs)
-                      return a.totalFocusSecs > b.totalFocusSecs;
+                  if (a.weightedFocusSecs != b.weightedFocusSecs)
+                      return a.weightedFocusSecs > b.weightedFocusSecs;
                   return a.lastSeenTs > b.lastSeenTs;
               });
 
+    // dominant_focus_pct stays based on RAW totalFocusSecs -- the
+    // boost is an internal ranking signal, never a user-facing
+    // percentage.  Otherwise "100% of focus" would lose its meaning
+    // when a single boosted entry crosses the in-window total.
     if (!ranked.empty() && totalFocusSecs > 0)
         snap.dominantPct = static_cast<int>(
             (ranked.front().totalFocusSecs * 100LL) / totalFocusSecs);
@@ -1446,10 +1570,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         // ---- Cluster the bag -----------------------------------------
         std::vector<int>                 clOf(bag.size(), -1);
         std::vector<std::vector<float>>  centroids;
-        std::vector<int>                 clTotalFocus;
+        std::vector<double>              clTotalFocus;
         std::vector<std::vector<size_t>> clMembers;
-        int                              bagTotalFocus = 0;
-        for (const auto& a : bag) bagTotalFocus += (std::max)(0, a.totalFocusSecs);
+        double                           bagTotalFocus = 0.0;
+        for (const auto& a : bag) bagTotalFocus += (std::max)(0.0, a.weightedFocusSecs);
 
         if (m_modelReady && bag.size() >= 2)
         {
@@ -1472,7 +1596,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 {
                     int cid = static_cast<int>(centroids.size());
                     centroids.push_back({});
-                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clTotalFocus.push_back(bag[i].weightedFocusSecs);
                     clMembers.push_back({ i });
                     clOf[i] = cid;
                     continue;
@@ -1489,7 +1613,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 {
                     int cid = static_cast<int>(centroids.size());
                     centroids.push_back(embs[i]);
-                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clTotalFocus.push_back(bag[i].weightedFocusSecs);
                     clMembers.push_back({ i });
                     clOf[i] = cid;
                 }
@@ -1506,7 +1630,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     if (norm > 1e-9f)
                         for (int d = 0; d < EMBED_DIM; ++d) c[d] /= norm;
                     clMembers[bestC].push_back(i);
-                    clTotalFocus[bestC] += bag[i].totalFocusSecs;
+                    clTotalFocus[bestC] += bag[i].weightedFocusSecs;
                     clOf[i] = bestC;
                 }
             }
@@ -1516,7 +1640,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             for (size_t i = 0; i < bag.size(); ++i)
             {
                 centroids.push_back({});
-                clTotalFocus.push_back(bag[i].totalFocusSecs);
+                clTotalFocus.push_back(bag[i].weightedFocusSecs);
                 clMembers.push_back({ i });
                 clOf[i] = static_cast<int>(i);
             }
@@ -1526,7 +1650,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         struct Cluster
         {
             size_t               origIdx;     // original index into `centroids` / `clMembers`
-            int                  totalFocus;
+            double               totalFocus;  // sum of members' weightedFocusSecs
             size_t               repIdx;
             std::vector<size_t>  members;
         };
@@ -1550,20 +1674,23 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         auto themeFor = [&](const Cluster& cl) -> std::string {
             // freq           = total occurrences of a token across the cluster's titles
             // titlesWith     = number of distinct titles in which the token appears
-            // focusWeight    = sum of totalFocusSecs of titles in which the token
+            // focusWeight    = sum of weightedFocusSecs of titles in which the token
             //                  appears.  This is the primary signal: a token from
             //                  a 99%-focus title decisively outweighs a token from
             //                  a 1%-focus virtual entry, regardless of how many
-            //                  virtual entries it appears in.
+            //                  virtual entries it appears in.  Uses
+            //                  weightedFocusSecs (not raw seconds) so a historically
+            //                  popular but currently low-focus entry still gets
+            //                  some token-level weight via the InferenceEngine boost.
             std::unordered_map<std::string, int>          freq;
             std::unordered_map<std::string, int>          titlesWith;
-            std::unordered_map<std::string, int64_t>      focusWeight;
+            std::unordered_map<std::string, double>       focusWeight;
             std::unordered_map<std::string, std::string>  bestSurface;
             std::vector<std::string>                      orderedLowers;
 
             for (size_t mi : cl.members)
             {
-                int memberFocus = (std::max)(0, bag[mi].totalFocusSecs);
+                double memberFocus = (std::max)(0.0, bag[mi].weightedFocusSecs);
                 auto toks = ExtractContentTokens(bag[mi].bestTitle);
                 std::unordered_set<std::string> seenInTitle;
                 for (const auto& t : toks)
@@ -1586,10 +1713,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
             const size_t titleCount = cl.members.size();
 
-            int64_t clusterTotalFocus = 0;
+            double clusterTotalFocus = 0.0;
             for (size_t mi : cl.members)
-                clusterTotalFocus += (std::max)(0, bag[mi].totalFocusSecs);
-            if (clusterTotalFocus <= 0) clusterTotalFocus = 1; // avoid div-by-zero
+                clusterTotalFocus += (std::max)(0.0, bag[mi].weightedFocusSecs);
+            if (clusterTotalFocus <= 0.0) clusterTotalFocus = 1.0; // avoid div-by-zero
 
             struct ScoredTok { std::string lower; double score; size_t firstIdx; };
             std::vector<ScoredTok> scored;
@@ -1974,7 +2101,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             std::string                 lower;     // lowercase key
             std::vector<std::string>    facets;    // display tokens, ordered
             std::unordered_set<size_t>  absorbed;  // indices into `clusters` covered
-            int                         focus = 0;
+            double                      focus = 0.0;
         };
 
         // Token set per cluster (for cross-cluster coverage analysis).
@@ -2006,8 +2133,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
             // For each token, count how many of the top-K clusters
             // contain it AND sum the focus of those clusters.
-            std::unordered_map<std::string, int>  tokenCoverage; // cluster count
-            std::unordered_map<std::string, int>  tokenFocus;
+            std::unordered_map<std::string, int>    tokenCoverage; // cluster count
+            std::unordered_map<std::string, double> tokenFocus;
             std::unordered_map<std::string, std::string> tokenSurface;
             for (size_t i = 0; i < topK; ++i)
             {
@@ -2026,7 +2153,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             // Pick the highest-coverage token (focus as tiebreaker).
             std::string bestLower;
             int         bestCoverage = 0;
-            int         bestFocus    = 0;
+            double      bestFocus    = 0.0;
             for (const auto& kv : tokenCoverage)
             {
                 if (kv.first.size() < 4) continue;       // tiny tokens are too noisy
@@ -2046,7 +2173,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             //   * >= 50% of bag focus contributed by absorbed clusters
             if (bestCoverage < 2)              return out;
             if (bestCoverage * 2 < (int)topK)  return out;
-            if (bagTotalFocus > 0 && bestFocus * 2 < bagTotalFocus) return out;
+            if (bagTotalFocus > 0.0 && bestFocus * 2.0 < bagTotalFocus) return out;
 
             out.surface = TitleCase(tokenSurface[bestLower].empty()
                                         ? bestLower : tokenSurface[bestLower]);
@@ -2173,7 +2300,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         const size_t kMaxSummaryLines     = 3;
         const int    kMinClusterPctOfFocus = 5;
         std::vector<std::string> lines;
-        int    covered  = 0;
+        double covered  = 0.0;
         size_t included = 0;
 
         if (umbrellaActive)
@@ -2191,15 +2318,15 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         {
             if (included >= kMaxSummaryLines) break;
             if (umbrellaActive && umbrella.absorbed.count(i)) continue;
-            if (!categoryMode && included >= 1 && bagTotalFocus > 0)
+            if (!categoryMode && included >= 1 && bagTotalFocus > 0.0)
             {
                 int clusterPct =
-                    static_cast<int>((clusters[i].totalFocus * 100LL)
+                    static_cast<int>((clusters[i].totalFocus * 100.0)
                                      / bagTotalFocus);
                 if (clusterPct < kMinClusterPctOfFocus) continue;
             }
-            if (bagTotalFocus > 0
-             && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 90)
+            if (bagTotalFocus > 0.0
+             && static_cast<int>((covered * 100.0) / bagTotalFocus) >= 90)
                 break;
             std::string phrase = clusterPhrase(clusters[i]);
             if (phrase.empty()) continue;
@@ -2416,7 +2543,17 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             for (const auto& a : rankedFiles)
                 seenLowered.insert(AsciiLower(a.bestTitle));
 
-            struct FileVirt { std::string base; int64_t ts; int hits; };
+            // Track each unique basename + its full path so the
+            // InferenceEngine boost can look up the per-file record
+            // (which is keyed by the full lowercased path).  Pick the
+            // most-recently-seen full path when several map to the
+            // same basename.
+            struct FileVirt {
+                std::string  base;
+                std::wstring fullPath;
+                int64_t      ts;
+                int          hits;
+            };
             std::unordered_map<std::string, FileVirt> byBase;
             for (const auto& f : files)
             {
@@ -2445,11 +2582,15 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
                 auto it = byBase.find(keyBase);
                 if (it == byBase.end())
-                    byBase[keyBase] = { base, f.timestampUtc, 1 };
+                    byBase[keyBase] = { base, f.path, f.timestampUtc, 1 };
                 else
                 {
                     it->second.hits += 1;
-                    if (f.timestampUtc > it->second.ts) it->second.ts = f.timestampUtc;
+                    if (f.timestampUtc > it->second.ts)
+                    {
+                        it->second.ts       = f.timestampUtc;
+                        it->second.fullPath = f.path;
+                    }
                 }
             }
             std::vector<FileVirt> fv;
@@ -2465,6 +2606,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.verb            = "Editing";
                 agg.bestTitle       = v.base;
                 agg.rawTitle        = v.base;
+                agg.filePath        = v.fullPath;   // for InferenceEngine lookup
                 // Cap synthetic focus at 15 s per virt regardless of
                 // FileMonitor hit volume.  Real foreground sessions
                 // (typically 30 s -- many minutes) thus dominate the
@@ -2475,14 +2617,42 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.isBrowser       = false;
                 rankedFiles.push_back(std::move(agg));
             }
+            // Apply InferenceEngine boost across the whole rankedFiles
+            // bag (real focused-file apps that were already boosted in
+            // the combined-ranked pass + the FileMonitor virtuals just
+            // added).  File apps get keyed by exePath; file virtuals
+            // by filePath.  Re-boosting the real apps is cheap (cache
+            // hit) and keeps the bag internally consistent.
+            ApplyInferenceBoost(rankedFiles, m_inference,
+                [](const AppAgg& a) -> std::string {
+                    if (!a.filePath.empty())
+                        return InferenceEngine::NormalizeEntityKey(a.filePath);
+                    if (!a.exePath.empty())
+                        return InferenceEngine::NormalizeEntityKey(a.exePath);
+                    return std::string();
+                });
             std::sort(rankedFiles.begin(), rankedFiles.end(),
                       [](const AppAgg& a, const AppAgg& b){
-                          if (a.totalFocusSecs != b.totalFocusSecs)
-                              return a.totalFocusSecs > b.totalFocusSecs;
+                          if (a.weightedFocusSecs != b.weightedFocusSecs)
+                              return a.weightedFocusSecs > b.weightedFocusSecs;
                           return a.lastSeenTs > b.lastSeenTs;
                       });
         }
     }
+
+    // rankedApps was split off `ranked` before the FileMonitor-virt
+    // augmentation, but ApplyInferenceBoost on `ranked` already
+    // populated weightedFocusSecs on each entry (file apps and
+    // non-file apps alike).  No need to re-run the boost on
+    // rankedApps -- the values flowed in via the copy.  Re-sort just
+    // in case (cheap; rankedApps is <=20 entries) to keep the
+    // weighted ordering after the split.
+    std::sort(rankedApps.begin(), rankedApps.end(),
+              [](const AppAgg& a, const AppAgg& b){
+                  if (a.weightedFocusSecs != b.weightedFocusSecs)
+                      return a.weightedFocusSecs > b.weightedFocusSecs;
+                  return a.lastSeenTs > b.lastSeenTs;
+              });
 
     // Build the Websites bag from BrowsingMonitor records.  Each
     // unique tab title becomes a virtual AppAgg with focus weighted
@@ -2508,15 +2678,43 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.verb         = "Reading";
                 agg.isBrowser    = true;
             }
+            // Record the URL of the most recent visit so the
+            // InferenceEngine lookup uses URL (preferred) -- which
+            // matches how OnBrowsingEvent stores browsing entries
+            // (URL if non-empty, title otherwise).
+            if (b.timestampUtc > agg.lastSeenTs)
+            {
+                agg.lastSeenTs = b.timestampUtc;
+                if (!b.url.empty()) agg.webUrl = b.url;
+            }
             agg.totalFocusSecs += 30;
-            if (b.timestampUtc > agg.lastSeenTs) agg.lastSeenTs = b.timestampUtc;
         }
         rankedWeb.reserve(webByTitle.size());
         for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
+
+        // Apply InferenceEngine boost: prefer URL key, fall back to
+        // lowercased title (matches InferenceEngine::OnBrowsingEvent's
+        // "url.empty()? title : url" key choice).
+        ApplyInferenceBoost(rankedWeb, m_inference,
+            [](const AppAgg& a) -> std::string {
+                if (!a.webUrl.empty())
+                    return InferenceEngine::NormalizeEntityKey(a.webUrl);
+                if (!a.bestTitle.empty())
+                {
+                    // bestTitle is already in UTF-8 mixed case; lowercase
+                    // it to match the InferenceEngine key form.
+                    std::string lo = a.bestTitle;
+                    for (char& c : lo)
+                        if (c >= 'A' && c <= 'Z') c = char(c + 32);
+                    return lo;
+                }
+                return std::string();
+            });
+
         std::sort(rankedWeb.begin(), rankedWeb.end(),
                   [](const AppAgg& a, const AppAgg& b){
-                      if (a.totalFocusSecs != b.totalFocusSecs)
-                          return a.totalFocusSecs > b.totalFocusSecs;
+                      if (a.weightedFocusSecs != b.weightedFocusSecs)
+                          return a.weightedFocusSecs > b.weightedFocusSecs;
                       return a.lastSeenTs > b.lastSeenTs;
                   });
         if (rankedWeb.size() > 16) rankedWeb.resize(16);

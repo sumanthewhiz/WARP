@@ -169,6 +169,7 @@ struct ContextSnapshot
 // change dedup the actual count is usually much smaller).
 // =====================================================================
 class LlmSummarizer;   // optional polishing layer, see LlmSummarizer.h
+class InferenceEngine; // confidence-weighted per-entity store, see InferenceEngine.h
 
 class ContextInference
 {
@@ -187,6 +188,27 @@ public:
     // Calling this AFTER Start() is fine -- the polisher is read
     // under a lock on every snapshot compose.
     void SetLlmSummarizer(LlmSummarizer* llm);
+
+    // Wire in (or detach with nullptr) the confidence-weighted
+    // per-entity inference store.  When connected, ComposeSnapshot
+    // boosts each in-window entry's effective focus seconds using
+    // the entity's historical `recency_score` + `open_count_7d` from
+    // the store, so:
+    //   (a) the dynamic context inference and the per-entity
+    //       inference engine agree on which entities matter;
+    //   (b) we don't recompute popularity / recency signals from
+    //       scratch when the inference engine has already done it
+    //       incrementally on every raw event;
+    //   (c) cluster ranking + theme weighting incorporate the
+    //       confidence weighting that was applied at event-capture
+    //       time (a 30 s focus session that the noise filter scored
+    //       confidence=0.3 contributes less than a confidence=1.0
+    //       session of the same length, because the InferenceEngine
+    //       already amortized that confidence into open_count_7d).
+    // Caller retains ownership; must not destroy while
+    // ContextInference is running.  Calling this AFTER Start() is
+    // fine -- the engine is read under a lock on every compose.
+    void SetInferenceEngine(InferenceEngine* eng);
 
     void RunOnce();
     std::string GetRecentContext (const std::string& category    = "all",
@@ -239,6 +261,16 @@ private:
 
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;
+
+    // Optional confidence-weighted per-entity inference store.
+    // Borrowed; not owned.  When non-null, ComposeSnapshot uses
+    // `Lookup()` on every snapshot to bias the per-entry ranking
+    // and clustering by historical recency + popularity.  When
+    // null, ranking falls back to in-window focus seconds only --
+    // identical to pre-v5.14 behaviour, so unit tests / tooling
+    // that constructs a ContextInference without wiring the engine
+    // continues to work.
+    InferenceEngine*     m_inference = nullptr;
 
     // Compute a 384-dim L2-normalized sentence embedding for `text`.
     // Returns an empty vector if the model is not loaded or inference fails.

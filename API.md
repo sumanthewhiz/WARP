@@ -1714,7 +1714,51 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.13.*
+*This documentation describes WARP API version 5.14.*
+
+*Changes from v5.13:*
+- ***Dynamic context inference now builds on top of the
+  confidence-weighted per-entity InferenceEngine instead of recomputing
+  recency / popularity from raw activity tables.***  Every snapshot
+  compose now does a single batch lookup against the inference store
+  (keyed by lowercased file path, exe path, or URL/title) and
+  multiplicatively boosts each in-window entry's effective focus
+  seconds by:
+
+      boost = 1 + log1p(recency_score / 50) + log1p(open_count_7d / 5)
+
+  Range: 1.0x (unknown entity) .. ~5.3x (high-recency, frequently-opened
+  entity).  The boost only changes ranking when in-window focus seconds
+  are comparable; a 10-minute focused session at 1.0x still wins over
+  a 5-minute session at 5.3x.
+- ***Why this is a strict win:***
+    - (a) **Consistency.**  The dynamic context summary and the
+      per-entity inference now agree on which entities matter.  A file
+      with recency_score=200 and open_count_7d=20 in the inference store
+      will no longer tie or lose to a similarly-focused but unknown
+      entity in the per-snapshot ranking.
+    - (b) **No wheel reinvention.**  The InferenceEngine already
+      maintains the exponential-decay recency score (TAU=48h) and
+      rolling open counts incrementally on every raw event with
+      confidence weighting applied at capture time.  Snapshots now
+      consume those precomputed weights instead of recomputing their
+      own popularity signal from `lastSeenTs` / visit count.
+    - (c) **Per-event confidence weighting flows through.**  A 30 s
+      focus session that the noise filter scored confidence=0.3
+      contributes less to open_count_7d than a confidence=1.0 session
+      of the same length.  By boosting via open_count_7d, the dynamic
+      context inference now inherits that confidence weighting without
+      having to re-read the per-event `confidence` column.
+- ***User-facing fields unchanged.***  `focus_seconds`,
+  `dominant_focus_pct`, and `items[].pct` continue to report **raw**
+  in-window dwell time -- the boost is an internal ranking signal that
+  never leaks into a user-visible percentage.  Otherwise "100% of
+  focus" would lose its meaning when a single boosted entry crossed
+  the raw window total.
+- ***Graceful degradation.***  When the InferenceEngine is not wired
+  (unit tests, custom embedders), `weightedFocusSecs` falls back to
+  `totalFocusSecs` and the ranking is identical to pre-v5.14
+  behaviour.
 
 *Changes from v5.12:*
 - ***Removed the `summary_polished` field (and the per-facet
