@@ -203,14 +203,16 @@ namespace
                "using\".\n"
                "- Plain English. No bullets, no numbered lists, no "
                "markdown, no quotes around the output.\n\n"
-               "Examples of the target style:\n"
-               "  User is reading about indexer reliability across "
-               "their emails and chats (Outlook, Microsoft Teams).\n"
-               "  User is reviewing the auth refactor PR in their "
-               "browser and editing the related source file in "
-               "Visual Studio.\n"
-               "  User is exploring various websites about React "
-               "hooks and state management.";
+               "Examples of the target style (these are just style "
+               "templates -- do NOT copy their topic words; the topic "
+               "must come from the actual window titles you are "
+               "given):\n"
+               "  User is reviewing the Q3 budget across their "
+               "spreadsheets and a status email.\n"
+               "  User is working on a customer onboarding flow in "
+               "their browser and a related design document.\n"
+               "  User is catching up on team announcements across "
+               "their chats and inbox.";
 
         if (category == "files")
             sys << " The snapshot covers documents and files only.";
@@ -349,6 +351,141 @@ namespace
             lc.find("title=") != std::string::npos)
             return true;
 
+        return false;
+    }
+
+    // ---------------------------------------------------------------
+    //  Hallucination guard
+    // ---------------------------------------------------------------
+    //
+    //  A 0.6B model with greedy / low-temperature decoding sometimes
+    //  copies a few-shot example out of the system prompt verbatim
+    //  when the input loosely resembles the example's setup (e.g.
+    //  user has Outlook + Teams open -> model emits the
+    //  "...indexer reliability across emails and chats..." example).
+    //
+    //  The pre-existing "at least one token grounded" check did NOT
+    //  catch this because the example mentioned the same app names
+    //  ("outlook", "teams") that the actual user input also has, so
+    //  the example was technically partially grounded -- enough to
+    //  pass the loose gate, even though the topic words ("indexer",
+    //  "reliability") were pure invention.
+    //
+    //  This gate is stricter.  Every >= 4-char *topic-bearing* token
+    //  in the output must appear somewhere in the input items
+    //  (app names, cleaned title, raw title) OR in the algorithmic
+    //  topic hint we fed the model.  Topic-bearing means "not a
+    //  discourse marker, generic verb, app-type noun, or function
+    //  word" -- those are weeded out via kDiscourseStops below so
+    //  the gate doesn't reject legitimate connective text.
+    //
+    //  Result: a line that invents a topic noun the user has never
+    //  touched is dropped.  A line that paraphrases the topic hint
+    //  with fresh connective text is kept.
+
+    // Words that carry zero topic information and so are exempt from
+    // the input-grounding check.  Pronouns, generic verbs, prepositions,
+    // discourse openers, generic app-type nouns, and counting words.
+    // Keeping this list explicit (rather than e.g. "anything in a top-N
+    // English frequency list") keeps the guard's behaviour predictable
+    // and unit-testable.
+    static const std::unordered_set<std::string>& DiscourseStops()
+    {
+        static const std::unordered_set<std::string> s = {
+            // pronouns / determiners / discourse openers
+            "user", "they", "their", "them", "theirs", "themselves",
+            "themself", "your", "yours", "ours", "mine",
+            "currently", "right", "just", "still", "also", "then",
+            "here", "there",
+            // generic verbs that describe *kinds of* activity rather
+            // than specific topics
+            "reading", "reviewing", "writing", "editing", "working",
+            "exploring", "researching", "checking", "looking",
+            "browsing", "watching", "listening", "discussing",
+            "designing", "playing", "drafting", "drafts", "draft",
+            "drafted", "viewing", "managing", "scrolling",
+            "running", "open", "opens", "opening", "opened",
+            "summarizing", "summarize", "summarized", "summarising",
+            "summarised", "catching", "catch", "caught",
+            "have", "having", "been", "being",
+            // connectives / prepositions / conjunctions (>= 4 chars only;
+            // shorter ones never reach this gate)
+            "about", "across", "between", "through", "while", "during",
+            "with", "from", "into", "onto", "upon", "over", "under",
+            "after", "before", "until", "where", "when", "what",
+            "which", "that", "this", "these", "those", "some", "other",
+            "another", "several", "various", "many", "multiple",
+            "more", "than", "than", "both", "either", "neither",
+            // generic context / app-type nouns that don't carry a
+            // topic; the model uses them to describe *what kind of*
+            // surface the activity happened on
+            "page", "pages", "site", "sites", "website", "websites",
+            "document", "documents", "doc", "docs", "file", "files",
+            "folder", "folders", "window", "windows", "screen", "screens",
+            "browser", "browsers", "tabs", "applications",
+            "application", "apps", "tool", "tools",
+            "email", "emails", "mail", "inbox", "outbox",
+            "chat", "chats", "message", "messages", "messaging",
+            "meeting", "meetings", "call", "calls", "video", "audio",
+            "spreadsheet", "spreadsheets", "presentation",
+            "presentations", "slides", "slide", "code", "source",
+            "notes", "note", "notebook", "notebooks", "links", "link",
+            "items", "item", "entries", "entry",
+            // ordinals / size words
+            "first", "second", "third", "fourth", "fifth",
+            "next", "last", "main", "core", "much", "long", "short",
+            "quick", "small", "large", "huge", "tiny",
+            // generic markers
+            "etc", "topic", "topics", "subject", "subjects",
+            "content", "context", "session", "sessions",
+            "snapshot", "summary", "summaries", "details", "detail",
+            "things", "stuff", "task", "tasks", "activity",
+            "activities",
+        };
+        return s;
+    }
+
+    // Returns true if `line` contains a topic-bearing token that does
+    // NOT appear anywhere in `inputTokens` (already lowercased >= 4-char
+    // token set built from items[].app + items[].title + items[].rawTitle
+    // + existing[]).
+    bool IsHallucination(const std::string& line,
+                         const std::unordered_set<std::string>& inputTokens)
+    {
+        const auto& stops = DiscourseStops();
+        std::string cur;
+        auto checkTok = [&](const std::string& tok) -> bool {
+            // false = "fine, not a hallucination"; true = "ungrounded
+            // topic token found, reject the line".
+            if (tok.size() < 4)            return false;
+            if (stops.count(tok))          return false;
+            if (inputTokens.count(tok))    return false;
+            // Sometimes the model fuses two short input tokens (e.g.
+            // "M365Copilot" in the title -> "m365copilot" in the
+            // output, while inputTokens has them as "m365" and
+            // "copilot" separately).  Accept the token if it is a
+            // prefix or suffix of any input token, or vice versa.
+            for (const auto& itok : inputTokens)
+            {
+                if (itok.size() >= 4 &&
+                    (itok.find(tok) != std::string::npos ||
+                     tok.find(itok) != std::string::npos))
+                    return false;
+            }
+            return true;
+        };
+        for (char c : line)
+        {
+            unsigned char u = static_cast<unsigned char>(c);
+            if (std::isalnum(u))
+                cur.push_back(static_cast<char>(std::tolower(u)));
+            else
+            {
+                if (checkTok(cur)) return true;
+                cur.clear();
+            }
+        }
+        if (checkTok(cur)) return true;
         return false;
     }
 
@@ -597,9 +734,24 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
             if (lines.empty()) return {};
         }
 
-        // Last sanity gate: at least one line must mention a token
-        // that appeared in the input items (grounding).  Otherwise we
-        // assume the model hallucinated and reject.
+        // Last sanity gate: per-line hallucination check.  Every
+        // topic-bearing token in the line must appear somewhere in
+        // the input items (app names / cleaned title / raw title)
+        // or in the algorithmic topic hint we fed the model.
+        //
+        // This catches the few-shot-leak failure mode where a 0.6B
+        // model with greedy decoding copies a concrete example out
+        // of the system prompt ("...indexer reliability across emails
+        // and chats...") because the example loosely matched the
+        // app-set of the actual input.  The previous "at least one
+        // token grounded" gate passed such leaks because the example
+        // mentioned the same app names the user actually had open
+        // (outlook, teams) -- the topic tokens (indexer, reliability)
+        // were pure invention but the gate didn't look at them
+        // specifically.
+        //
+        // Rejected lines are silently dropped; if every line is
+        // rejected we fall back to the algorithmic summary.
         std::unordered_set<std::string> inputTokens;
         auto addLowerTokens = [&](const std::string& s) {
             std::string cur;
@@ -624,26 +776,17 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
         }
         for (const auto& l : existing) addLowerTokens(l);
 
-        bool grounded = false;
-        for (const auto& line : lines)
         {
-            std::string cur;
-            for (char c : line)
+            std::vector<std::string> grounded;
+            grounded.reserve(lines.size());
+            for (auto& line : lines)
             {
-                unsigned char u = (unsigned char)c;
-                if (std::isalnum(u))
-                    cur.push_back((char)std::tolower(u));
-                else
-                {
-                    if (cur.size() >= 4 && inputTokens.count(cur)) { grounded = true; break; }
-                    cur.clear();
-                }
+                if (!IsHallucination(line, inputTokens))
+                    grounded.push_back(std::move(line));
             }
-            if (grounded) break;
-            if (cur.size() >= 4 && inputTokens.count(cur)) grounded = true;
-            if (grounded) break;
+            lines = std::move(grounded);
+            if (lines.empty()) return {};
         }
-        if (!grounded) return {};
 
         return lines;
     }

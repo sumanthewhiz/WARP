@@ -1714,7 +1714,57 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.14.*
+*This documentation describes WARP API version 5.15.*
+
+*Changes from v5.14:*
+- ***Fixed a recurring hallucination where the LLM-as-brain layer
+  would copy a few-shot example out of the system prompt verbatim
+  whenever the input loosely matched the example's app set.***  Most
+  visible failure mode: the model emitted
+  `"User is reading about indexer reliability across their emails
+  and chats (Outlook, Microsoft Teams)."` whenever the user had
+  Outlook + Teams open, regardless of what was actually in the
+  window titles.  This was the literal text of the few-shot
+  example, sometimes with a stray trailing `)` appended.
+- ***Root cause.***  The old grounding gate required only *at least
+  one* >= 4-char token from the LLM output to appear in the input.
+  For the indexer-reliability leak, the example mentioned the same
+  app names ("outlook", "teams") that the user actually had open,
+  so the leak was technically partially grounded -- enough to pass
+  the loose gate, even though the topic tokens ("indexer",
+  "reliability") were pure invention.
+- ***Fix (two-pronged).***
+    - Tightened the post-processing grounding gate in `Polish()`:
+      every >= 4-char *topic-bearing* token in the LLM output must
+      appear in the input items (app names, cleaned title, raw
+      title) or in the algorithmic topic hint.  Topic-bearing means
+      "not a discourse marker, generic verb, app-type noun, or
+      function word" -- those are weeded out via an explicit
+      `DiscourseStops()` set so the gate doesn't reject legitimate
+      connective text.  Fuzzy prefix/suffix match catches compound
+      tokens (e.g. `m365copilot` in the output matches `m365` +
+      `copilot` in input).
+    - Replaced the three concrete few-shot examples in the system
+      prompt with abstract placeholders (Q3 budget / customer
+      onboarding / team announcements) that are less domain-y and
+      explicitly labelled "do NOT copy their topic words; the
+      topic must come from the actual window titles you are
+      given".  Both layers (less-sticky examples + post-processing
+      gate) work together so even if the model still attempts a
+      verbatim copy, the gate drops the line.
+- ***Behavioural effect.***  Hallucinated lines are silently dropped
+  during post-processing.  If every generated line is rejected,
+  `Polish()` returns empty and the snapshot falls back to the
+  algorithmic cluster->theme summary (still correct, just less
+  natural).  False-positive rejections of legitimate phrasings are
+  the explicit design trade-off: showing the user invented content
+  is worse than showing them slightly-less-polished prose.
+- ***Pinned via test fixture.***  `scripts/test_hallucination_guard.py`
+  is a pure-Python port of the C++ guard that locks down 8 reject
+  cases (the original bug plus 7 related leak patterns) and 7
+  accept cases (legitimate rewrites, compound-word matching, etc.).
+  Run it before changing `DiscourseStops()` or `IsHallucination()`
+  in `LlmSummarizer.cpp`.
 
 *Changes from v5.13:*
 - ***Dynamic context inference now builds on top of the
