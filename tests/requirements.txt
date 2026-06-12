@@ -1,0 +1,4 @@
+# Python test dependencies for WARP's test suite.
+# Pinned conservatively -- minor bumps are fine, majors require review.
+pytest>=8.0,<9.0
+hypothesis>=6.100,<7.0

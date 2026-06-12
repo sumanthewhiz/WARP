@@ -218,3 +218,49 @@ jobs:
         name: WARP-${{ steps.branch.outputs.label }}-x86
         path: artifacts/x86
         if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Python test suite (TEST_PLAN.md L1 + L1-property + L2 layers).
+  #
+  # Runs in parallel with `build` since it has no MSBuild / model-file
+  # dependency -- only Python + pytest + hypothesis (installed in
+  # ~5 s).  Full pytest suite completes in < 10 s.  Fully local: no
+  # cloud LLM, no API key, no model download.
+  #
+  # Trigger independently:
+  #   .\tests\run_tests.ps1                # everything
+  #   .\tests\run_tests.ps1 -Layer l1      # just L1
+  #   python tests/run_tests.py --list     # discovery
+  # ----------------------------------------------------------------
+  tests:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+        cache-dependency-path: tests/requirements.txt
+
+    - name: Install test dependencies
+      run: |
+        python -m pip install --quiet --disable-pip-version-check -r tests/requirements.txt
+
+    - name: Run L1 deterministic tests
+      run: python tests/run_tests.py --tier python --layer l1
+
+    - name: Run L1 property-based tests (Hypothesis)
+      run: python tests/run_tests.py --tier python --layer l1_property
+
+    - name: Run L2 model-contract + adversarial tests
+      run: python tests/run_tests.py --tier python --layer l2
+
+    - name: Run L3 eval / quality tests
+      run: python tests/run_tests.py --tier python --layer l3
+
+    - name: Run legacy standalone scripts (regression smoke)
+      run: python tests/run_tests.py --tier scripts
