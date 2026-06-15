@@ -45,6 +45,7 @@ python -m pytest -c pytest.ini eval/
 | §3.3.5 Hallucination guard | ✅ via `python/test_hallucination_guard.py` | 15 example cases + Hypothesis fuzz. |
 | §3.3.4 Near-copy gate | ✅ via `python/test_near_copy.py` | 9 cases including all known regressions. |
 | §3.3.1 Post-processing sanitizer | ✅ via `python/adversarial/test_prompt_markers.py` | All `<think>` / `<\|im_*\|>` variants covered. |
+| Rich-listing composer (v5.17) | ✅ via `python/test_rich_listing.py` | `CleanPhrase` + `ComposeRichListing` Python port, pinned bit-for-bit against the C++ source (validated via standalone g++ build). |
 | §3.6 Adversarial fuzz | ✅ via `python/adversarial/test_title_perturbations.py` + `fixtures/adversarial_titles.jsonl` | Pure-Python replay through the post-processing strippers; full end-to-end (with Qwen3) deferred to P3.5. |
 | §4.2.1b ROUGE-L | ✅ via `eval/metrics.py` + `eval/test_metrics_self.py` | LCS-based F1; self-tested. |
 | §4.2.2 Programmatic token metrics | ✅ via `eval/metrics.py` | must_contain recall, must_not_contain hits, token recall. |

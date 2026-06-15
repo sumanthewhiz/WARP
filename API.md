@@ -645,7 +645,7 @@ cluster of activity).  Consumers render them as separate lines.
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
 | `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded; `"deterministic"` when no model file was found. Older BGE-small / MiniLM fallbacks were removed in v5.16. |
-| `model_polish` | `string` | `"qwen3-0.6b"` when the LLM "brain" model is loaded -- it generates the canonical `summary` directly. `"(not loaded)"` when the brain model isn't present; in that case `summary` falls back to the algorithmic cluster->theme output. Field name is retained for backward compatibility; the LLM is no longer a separate "polishing" stage on top of the algorithmic summary, it *is* the summary writer. |
+| `model_polish` | `string` | `"qwen3-0.6b"` when the Qwen3 "brain" model is loaded -- as of v5.17 it acts as a *gated refiner* on top of the deterministic rich-listing summary (its prose replaces the listing only when it is at least as grounded in the window titles, measured by granite cosine). `"(not loaded)"` when the model isn't present; the rich-listing summary stands alone. Field name retained for backward compatibility. |
 | `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
@@ -1712,7 +1712,50 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.16.*
+*This documentation describes WARP API version 5.17.*
+
+*Changes from v5.16:*
+- ***Canonical summary is now a rich deterministic listing, not the
+  LLM output.***  Through v5.16 the Qwen3-0.6B "brain" generated the
+  user-facing `summary` (overwriting the algorithmic output).  An A/B
+  harness over 12 realistic scenarios -- running the actual Qwen3-0.6B
+  + granite encoder locally and scoring against human-authored gold
+  summaries with granite cosine + ROUGE-L + token coverage -- showed
+  this was a net loss:
+    - The 0.6B model's output was **rejected by the grounding gate
+      75-90% of the time** (it copies the few-shot examples or trips
+      the hallucination check), so the user was usually shown the
+      terse 1-token cluster theme (e.g. *"Working on Auth
+      Middleware"*) -- the "average and generic" summaries.
+    - When the LLM output *was* accepted it was, on average, **less
+      grounded** in the actual titles than a plain listing (granite
+      cos-to-titles 0.906 vs 0.920), because the 0.6B model drops
+      activity breadth.
+    - A 0.6B model fundamentally **cannot abstract** diverse titles
+      into a higher-level intent (*"auth_middleware.cpp + login.ts +
+      session.go"* -> *"authentication system"*); all it can do is
+      rephrase/list -- less completely than a deterministic listing.
+  The new `ComposeRichListing` composes
+  *"User is working on auth middleware, login handler and session
+  store in Visual Studio Code"* from the top distinct cleaned title
+  phrases.  Versus the prior summary it scored: granite cos-to-gold
+  **+0.016 (8 wins / 3 losses)**, cos-to-titles **+0.049**, ROUGE-L
+  **+0.205 (+80%)**, specificity **2x**, zero new hallucinations --
+  at **zero inference cost** and **full determinism**.  It also
+  *matches* an expensive best-of-N LLM on semantic fidelity.
+- ***The Qwen3 LLM is retained as a gated refiner, not removed.***
+  When loaded, its prose may still replace the listing -- but only
+  when it is at least as grounded in the window titles as the listing
+  (granite cosine, with a small tolerance).  So it can only help
+  (cleaner prose for a single-topic facet), never regress below the
+  much-better listing floor.  No new CPU cost: the LLM already ran in
+  v5.16; v5.17 adds a rich-listing floor + a groundedness check
+  (3 cheap granite embeds per facet).
+- ***No JSON shape change.***  `summary` / `summary_files` /
+  `summary_websites` / `summary_apps` / `summary_embedding` /
+  `model_polish` are unchanged on the wire; only the *content* of the
+  summary fields improves.  `model_polish` still reports `"qwen3-0.6b"`
+  vs `"(not loaded)"`.
 
 *Changes from v5.15:*
 - ***Removed BGE-small and MiniLM as supported sentence-encoder

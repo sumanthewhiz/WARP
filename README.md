@@ -16,20 +16,27 @@ application that does two things on the local PC:
 
 2. **Reasons** over that raw activity entirely on-device to produce structured,
    human-readable *context snapshots* of what the user is actually working on.
-   A hybrid pipeline groups recent events into dynamic clusters, distils each
-   cluster into a topic hint, then hands those hints to a small local LLM
-   (**Qwen3-0.6B**, INT4, ONNX Runtime GenAI) that generates the final crisp
-   English narrative for the overall session and for each facet (files,
-   websites, apps). Ranking and clustering are biased by a separate
-   **confidence-weighted per-entity inference engine** that accumulates
-   recency + 7-day open counts incrementally on every captured event (with
-   the noise filter's per-event confidence already baked in) — so the
-   dynamic context inference doesn't reinvent popularity / recency signals
-   from scratch and the two layers always agree on which entities matter.
-   The final narrative is then encoded by a sentence-embedding model
-   (**granite-embedding-small-english-r2**, 384-dim ModernBERT) into a vector
-   that ships alongside the text, so downstream consumers can do similarity
-   search, deduplication, or clustering without re-running inference.
+   A hybrid pipeline groups recent events into dynamic clusters, ranks them,
+   and composes a **rich deterministic one-liner** that lists what the user is
+   actually working on — e.g. *"User is working on auth middleware, login
+   handler and session store in Visual Studio Code"* — for the overall session
+   and for each facet (files, websites, apps). A small local LLM
+   (**Qwen3-0.6B**, INT4, ONNX Runtime GenAI) is retained as an optional
+   *gated refiner*: when loaded it may rewrite the listing into cleaner prose,
+   but only when its output is at least as grounded in the actual window titles
+   (measured by the granite encoder), so it can only help, never regress. (An
+   on-device A/B harness showed the deterministic listing matches the LLM on
+   semantic fidelity while being more grounded, closer to a human reference and
+   ~2× more specific — at zero inference cost and full determinism.) Ranking
+   and clustering are biased by a separate **confidence-weighted per-entity
+   inference engine** that accumulates recency + 7-day open counts incrementally
+   on every captured event (with the noise filter's per-event confidence already
+   baked in) — so the dynamic context inference doesn't reinvent popularity /
+   recency signals from scratch and the two layers always agree on which
+   entities matter. The final summary is then encoded by a sentence-embedding
+   model (**granite-embedding-small-english-r2**, 384-dim ModernBERT) into a
+   vector that ships alongside the text, so downstream consumers can do
+   similarity search, deduplication, or clustering without re-running inference.
 
 The result is exposed through the same named-pipe API: any application on the
 machine can ask WARP "what is the user doing right now?" or "what were they

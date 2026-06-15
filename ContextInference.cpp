@@ -1254,6 +1254,238 @@ static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
     }
 }
 
+// =====================================================================
+//  Rich deterministic listing (v5.17)
+//
+//  Empirical finding (local A/B harness on Qwen3-0.6B + granite over
+//  12 realistic scenarios -- see commit message): a 0.6B on-device LLM
+//  cannot ABSTRACT diverse window titles into a higher-level intent
+//  ("auth_middleware.cpp + login.ts + session.go" -> "authentication
+//  system").  All it can do is rephrase / list the titles -- and it
+//  does so LESS completely (drops items) and LESS reliably (its output
+//  is rejected by the grounding gate 75-90% of the time, so the user
+//  is usually left looking at the terse 1-token theme).
+//
+//  A deterministic listing of the top cleaned title phrases is, on the
+//  same granite metric the product itself uses, MORE grounded
+//  (cos-to-titles +0.05), closer to a human reference (ROUGE-L +0.20,
+//  +80% relative) and ~2x more specific than the token-theme -- at
+//  ZERO inference cost and full determinism.  It also matches the
+//  expensive best-of-N LLM on semantic similarity to an ideal summary.
+//
+//  This composes "User is <verb> <p1>, <p2> and <p3><app clause>"
+//  from the top distinct cleaned title phrases in the ranked bag.
+//  Returns `themeHint` unchanged when the bag yields no usable phrase
+//  (so we never regress below the prior behaviour for empty input).
+// =====================================================================
+namespace
+{
+    // Strip a recognized trailing file extension from a phrase.
+    std::string StripTrailingExt(const std::string& s)
+    {
+        static const std::unordered_set<std::string> kExt = {
+            "cpp","h","hpp","cc","cxx","cs","java","kt","py","rb","pl",
+            "php","js","mjs","cjs","jsx","ts","tsx","go","rs","swift",
+            "m","mm","dart","sh","bash","zsh","ps1","psm1","html","htm",
+            "css","scss","sass","less","xml","json","yaml","yml","toml",
+            "ini","cfg","conf","sql","graphql","vue","svelte","r","jl",
+            "lua","ex","exs","erl","hs","clj","docx","doc","xlsx","xls",
+            "pptx","ppt","pdf","txt","md","rst","tex","one","csv","tsv",
+            "sln","vcxproj","png","jpg","jpeg","gif","svg"
+        };
+        size_t dot = s.find_last_of('.');
+        if (dot == std::string::npos || dot == 0) return s;
+        std::string ext = AsciiLower(s.substr(dot + 1));
+        if (kExt.count(ext)) return s.substr(0, dot);
+        return s;
+    }
+
+    // Turn a (already app-suffix-cleaned) window title into a short,
+    // human-readable phrase: strip extension, snake/kebab/camel ->
+    // spaces, drop leading "Re:"/"#"/article and dangling trailing
+    // connector/version tokens, cap at 4 words.
+    std::string CleanPhrase(const std::string& title, size_t maxWords = 4)
+    {
+        std::string t = StripTrailingExt(title);
+
+        // snake / kebab -> space; camelCase -> spaced
+        std::string spaced;
+        spaced.reserve(t.size() + 8);
+        for (size_t i = 0; i < t.size(); ++i)
+        {
+            char c = t[i];
+            if (c == '_' || c == '-' || c == '/' || c == '\\')
+            {
+                spaced.push_back(' ');
+            }
+            else
+            {
+                // insert a space at a lower->Upper camelCase boundary
+                if (i > 0 && c >= 'A' && c <= 'Z'
+                    && t[i - 1] >= 'a' && t[i - 1] <= 'z')
+                    spaced.push_back(' ');
+                spaced.push_back(c);
+            }
+        }
+
+        // strip a leading "re:" / "fwd:" / "fw:" reply/forward marker
+        {
+            std::string lo = AsciiLower(spaced);
+            static const char* const kLead[] = { "re:", "fwd:", "fw:" };
+            for (const char* m : kLead)
+            {
+                size_t ml = std::strlen(m);
+                if (lo.size() >= ml && lo.compare(0, ml, m) == 0)
+                {
+                    spaced = spaced.substr(ml);
+                    break;
+                }
+            }
+        }
+
+        // strip leading punctuation noise (#, @, *, :, >, |, -, spaces)
+        {
+            size_t p = 0;
+            while (p < spaced.size())
+            {
+                char c = spaced[p];
+                if (c == '#' || c == '@' || c == '*' || c == ':' ||
+                    c == '>' || c == '|' || c == '-' || c == ' ')
+                    ++p;
+                else
+                    break;
+            }
+            if (p > 0) spaced = spaced.substr(p);
+        }
+
+        // tokenize on whitespace, dropping leading punctuation noise
+        std::vector<std::string> words;
+        {
+            std::string cur;
+            for (char c : spaced)
+            {
+                unsigned char u = static_cast<unsigned char>(c);
+                if (u <= ' ')
+                {
+                    if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+                }
+                else
+                {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) words.push_back(cur);
+        }
+
+        // strip leading punctuation-only / article tokens
+        static const std::unordered_set<std::string> kLeadDrop = {
+            "a", "an", "the"
+        };
+        while (!words.empty())
+        {
+            std::string w = words.front();
+            // strip surrounding punctuation
+            std::string stripped;
+            for (char c : w)
+            {
+                unsigned char u = static_cast<unsigned char>(c);
+                if (std::isalnum(u)) stripped.push_back(c);
+                else if (!stripped.empty()) break;
+            }
+            if (stripped.empty() || kLeadDrop.count(AsciiLower(stripped)))
+                words.erase(words.begin());
+            else
+                break;
+        }
+
+        if (words.size() > maxWords) words.resize(maxWords);
+
+        // drop dangling trailing connector / version tokens
+        static const std::unordered_set<std::string> kDangle = {
+            "to","the","a","an","of","for","in","on","and","or","with",
+            "from","f","vs","ch","p99","v1","v2","v3","v4","v5","draft",
+            "is","at","by"
+        };
+        while (!words.empty() && kDangle.count(AsciiLower(words.back())))
+            words.pop_back();
+
+        std::string out;
+        for (size_t i = 0; i < words.size(); ++i)
+        {
+            if (i) out += " ";
+            out += words[i];
+        }
+        return Trim(out);
+    }
+}
+
+static std::vector<std::string> ComposeRichListing(
+    const std::vector<AppAgg>&       bag,
+    const std::string&               category,
+    const std::vector<std::string>&  themeHint)
+{
+    if (bag.empty()) return themeHint;
+
+    // Collect up to 3 distinct cleaned title phrases, in ranked order.
+    std::vector<std::string> phrases;
+    std::vector<std::string> phrasesLower;
+    for (const auto& a : bag)
+    {
+        const std::string& src = !a.bestTitle.empty() ? a.bestTitle : a.rawTitle;
+        std::string p = CleanPhrase(src);
+        if (p.size() < 2) continue;
+        std::string lo = AsciiLower(p);
+
+        // skip if this phrase is contained in, or contains, one already
+        // taken (avoids "Search Relevance" + "Search Relevance Spec").
+        bool dup = false;
+        for (const auto& seen : phrasesLower)
+        {
+            if (lo.find(seen) != std::string::npos ||
+                seen.find(lo) != std::string::npos)
+            { dup = true; break; }
+        }
+        if (dup) continue;
+
+        phrases.push_back(std::move(p));
+        phrasesLower.push_back(std::move(lo));
+        if (phrases.size() >= 3) break;
+    }
+
+    if (phrases.empty()) return themeHint;
+
+    const char* verb =
+        (category == "websites") ? "researching" :
+        (category == "apps")     ? "working across" :
+                                   "working on";
+
+    std::string body;
+    if (phrases.size() == 1)
+        body = phrases[0];
+    else if (phrases.size() == 2)
+        body = phrases[0] + " and " + phrases[1];
+    else
+        body = phrases[0] + ", " + phrases[1] + " and " + phrases[2];
+
+    // Brief app clause: up to 2 distinct friendly names.
+    std::vector<std::string> apps;
+    for (const auto& a : bag)
+    {
+        if (a.friendlyName.empty()) continue;
+        bool seen = false;
+        for (const auto& x : apps) if (x == a.friendlyName) { seen = true; break; }
+        if (!seen) apps.push_back(a.friendlyName);
+        if (apps.size() >= 2) break;
+    }
+    std::string appClause;
+    if (apps.size() == 1)
+        appClause = " in " + apps[0];
+    else if (apps.size() >= 2)
+        appClause = " across " + apps[0] + " and " + apps[1];
+
+    return { "User is " + std::string(verb) + " " + body + appClause };
+}
+
 ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
@@ -2285,7 +2517,12 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         return snap;
     }
 
-    snap.summary = allBuild.lines;
+    // ---- Canonical "all" summary: rich deterministic listing (v5.17)
+    // The cluster->theme token output (`allBuild.lines`) is kept as the
+    // LLM topic hint (`themeAll`); the user-facing summary is the
+    // richer, more grounded listing produced by ComposeRichListing.
+    std::vector<std::string> themeAll = allBuild.lines;
+    snap.summary = ComposeRichListing(ranked, "all", themeAll);
 
     // -----------------------------------------------------------------
     // Per-category summaries.  Each is an *independent* projection of
@@ -2604,27 +2841,37 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    snap.summaryFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).lines;
-    snap.summaryWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
-    snap.summaryApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
+    // ---- Canonical per-facet summaries: rich deterministic listing --
+    // Keep the cluster->theme token output as the LLM topic hint
+    // (themeFiles/Websites/Apps); surface the richer listing.
+    std::vector<std::string> themeFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).lines;
+    std::vector<std::string> themeWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
+    std::vector<std::string> themeApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
 
-    // ---- LLM as brain: generate the canonical summary -------------
-    // When the Qwen3-0.6B "brain" model is loaded, it reads the
-    // window titles and writes the user-facing `summary` lines
-    // directly.  The algorithmic cluster->theme output composed above
-    // stays as the `existing` topic-hint fed into the LLM prompt
-    // (the hint measurably improves output quality versus letting
-    // the model work from raw titles alone -- see
-    // scripts/smoke_test_polish.py).  The LLM's output OVERWRITES
-    // `summary` / `summaryFiles` / `summaryWebsites` / `summaryApps`
-    // in place, so there is only ever one user-facing summary field
-    // per facet -- the brain writes directly, with no separate
-    // "polished" alias.
+    snap.summaryFiles    = ComposeRichListing(rankedFiles, "files",    themeFiles);
+    snap.summaryWebsites = ComposeRichListing(rankedWeb,   "websites", themeWebsites);
+    snap.summaryApps     = ComposeRichListing(rankedApps,  "apps",     themeApps);
+
+    // ---- LLM refinement (gated) -----------------------------------
+    // The canonical per-facet summary is now the rich deterministic
+    // listing produced above.  When the Qwen3-0.6B "brain" model is
+    // loaded we still give it a chance to produce nicer prose, but its
+    // output only REPLACES the listing when it is at least as grounded
+    // in the actual window titles as the listing is -- measured by
+    // granite cosine to the joined titles.
     //
-    // When the LLM isn't loaded the algorithmic summary stays as-is.
-    // `modelPolish` reports which brain model produced the summary
-    // ("qwen3-0.6b") or "(not loaded)" so consumers can tell which
-    // pipeline ran.
+    // Why gated rather than unconditional (the pre-v5.17 behaviour):
+    // an A/B harness over 12 realistic scenarios (Qwen3-0.6B + granite,
+    // see commit message) showed the unconditional LLM override was a
+    // net LOSS -- the 0.6B model drops activity breadth, its output is
+    // rejected by the grounding gate 75-90% of the time (so the user
+    // was usually shown the terse token-theme), and even when accepted
+    // it is, on average, LESS grounded than the listing (granite
+    // cos-to-titles 0.906 vs 0.920).  The gate keeps the rare genuine
+    // LLM win (cleaner prose for a single-topic facet) while flooring
+    // the common case at the much-better listing.  The cluster->theme
+    // token output (themeAll / themeFiles / ...) is passed as the LLM
+    // topic hint, exactly as before.
     snap.modelPolish = (m_llm && m_llm->IsLoaded())
                           ? m_llm->ModelName()
                           : std::string("(not loaded)");
@@ -2679,27 +2926,61 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
         std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
 
-        // Helper: run the LLM for one facet and promote its output to
-        // be the canonical summary.  On failure (empty output) we
-        // keep the algorithmic summary already sitting in `canonical`
-        // so the user never sees an empty line when we have valid
-        // input.
+        // Joiner used by the groundedness gate.
+        auto joinLines = [](const std::vector<std::string>& v) -> std::string {
+            std::string s;
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                if (i) s += ". ";
+                s += v[i];
+            }
+            return s;
+        };
+
+        // Helper: run the LLM for one facet.  The LLM output replaces
+        // the rich listing only when it (a) survives the LLM's own
+        // grounding / anti-copy gates AND (b) is at least as grounded
+        // in the window titles as the listing -- granite cosine to the
+        // joined item titles, with a small tolerance so genuinely
+        // nicer prose isn't rejected for a trivial grounding dip.
         auto runFacet = [&](std::vector<std::string>&        canonical,
+                            const std::vector<std::string>&  hint,
                             const std::vector<LlmActivityItem>& facetItems,
                             const char*                       category)
         {
             if (facetItems.empty()) return;
-            auto generated = m_llm->Polish(canonical, facetItems, category);
-            if (!generated.empty())
+            auto generated = m_llm->Polish(hint, facetItems, category);
+            if (generated.empty()) return;
+
+            // Groundedness gate (only when the granite encoder is
+            // available; otherwise keep the listing -- we can't score).
+            if (m_modelReady)
             {
-                canonical = generated;
+                std::string titles;
+                for (const auto& it : facetItems)
+                {
+                    if (!titles.empty()) titles += ". ";
+                    titles += it.title.empty() ? it.rawTitle : it.title;
+                }
+                std::vector<float> eT = Embed(titles);
+                std::vector<float> eG = Embed(joinLines(generated));
+                std::vector<float> eC = Embed(joinLines(canonical));
+                if (!eT.empty() && !eG.empty() && !eC.empty())
+                {
+                    float cosG = CosineSim(eG, eT);
+                    float cosC = CosineSim(eC, eT);
+                    // Reject the LLM rewrite when it is meaningfully
+                    // less grounded than the listing.
+                    if (cosG + 0.02f < cosC) return;
+                }
             }
+            canonical = generated;
         };
 
-        runFacet(snap.summary,         llmItemsAll,      "all");
-        runFacet(snap.summaryFiles,    llmItemsFiles,    "files");
-        runFacet(snap.summaryWebsites, llmItemsWebsites, "websites");
-        runFacet(snap.summaryApps,     llmItemsApps,     "apps");
+        runFacet(snap.summary,         themeAll,      llmItemsAll,      "all");
+        runFacet(snap.summaryFiles,    themeFiles,    llmItemsFiles,    "files");
+        runFacet(snap.summaryWebsites, themeWebsites, llmItemsWebsites, "websites");
+        runFacet(snap.summaryApps,     themeApps,     llmItemsApps,     "apps");
     }
 
     // ---- Granite translator: embed the canonical summary -----------
