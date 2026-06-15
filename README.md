@@ -4,7 +4,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B14-00599c)](https://isocpp.org/)
 [![Toolset](https://img.shields.io/badge/toolset-MSVC%20v143-purple)](https://visualstudio.microsoft.com/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite%20WAL-003b57)](https://sqlite.org/)
-[![Inference](https://img.shields.io/badge/inference-Qwen3--0.6B%20brain%20%C2%B7%20Granite--R2%20embeddings-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
+[![Inference](https://img.shields.io/badge/inference-Granite--R2%20listing%20%C2%B7%20Qwen3--0.6B%20refiner-2ea44f)](#contextinference-contextinferenceh--contextinferencecpp)
 
 WARP — the **Windows Activity Reasoning Platform** — is a lightweight Windows desktop
 application that does two things on the local PC:
@@ -92,7 +92,7 @@ the PC is actively being used.
 | **Named-pipe query API** | Other Windows processes can connect to `\\.\pipe\WarpFileActivityAPI` and retrieve activity data as JSON for any supported time window, optionally filtered by event type. |
 | **Confidence-weighted inference engine** | Every captured event incrementally updates per-entity inference records (files, apps, URLs) with open/edit timestamps and an exponential-decay recency score. Counters are accumulated by the producer's `confidence` (a REAL value in [0, 1]) rather than by `1`, so a stream of 10 events at confidence 0.1 contributes the same weight as one full-confidence event instead of being dropped wholesale by a hard threshold. JSON output rounds to integer via `llround()` so the documented integer `open_count_*` API contract still holds. Two dedicated API operations (`QueryInferences`, `GetInferenceDeltas`) let client apps retrieve these precomputed insights without scanning raw events. |
 | **Inference explorer UI** | A built-in "Explore Precomputed Inferences" panel lets you browse the top-N entities ranked by recency score, filtered by entity type (Files / Apps / URLs), and look up the inference record for any specific path or URL -- all without leaving the WARP window. |
-| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a human-readable **context summary** of 1–3 short phrase lines describing what the user is actively doing — e.g. `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the **granite (`ibm-granite/granite-embedding-small-english-r2`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. Granite uses a byte-level BPE tokenizer that handles code/identifier tokens like `auth.cpp` and `useEffect` cleanly. For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `focus-weighted coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–3 tokens become the cluster's theme phrase. **Umbrella detection:** if a single content token appears in titles of ≥ 50 % of the top clusters AND those clusters carry ≥ 50 % of focus, those clusters are collapsed into a single descriptive line of the form `"Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"` (with a "Researching"-verb variant for browser-dominant umbrellas and a "Working on"-variant for editor-dominant ones). The combined "All" summary is hard-capped at 3 lines total and drops any non-umbrella cluster contributing less than 5 % of focus time, so each line stays *coherent* — no more `"… + 2 other threads"` noise. The verb is selected from a small set (`Working on`, `Reviewing`, `Researching`, `Reading about`, `Discussing`, `Writing`, `Exploring`, …) based on the dominant app type and content keywords. Without the model the engine still extracts themes by frequency alone (the verb logic is unchanged) and falls back to the verbatim title only when no usable content tokens remain. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"granite-embedding-small-english-r2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined summary, the snapshot also carries three independent summaries — `summary_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `summary_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `summary_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same sentence-encoder cluster→theme pipeline (including umbrella detection). The UI dropdowns next to the *Show Context Summary* / *Show Summary History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different summary in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
+| **Dynamic context inference** | Every 60 seconds, all activities from the configured lookback window (default last 15 minutes; user-selectable from 5 minutes up to 30 days) are read directly from SQLite (with the user's *currently-active* foreground window overlaid as a virtual focus row, so even a single deep-work session is captured). A summarizer composes a human-readable **context summary** — as of **v5.17** a single rich, grounded line per facet (the field stays a string array for backward compatibility) describing what the user is actively doing — e.g. `["User is working on Context Inference and the WARP dev branch across Visual Studio and Edge"]`. The composer runs a layered classifier (exact exe table → path heuristics → fallback) plus a UTF-8-aware title cleaner that captures the *full* window title alongside a cleaned form. When the **granite (`ibm-granite/granite-embedding-small-english-r2`) ONNX sentence-encoder model** is present alongside the executable, per-app phrases are embedded and **dynamically clustered** (greedy, cosine ≥ 0.65) so semantically related activities (e.g. editing `auth.cpp` and reviewing the Auth PR in a browser) collapse into one *thread of work* — there is no fixed taxonomy of buckets. Granite uses a byte-level BPE tokenizer that handles code/identifier tokens like `auth.cpp` and `useEffect` cleanly. For each cluster a **semantic theme** is then distilled by tokenizing the cleaned titles, filtering stop-words / file-extensions / brand names, and scoring the remaining content tokens by `focus-weighted coverage × (1 + cosine-to-clean-cluster-centroid)`; the top 1–3 tokens become the cluster's **theme phrase** — but, as of **v5.17**, this token theme is **no longer the user-facing summary**; it is retained only as a compact *topic hint* for the optional LLM refiner. The **canonical summary** is instead a **rich deterministic listing** (`ComposeRichListing` / `CleanPhrase`): WARP takes the top-ranked clusters, cleans each one's most representative window title into a short noun phrase (strips a trailing file extension, expands `camelCase` / `snake_case` / `kebab-case`, drops leading `Re:` / `#` / articles and dangling connector / version tokens, caps at 4 words, and dedups any phrase contained in another), and joins the top three distinct phrases into one grounded line such as `"User is working on Context Inference, Auth Middleware and Session Store across Visual Studio and Edge"`. The verb adapts to the facet (`working on` for the combined / files view, `researching` for websites, `working across` for apps) and an optional tail names up to two apps (` in <App>` or ` across <A> and <B>`). A small local **LLM (Qwen3-0.6B)**, when its model files are present, may then rewrite the line into cleaner prose — but the rewrite is accepted **only when it is at least as grounded in the actual window titles as the listing is** (measured by the granite encoder), so the model can refine but never regress below the deterministic floor. On a 12-scenario on-device A/B harness the deterministic listing matched the LLM on semantic fidelity while being more grounded, closer to a human reference and ~2× more specific — at zero inference cost. Without the **granite** encoder the engine still produces the listing (clustering simply collapses to one app per cluster) and falls back to the verbatim cleaned title only when a phrase yields no usable words. Each snapshot also carries a `confidence` score, a `dominant_focus_pct`, a `model` field (`"granite-embedding-small-english-r2"` or `"deterministic"`), a `thread_count`, and a structured `items[]` breakdown — each item carries both the cleaned `title` and the **full** original `raw_title`, plus per-item `thread_id`. **Per-category facets:** in addition to the combined summary, the snapshot also carries three independent summaries — `summary_files` (any app where the user is engaged with a real file: `.docx` in Word, `.xlsx` in Excel, `.pptx` in PowerPoint, `.jpg`/`.png`/`.heic` in Photos / IrfanView / Paint, `.cpp`/`.json`/`.md`/`.txt` in any editor — recognized through both the file-app whitelist *and* title-based file-extension detection — plus recent file basenames from the file monitor), `summary_websites` (derived only from browser tab titles, aggregated per unique cleaned tab title), and `summary_apps` (derived only from non-file, non-browser apps: communications such as Outlook / Teams / Slack / Discord / WhatsApp / Zoom, media players, terminals, remote desktop) — each composed through the same clustering → rich-listing pipeline (the cluster→theme tokens are kept only as the optional LLM hint). The UI dropdowns next to the *Show Context Summary* / *Show Summary History* buttons let the user pick **which facet** (`All` / `Files` / `Websites` / `Apps`, default *All*) and **what lookback window** (5 min / 15 min / 30 min / 1 h / 2 h / 6 h / 24 h / 7 d / 15 d / 30 d, default *Last 15 minutes*). Snapshots refresh every minute; new entries are appended to history only on **material change** (different summary in *any* facet, different dominant app, or a 5-minute heartbeat). The latest snapshot is retrievable via `GetRecentContext` (with optional `category` and `window_seconds` parameters); the last *N* snapshots (default 10, max 200, newest-first) via `GetRecentContexts`. |
 
 ---
 
@@ -696,7 +696,7 @@ cache via `ClearCache()`.
 #### `ContextInference` (`ContextInference.h` / `ContextInference.cpp`)
 
 A **dynamic, sentence-encoder-clustered** context summarizer that reads recent
-activity directly from SQLite and composes a multi-line **context summary** (1-3 phrase lines)
+activity directly from SQLite and composes a **context summary** (as of v5.17, a single rich deterministic line per facet)
 describing what the user is actively doing — using the actual document names,
 browser tab titles, and application titles observed, **not** a fixed list of
 pre-defined topic buckets.
@@ -763,7 +763,10 @@ pre-defined topic buckets.
      joined content-token bag. The top **1–2** tokens (the second is
      dropped if its score is < 60 % of the first or if one is a prefix of
      the other) become the cluster's **theme phrase**, ordered by their
-     first appearance and Title-Cased.
+     first appearance and Title-Cased. *(v5.17: this theme phrase is no
+     longer surfaced to the user — it is retained only as a compact topic
+     **hint** for the optional LLM refiner; the user-facing summary is the
+     rich deterministic listing described below.)*
    - **Activity verb selection.** A small, fixed verb vocabulary —
      `Working on`, `Reviewing`, `Reading about`, `Researching`,
      `Discussing`, `Watching`, `Designing`, `Reading` — is chosen per
@@ -771,19 +774,40 @@ pre-defined topic buckets.
      keywords (e.g. browser + `pull request` / `commit` / `diff` →
      `Reviewing`; browser + `tutorial` / `documentation` →
      `Reading about`).
-   - **One-liner composition (semantic).** Each cluster contributes
-     `<verb> <Theme Phrase>` (no quoted titles, no app names by
-     default); when a cluster spans 2+ apps, a tail
-     `(across App1, App2 & App3 + N more)` is appended so the
-     consumer can still see *where* the work is happening. Clusters are
-     joined by ` · ` with **adaptive top-N**: keep adding until 80 % of
-     focus time is covered or the 180-character budget is reached, then
-     append `+ N other thread(s)`. **Fallback:** if a cluster's title
-     bag yields zero usable content tokens (all stop-words / brands),
-     that cluster falls back to the prior verbatim format
-     `<verb> "<title>" in <friendlyName>` so a context-free verb is
-     never emitted. Without the sentence-encoder loaded the same theme
-     extraction runs on frequency alone (no cosine weighting).
+   - **Rich deterministic listing (canonical summary, v5.17).** The
+     user-facing summary is built by `ComposeRichListing`, **not** the
+     terse token theme above. WARP walks the ranked clusters and, for
+     each, cleans its most representative window title into a short noun
+     phrase via `CleanPhrase` — strips a trailing file extension, expands
+     `camelCase` / `snake_case` / `kebab-case` into words, drops leading
+     `Re:` / `#` / articles and dangling connector / version tokens, caps
+     at 4 words — then dedups any phrase contained in (or containing) one
+     already taken. The top **3** distinct phrases are joined into a
+     single grounded line `User is <verb> <P1>, <P2> and <P3><app-clause>`,
+     where the verb is facet-derived (`working on` for the combined /
+     files view, `researching` for websites, `working across` for apps)
+     and the optional app clause names up to two friendly apps
+     (` in <App>` or ` across <A> and <B>`). This path runs **with or
+     without** the sentence-encoder — clustering only changes which titles
+     rank first; if a title yields no usable words the cleaned verbatim
+     title is used. *Example:* `auth.cpp` + `login.ts` + `session.go` in
+     VS Code → `"User is working on Auth, Login and Session in Visual
+     Studio Code"`.
+   - **Optional LLM refinement (gated, v5.17).** When the **Qwen3-0.6B**
+     refiner model is loaded, each facet's listing items plus the token
+     hint are passed to `LlmSummarizer::Polish`, which may rewrite the
+     line into cleaner prose. The rewrite **replaces** the listing only
+     when it (a) survives the LLM's own anti-hallucination / anti-echo
+     gates **and** (b) is at least as grounded in the joined window
+     titles as the listing — granite cosine with a 0.02 tolerance
+     (`cos(LLM, titles) + 0.02 ≥ cos(listing, titles)`); otherwise the
+     listing is kept. The LLM is therefore strictly a *refiner over a
+     strong floor*: it can only help, never drag the summary below the
+     deterministic baseline. A 12-scenario on-device A/B harness showed
+     the unconditional pre-v5.17 override was a **net loss** — the 0.6B
+     model's output was rejected 75–90 % of the time, dropped activity
+     breadth, and was on average *less* grounded (cos-to-titles 0.906 vs
+     0.920) — which is exactly why it is now gated.
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
      capped at 0.99.
@@ -1120,7 +1144,7 @@ All controls reflow when the window is resized. Minimum window size is 800 x 500
 The project compiles SQLite as an embedded amalgamation (`sqlite3.c` / `sqlite3.h`)
 and pulls **`Microsoft.ML.OnnxRuntime` 1.23.0** plus **`Microsoft.ML.OnnxRuntimeGenAI` 0.14.1**
 via NuGet (declared in `packages.config`). The granite sentence-encoder model files
-and the Qwen3-0.6B "brain" model files are **not** committed to the repo — they are
+and the Qwen3-0.6B refiner model files are **not** committed to the repo — they are
 downloaded once into a `models/` folder before the build.
 
 **Steps:**
@@ -1153,11 +1177,13 @@ downloaded once into a `models/` folder before the build.
    > app becomes its own cluster, no semantic clustering, no
    > `summary_embedding`. The summary text still renders correctly.
 
-3. Download the **LLM "brain" model** (Qwen3-0.6B, CPU-INT4,
-   ~430 MB) into `models/qwen/`.  This is the model that reads the
-   raw window titles and generates the user-facing summary text;
-   when present, its output replaces the algorithmic cluster->theme
-   output in the `summary` field.  **Required on x64 and ARM64**
+3. Download the **LLM refiner model** (Qwen3-0.6B, CPU-INT4,
+   ~430 MB) into `models/qwen/`.  This is the model that may rewrite
+   WARP's deterministic context listing into cleaner prose; *(v5.17)*
+   its output replaces the listing in the `summary` field **only when
+   it is at least as grounded in the actual window titles as the
+   listing is** (granite cosine), so it can refine but never regress
+   below the deterministic floor.  **Required on x64 and ARM64**
    — the CI build pipeline downloads it automatically and **bundles it
    into the release artifact** so end users don't have to.  For local
    development you'll need to fetch it yourself once:
@@ -1172,9 +1198,9 @@ downloaded once into a `models/` folder before the build.
 
    **x86 builds skip this step entirely** — the
    `Microsoft.ML.OnnxRuntimeGenAI` NuGet only ships x64 and ARM64
-   binaries.  The brain layer is graceful-degrade: when its model
-   files or runtime DLL aren't present, `ContextInference` falls back
-   to the algorithmic cluster->theme summary and reports
+   binaries.  The refiner layer is graceful-degrade: when its model
+   files or runtime DLL aren't present, `ContextInference` simply
+   serves the deterministic rich listing and reports
    `"model_polish": "(not loaded)"` in the response.
 
 4. Build any configuration (Debug/Release × Win32/x64/ARM64).  The post-build
@@ -1187,9 +1213,9 @@ downloaded once into a `models/` folder before the build.
 > build and run; `ContextInference::Init()` just falls through to the
 > deterministic per-app composer and reports `"model": "deterministic"` in
 > every snapshot.  The Qwen model download is **mandatory for x64 / ARM64
-> CI builds** but optional for local development (the LLM brain simply
-> stays disabled when its files are missing and the algorithmic summary
-> path takes over).
+> CI builds** but optional for local development (the LLM refiner simply
+> stays disabled when its files are missing and the deterministic rich
+> listing is served as-is).
 
 ---
 
@@ -1233,7 +1259,7 @@ flowchart TB
     subgraph CTX ["Context inference layer"]
         CI["ContextInference<br/><sub>granite dynamic clustering · in-process</sub>"]:::ml
         CLS["kAppClasses + path heuristics<br/><sub>~80 entries · 3-layer classifier</sub>"]:::ml
-        TC["CleanTitle + ComposeOneLiner<br/><sub>UTF-8 normaliser · adaptive top-N</sub>"]:::ml
+        TC["CleanTitle + ComposeRichListing<br/><sub>UTF-8 normaliser · rich deterministic listing</sub>"]:::ml
     end
 
     WARP --> ETW
@@ -1266,9 +1292,9 @@ flowchart TB
 | **Attribution**  | WinTrust + WTS                       | Authenticode subject and session/integrity for system-process voting   |
 | **IPC**          | Named pipes                          | Sync request/response API on `\\.\pipe\WarpFileActivityAPI`            |
 | **Storage**      | SQLite (amalgamation, WAL)           | Embedded; one `activity.db` per user under `%LOCALAPPDATA%\WARP\`      |
-| **Context**      | `ContextInference` (granite clustering) | 60-sec rolling summarizer; emits a 1–3 line `summary` + clustered `items[]`        |
+| **Context**      | `ContextInference` (granite clustering) | 60-sec rolling summarizer; emits a rich deterministic `summary` line + clustered `items[]`        |
 | **Context**      | `kAppClasses` + path heuristics      | 3-layer exe classifier (~80 known apps + JetBrains/Office/browsers)    |
-| **Context**      | `CleanTitle` + `ComposeOneLiner`     | UTF-8 separator normaliser, suffix stripper, adaptive top-N composer   |
+| **Context**      | `CleanTitle` + `ComposeRichListing`  | UTF-8 separator normaliser, suffix stripper, rich deterministic listing composer (+ gated Qwen refiner) |
 
 > **Why no service?** WARP runs interactively in the elevated user session so
 > that `GetForegroundWindow`, `WTSGetActiveConsoleSessionId`, and UI
@@ -1504,7 +1530,7 @@ Returns up to 5 000 records per call, ordered by ascending `version`.
 
 ##### GetRecentContext
 
-Retrieve the **latest context summary** snapshot (1–3 phrase lines) from the
+Retrieve the **latest context summary** snapshot (a single rich line per facet) from the
 `ContextInference` summarizer.
 
 ```json
@@ -1531,13 +1557,11 @@ Retrieve the **latest context summary** snapshot (1–3 phrase lines) from the
     "window_seconds": 900,
     "category": "all",
     "summary": [
-      "Working on Context Inference (across Visual Studio & Edge)",
-      "Discussing Daily Standup (across Teams & Outlook)",
-      "Researching React Hooks"
+      "User is working on Context Inference and the WARP dev branch across Visual Studio and Edge"
     ],
-    "summary_files":    ["Editing Context Inference module", "Drafting Daily Standup notes"],
-    "summary_websites": ["Researching React Hooks", "Reviewing GitHub PR for ContextInference"],
-    "summary_apps":     ["Discussing in Slack & Teams", "Triaging Outlook inbox"],
+    "summary_files":    ["User is working on Context Inference in Visual Studio"],
+    "summary_websites": ["User is researching the Context Inference PR review in Edge"],
+    "summary_apps":     ["User is working across the WARP channel and the inbox in Slack and Outlook"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -1569,7 +1593,7 @@ Retrieve the **latest context summary** snapshot (1–3 phrase lines) from the
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "files",
-    "summary": ["Editing Context Inference module", "Drafting Daily Standup notes"],
+    "summary": ["User is working on Context Inference in Visual Studio"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
@@ -1591,7 +1615,7 @@ Retrieve the **latest context summary** snapshot (1–3 phrase lines) from the
 | `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds). |
 | `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` (after normalization). |
 | `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
-| `summary` | `string[]` | Array of 1–3 short phrase lines describing what the user is actively doing. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
+| `summary` | `string[]` | Phrase lines describing what the user is actively doing. As of **v5.17** the deterministic path emits a **single rich line** (`"User is working on …"`); the field stays an array for backward compatibility and for the rare multi-line LLM rewrite. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
 | `summary_files` | `string[]` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file — code editors / IDEs / Office apps / OneNote / PDF readers / image viewers / design tools, **plus** any other app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pdf`, `.png`, `.cpp`, `.json`), **plus** recent file basenames from the file monitor. |
 | `summary_websites` | `string[]` | **Only present when `category == "all"`.** Summary derived from browser tab titles (per-tab aggregation). |
 | `summary_apps` | `string[]` | **Only present when `category == "all"`.** Summary derived from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Zoom / Webex), media players (Spotify / VLC), terminals, remote desktop, version-control UIs, etc. |
@@ -1631,8 +1655,8 @@ wants short-term memory of what the user has been doing.
 ```json
 {
   "recent_contexts": [
-    { "timestamp": 1750012345, "category": "all", "summary": ["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "+ 2 other threads"], "summary_files": [ "…" ], "summary_websites": [ "…" ], "summary_apps": [ "…" ], "confidence": 0.84, "model": "granite-embedding-small-english-r2", "thread_count": 3, "/* …full snapshot fields… */": null },
-    { "timestamp": 1750012045, "category": "all", "summary": ["Reading GitHub dev branch in Edge", "Editing README.md in Visual Studio"], "confidence": 0.71, "model": "granite-embedding-small-english-r2", "thread_count": 2, "/* … */": null }
+    { "timestamp": 1750012345, "category": "all", "summary": ["User is working on Context Inference and the WARP dev branch across Visual Studio and Edge"], "summary_files": [ "…" ], "summary_websites": [ "…" ], "summary_apps": [ "…" ], "confidence": 0.84, "model": "granite-embedding-small-english-r2", "thread_count": 3, "/* …full snapshot fields… */": null },
+    { "timestamp": 1750012045, "category": "all", "summary": ["User is working on the README and the WARP dev branch across Edge and Visual Studio"], "confidence": 0.71, "model": "granite-embedding-small-english-r2", "thread_count": 2, "/* … */": null }
   ],
   "category": "all",
   "returned": 2,
