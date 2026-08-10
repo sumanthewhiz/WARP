@@ -1,8 +1,5 @@
 # WARP Activity API -- Integration Guide
 
-
-# WARP Activity API -- Integration Guide
-
 > **Version:** 4.0
 > **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`
 > **Transport:** Windows Named Pipe (message mode)
