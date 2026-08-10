@@ -312,6 +312,53 @@ void InferenceEngine::OnAppFocusEvent(const std::wstring& exePath,
 
 // ===================== Query Handlers =====================
 
+std::vector<InferenceRecord> InferenceEngine::Lookup(
+    const std::vector<std::string>& keys)
+{
+    std::vector<InferenceRecord> out;
+    out.reserve(keys.size());
+
+    for (const auto& key : keys)
+    {
+        InferenceRecord rec;
+        bool found = false;
+
+        // Cache first.
+        {
+            std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+            auto it = m_cache.find(key);
+            if (it != m_cache.end())
+            {
+                rec = it->second;
+                found = true;
+            }
+        }
+
+        // Fall back to DB and warm the cache on hit.
+        if (!found)
+        {
+            std::lock_guard<std::mutex> dbLock(*m_dbMutex);
+            if (LoadFromDb(key, rec))
+            {
+                found = true;
+                std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+                m_cache[key] = rec;
+            }
+        }
+
+        // Default-constructed record (all zeros, empty strings) when
+        // not found -- callers can detect this via entityKey.empty().
+        out.push_back(found ? rec : InferenceRecord{});
+    }
+
+    return out;
+}
+
+std::string InferenceEngine::NormalizeEntityKey(const std::wstring& widePath)
+{
+    return NormalizeKey(widePath);
+}
+
 std::string InferenceEngine::HandleQueryInferences(
     const std::vector<std::string>& paths,
     const std::vector<std::string>& fields)

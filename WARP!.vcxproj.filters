@@ -57,9 +57,6 @@
     <ClInclude Include="ContextInference.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="BertTokenizer.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WARP!.cpp">

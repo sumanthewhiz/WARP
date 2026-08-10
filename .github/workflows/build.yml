@@ -40,13 +40,80 @@ jobs:
     - name: Restore NuGet packages
       run: |
         nuget restore "WARP!.sln" -PackagesDirectory ../packages
+        # ORT 1.23.0 (transitively required by ORT-GenAI 0.14.1) no
+        # longer ships its win-x86 native binaries, but WARP still
+        # builds an x86 configuration (purely for backward compat;
+        # x86 never links the LLM polisher).  Side-install the last
+        # ORT release that still publishes win-x86 onnxruntime.lib so
+        # the x86 link step has something to point at.  x64 / ARM64
+        # builds continue to use the version restored by
+        # `nuget restore` (1.23.0).
+        nuget install Microsoft.ML.OnnxRuntime -Version 1.22.0 -OutputDirectory ../packages -DependencyVersion Ignore
 
-    - name: Download sentence-encoder model files (BGE-small-en-v1.5)
+    - name: Download sentence-encoder model (granite-embedding-small-english-r2)
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Path "models" -Force | Out-Null
-        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx" -OutFile "models/bge-small.onnx"
-        Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt" -OutFile "models/vocab.txt"
+        # ibm-granite/granite-embedding-small-english-r2 (ModernBERT,
+        # byte-level BPE, 384-dim, COIR code-retrieval trained, Apache
+        # 2.0).  We pull the INT8-quantized ONNX from the community
+        # `onnx-community/granite-embedding-small-english-r2-ONNX`
+        # mirror (~52 MB weights + ~600 KB wrapper) plus the original
+        # HF tokenizer.json from the upstream repo so we can deterministically
+        # extract the flat tokenizer artefacts the C++ runtime consumes
+        # (vocab.txt / merges.txt / special_tokens.txt).
+        $graniteDir = "models/granite"
+        New-Item -ItemType Directory -Path $graniteDir -Force | Out-Null
+
+        $onnxRepo = "https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main"
+        Invoke-WebRequest -Uri "$onnxRepo/onnx/model_quantized.onnx"      -OutFile "$graniteDir/model_quantized.onnx"
+        Invoke-WebRequest -Uri "$onnxRepo/onnx/model_quantized.onnx_data" -OutFile "$graniteDir/model_quantized.onnx_data"
+
+        $hfRepo = "https://huggingface.co/ibm-granite/granite-embedding-small-english-r2/resolve/main"
+        Invoke-WebRequest -Uri "$hfRepo/tokenizer.json" -OutFile "$graniteDir/tokenizer.json"
+
+        # Extract the flat vocab.txt + merges.txt + special_tokens.txt
+        # the C++ ModernBertTokenizer consumes (it deliberately has no
+        # JSON parser dependency).  The python reference in
+        # `scripts/modernbert_tokenizer_ref.py` is verified bit-exact
+        # against transformers.AutoTokenizer for the C++ port.
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet regex
+        python scripts/extract_modernbert_tokenizer.py "$graniteDir/tokenizer.json" "$graniteDir"
+        # tokenizer.json (~3.5 MB) is consumed only by the extractor; drop
+        # it from the staged model directory so the shipped artefact only
+        # carries the flat files the C++ runtime actually loads.
+        Remove-Item "$graniteDir/tokenizer.json" -Force
+
+    - name: Download LLM polishing model (Qwen3-0.6B, CPU INT4)
+      shell: pwsh
+      run: |
+        # ORT-GenAI-compatible Qwen3-0.6B bundle from the
+        # community-maintained `xiaoyao9184/Qwen3-0.6B-onnx-genai`
+        # repo on HuggingFace.  We pull the CPU INT4 variant (~430 MB)
+        # under the `cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/`
+        # subdirectory, which ships the genai_config.json that
+        # onnxruntime-genai requires plus the model + tokenizer files.
+        # All listed files are required for the polishing layer to
+        # load; any download failure aborts the build so we never ship
+        # a half-populated artifact.  The x64 / ARM64 staging step
+        # below bundles this directory verbatim into the release zip;
+        # x86 builds skip the polishing layer at link time and don't
+        # ship these files.
+        $qwenDir = "models/qwen"
+        New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
+        $repo = "https://huggingface.co/xiaoyao9184/Qwen3-0.6B-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
+        $files = @(
+          "chat_template.jinja",
+          "genai_config.json",
+          "model.onnx",
+          "model.onnx.data",
+          "tokenizer.json",
+          "tokenizer_config.json"
+        )
+        foreach ($f in $files) {
+          Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f"
+          Write-Host "Downloaded $f"
+        }
 
     - name: Detect available VC toolset
       id: toolset
@@ -77,10 +144,15 @@ jobs:
     - name: Stage artifacts
       shell: pwsh
       run: |
+        # x64 and ARM64 ship the LLM polishing layer -- bundled
+        # Qwen3-0.6B + onnxruntime-genai.dll are required and the
+        # staging step fails if either is missing.  x86 ships without
+        # the polisher (the ORT-GenAI NuGet has no win-x86 binaries),
+        # so its staging skips both.
         $platforms = @(
-          @{ arch = "ARM64"; src = "ARM64/Release" },
-          @{ arch = "x64";   src = "x64/Release"   },
-          @{ arch = "x86";   src = "Release"        }
+          @{ arch = "ARM64"; src = "ARM64/Release"; hasLlm = $true  },
+          @{ arch = "x64";   src = "x64/Release";   hasLlm = $true  },
+          @{ arch = "x86";   src = "Release";       hasLlm = $false }
         )
 
         foreach ($p in $platforms) {
@@ -89,8 +161,39 @@ jobs:
           New-Item -ItemType Directory -Path "$staging/models" -Force | Out-Null
           Copy-Item "$($p.src)/WARP!.exe" "$staging/WARP!.exe" -Force
           Copy-Item "$($p.src)/onnxruntime.dll" "$staging/onnxruntime.dll" -Force
-          Copy-Item "$($p.src)/models/bge-small.onnx" "$staging/models/bge-small.onnx" -Force
-          Copy-Item "$($p.src)/models/vocab.txt" "$staging/models/vocab.txt" -Force
+
+          # Granite embedding model.  Required on every platform -- the
+          # post-build target copies the whole models/granite/ subtree
+          # into $(OutDir), so failing here means the download step
+          # never populated it.
+          $granite = "$($p.src)/models/granite"
+          if (!(Test-Path $granite)) {
+            throw "Missing $granite -- the granite-embedding-small-english-r2 model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download sentence-encoder model' step should have populated models/granite/."
+          }
+          Copy-Item $granite "$staging/models/granite" -Recurse -Force
+          Write-Host "Bundled granite-embedding-small-english-r2 into $staging/models/granite"
+
+          if ($p.hasLlm) {
+            # Required: ORT-GenAI runtime + Qwen3-0.6B model subtree.
+            $genaiDll = "$($p.src)/onnxruntime-genai.dll"
+            if (!(Test-Path $genaiDll)) {
+              throw "Missing $genaiDll -- the LLM polishing layer is mandatory for $($p.arch) but its runtime DLL was not produced by the build."
+            }
+            Copy-Item $genaiDll "$staging/onnxruntime-genai.dll" -Force
+
+            $qwen = "$($p.src)/models/qwen"
+            if (!(Test-Path $qwen)) {
+              throw "Missing $qwen -- the Qwen3-0.6B model subtree is mandatory for $($p.arch) but was not staged into the build output.  The 'Download LLM polishing model' step should have populated models/qwen/."
+            }
+            Copy-Item $qwen "$staging/models/qwen" -Recurse -Force
+            Write-Host "Bundled Qwen3-0.6B model into $staging/models/qwen"
+          }
+          else {
+            # x86: explicitly skip the LLM artefacts even if the
+            # post-build target somehow copied them (defence in depth).
+            Write-Host "Skipping Qwen model bundle for $($p.arch) (LLM polishing layer unavailable on this platform)"
+          }
+
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Write-Host "Staged $($p.arch): $staging"
         }
@@ -115,3 +218,49 @@ jobs:
         name: WARP-${{ steps.branch.outputs.label }}-x86
         path: artifacts/x86
         if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Python test suite (TEST_PLAN.md L1 + L1-property + L2 layers).
+  #
+  # Runs in parallel with `build` since it has no MSBuild / model-file
+  # dependency -- only Python + pytest + hypothesis (installed in
+  # ~5 s).  Full pytest suite completes in < 10 s.  Fully local: no
+  # cloud LLM, no API key, no model download.
+  #
+  # Trigger independently:
+  #   .\tests\run_tests.ps1                # everything
+  #   .\tests\run_tests.ps1 -Layer l1      # just L1
+  #   python tests/run_tests.py --list     # discovery
+  # ----------------------------------------------------------------
+  tests:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+        cache-dependency-path: tests/requirements.txt
+
+    - name: Install test dependencies
+      run: |
+        python -m pip install --quiet --disable-pip-version-check -r tests/requirements.txt
+
+    - name: Run L1 deterministic tests
+      run: python tests/run_tests.py --tier python --layer l1
+
+    - name: Run L1 property-based tests (Hypothesis)
+      run: python tests/run_tests.py --tier python --layer l1_property
+
+    - name: Run L2 model-contract + adversarial tests
+      run: python tests/run_tests.py --tier python --layer l2
+
+    - name: Run L3 eval / quality tests
+      run: python tests/run_tests.py --tier python --layer l3
+
+    - name: Run legacy standalone scripts (regression smoke)
+      run: python tests/run_tests.py --tier scripts

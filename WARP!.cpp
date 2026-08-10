@@ -13,6 +13,7 @@
 #include "QueryApi.h"
 #include "InferenceEngine.h"
 #include "ContextInference.h"
+#include "LlmSummarizer.h"
 #include "LaunchCorrelator.h"
 #include "ForegroundChangeBroker.h"
 
@@ -111,6 +112,7 @@ IdleDetector        g_idleDetector;
 QueryApi            g_queryApi;
 InferenceEngine     g_inference;
 ContextInference    g_contextInference;
+LlmSummarizer       g_llmSummarizer;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -486,12 +488,12 @@ void CreateUIControls(HWND hWnd, HINSTANCE hInstance)
     SendMessageW(g_hBtnInferLookup, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
     // Recent context buttons (latest snapshot + last-N history)
-    g_hBtnRecentContext = CreateWindowW(L"BUTTON", L"Show Recent Context",
+    g_hBtnRecentContext = CreateWindowW(L"BUTTON", L"Show Context Summary",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
         0, 0, 0, 0, hWnd, (HMENU)IDB_RECENT_CONTEXT, hInstance, nullptr);
     SendMessageW(g_hBtnRecentContext, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
 
-    g_hBtnContextHistory = CreateWindowW(L"BUTTON", L"Show Context History (last 10)",
+    g_hBtnContextHistory = CreateWindowW(L"BUTTON", L"Show Summary History (last 10)",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
         0, 0, 0, 0, hWnd, (HMENU)IDB_CONTEXT_HISTORY, hInstance, nullptr);
     SendMessageW(g_hBtnContextHistory, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
@@ -1331,14 +1333,16 @@ void StartSubsystems()
 
     g_queryApi.Start(&g_db, &g_inference, &g_contextInference);
 
-    // Initialize and start the dynamic context inference engine.  If the
-    // sentence-encoder model files are present (`models/bge-small.onnx` or
-    // legacy `models/minilm.onnx`, plus `models/vocab.txt`) next to the exe
-    // -- or under `%LOCALAPPDATA%\WARP\models` -- the engine
-    // uses the model to **dynamically cluster** the per-app descriptions seen in
-    // the rolling 15-min window.  No pre-defined topic buckets are involved;
-    // clusters emerge from the actual document/tab/app titles.  If the model
-    // is absent the engine falls back to a deterministic per-app composition.
+    // Initialize and start the dynamic context inference engine.  If
+    // the sentence-encoder model files are present
+    // (`models/granite/model_quantized.onnx` + the extracted
+    // tokenizer files) next to the exe -- or under
+    // `%LOCALAPPDATA%\WARP\models` -- the engine uses the model to
+    // **dynamically cluster** the per-app descriptions seen in the
+    // rolling 15-min window.  No pre-defined topic buckets are
+    // involved; clusters emerge from the actual document/tab/app
+    // titles.  If the model is absent the engine falls back to a
+    // deterministic per-app composition.
     {
         std::wstring modelsDir;
         wchar_t exePath[MAX_PATH] = { 0 };
@@ -1367,6 +1371,23 @@ void StartSubsystems()
             }
         }
         g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
+
+        // Wire the confidence-weighted per-entity store so the
+        // dynamic context inference can bias its ranking and
+        // clustering by historical recency + 7-day popularity
+        // instead of re-deriving those signals from the raw event
+        // tables.  Best-effort: passing nullptr (or skipping this
+        // call entirely) keeps the legacy in-window-focus-only
+        // behaviour.
+        g_contextInference.SetInferenceEngine(&g_inference);
+
+        // Best-effort init of the optional LLM polishing layer.  When
+        // the Qwen3 model files aren't on disk this returns false
+        // and Polish() calls become no-ops; nothing in the pipeline
+        // regresses.
+        if (g_llmSummarizer.Init(modelsDir))
+            g_contextInference.SetLlmSummarizer(&g_llmSummarizer);
+
         g_contextInference.Start(&g_db, &g_foregroundMonitor);
     }
 }
@@ -1628,6 +1649,7 @@ void OnInferenceButton(HWND hWnd, int id)
 void StopSubsystems()
 {
     g_contextInference.Stop();
+    g_llmSummarizer.Stop();
     g_queryApi.Stop();
     g_idleDetector.Stop();
     g_foregroundMonitor.Stop();

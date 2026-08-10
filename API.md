@@ -94,7 +94,7 @@ retrieve this history as structured JSON, optionally filtered by event type.
 | Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
 | Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
 | Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
-| Dynamic context awareness | Use `GetRecentContext` for the latest one-liner of what the user is doing right now (e.g., *"Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks"*); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
+| Dynamic context awareness | Use `GetRecentContext` for the latest **context summary** (1–3 phrase lines describing what the user is doing right now — e.g., `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
 
 ---
 
@@ -276,14 +276,15 @@ you received in the previous response to get only new/updated records.
 
 #### GetRecentContext
 
-Retrieve the **latest** one-liner snapshot from the `ContextInference`
-summarizer. This operation has no parameters.
+Retrieve the **latest context-summary** snapshot from the `ContextInference`
+summarizer.  The summary is a JSON array of 1–3 short phrase lines (one per
+cluster of activity) that describe what the user is actively doing.
 
-Every 60 seconds, WARP gathers all activities from the last 15-minute window
+Every 60 seconds, WARP gathers all activities from the lookback window
 (overlaying the user's currently-active foreground window as a virtual focus
 row), classifies each app via a layered classifier (~80-entry exact-match table
-→ vendor-path heuristics → exe-name fallback), and composes a single
-human-readable one-liner that names the actual documents, browser tabs, and
+→ vendor-path heuristics → exe-name fallback), and composes a human-readable
+context summary that names the actual documents, browser tabs, and
 apps the user is working with — not a fixed bucket label.
 
 ```json
@@ -296,7 +297,7 @@ apps the user is working with — not a fixed bucket label.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which one-liner is surfaced as the top-level `one_liner` field **and** the response shape: `"all"` returns the combined line plus all three per-category lines; any other value returns only the matching category's one-liner. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
+| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which summary is surfaced as the top-level `summary` field **and** the response shape: `"all"` returns the combined summary plus all three per-category summaries; any other value returns only the matching category's summary. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
 | `window_seconds` | `integer` | `900` (= 15 min) | Activity lookback span. Snapped to the nearest of: 300, 900, 1800, 3600, 7200, 21600, 86400, 604800, 1296000, 2592000 (5 min, 15 min, 30 min, 1 h, 2 h, 6 h, 24 h, 7 d, 15 d, 30 d). 15 min serves the cached snapshot from the 60-sec timer; any other value composes fresh on demand. |
 
 The response is grounded in observed window titles and tab names, so it stays
@@ -325,7 +326,7 @@ memory for an LLM agent, or rendering a "what was I doing" timeline.
 | `window_seconds` | `integer` | `900` | Filters history to snapshots whose `timestamp` falls within the last `window_seconds`.  Larger values include more historical rows; each row's underlying compute window stays at the rolling-history cadence (15 min). |
 
 History entries are de-duplicated on append: a new snapshot is recorded only on
-**material change** — different one-liner, different dominant app, or a
+**material change** — different summary, different dominant app, or a
 5-minute heartbeat — so the returned list reflects context *transitions*
 rather than 60-second polling artifacts.
 
@@ -550,13 +551,16 @@ Each section has:
 The shape varies with the requested `category`:
 
 * **`category == "all"` (default).** The response carries the **combined**
-  one-liner as `one_liner` plus all three per-category one-liners
-  (`one_liner_files` / `_websites` / `_apps`), so a UI that wants to
+  summary as `summary` plus all three per-category summaries
+  (`summary_files` / `_websites` / `_apps`), so a UI that wants to
   switch facets locally can do so without re-querying.
 * **`category == "files" | "websites" | "apps"`.** Only the matching
-  per-category one-liner is returned (as `one_liner`). The other
-  categories — including the combined "all" line — are **omitted**, keeping
-  the response focused on what the caller asked for.
+  per-category summary is returned (as `summary`). The other
+  categories — including the combined "all" summary — are **omitted**,
+  keeping the response focused on what the caller asked for.
+
+Each `summary` is a JSON **array** of 1–3 short phrase strings (one per
+cluster of activity).  Consumers render them as separate lines.
 
 **Example — `category == "all"`, `window_seconds = 900`:**
 
@@ -568,15 +572,19 @@ The shape varies with the requested `category`:
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "all",
-    "one_liner": "Working on Context Inference (across Visual Studio & Edge) · Discussing Daily Standup (across Outlook & Teams) · Researching React Hooks",
-    "one_liner_files":    "Editing Context Inference module · Drafting Daily Standup notes",
-    "one_liner_websites": "Researching React Hooks · Reviewing GitHub PR for ContextInference",
-    "one_liner_apps":     "Discussing in Slack & Teams · Triaging Outlook inbox",
+    "summary": [
+      "Working on Context Inference (across Visual Studio & Edge)",
+      "Discussing Daily Standup (across Teams & Outlook)",
+      "Researching React Hooks"
+    ],
+    "summary_files":    ["Editing Context Inference module", "Drafting Daily Standup notes"],
+    "summary_websites": ["Researching React Hooks", "Reviewing GitHub PR for ContextInference"],
+    "summary_apps":     ["Discussing in Slack & Teams", "Triaging Outlook inbox"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "bge-small-en-v1.5",
+    "model": "granite-embedding-small-english-r2",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [
@@ -603,12 +611,12 @@ The shape varies with the requested `category`:
     "window_end": 1750012345,
     "window_seconds": 900,
     "category": "files",
-    "one_liner": "Editing Context Inference module · Drafting Daily Standup notes",
+    "summary": ["Editing Context Inference module", "Drafting Daily Standup notes"],
     "activity_count": 47,
     "focus_seconds": 812,
     "dominant_focus_pct": 61.4,
     "confidence": 0.84,
-    "model": "bge-small-en-v1.5",
+    "model": "granite-embedding-small-english-r2",
     "thread_count": 3,
     "signal_types": ["focus", "file", "browsing"],
     "items": [ /* same shape as above; always reflects the All clustering */ ]
@@ -625,33 +633,35 @@ The shape varies with the requested `category`:
 | `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds, UTC). |
 | `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` after normalisation to the nearest allowed value. |
 | `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
-| `one_liner` | `string` | Human-readable summary of what the user is actively doing. Equals the **combined** line when `category == "all"`; equals the matching per-category line otherwise. |
-| `one_liner_files` | `string` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
-| `one_liner_websites` | `string` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
-| `one_liner_apps` | `string` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
+| `summary` | `string[]` | Array of 1–3 short phrase lines describing what the user is actively doing. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
+| `summary_files` | `string[]` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
+| `summary_websites` | `string[]` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
+| `summary_apps` | `string[]` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
 | `activity_count` | `integer` | Total activities examined in the window. |
 | `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
 | `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
 | `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"bge-small-en-v1.5"` when the BGE-small ONNX sentence-encoder is loaded; `"all-MiniLM-L6-v2"` when the legacy MiniLM model is the only one present (transparent backward-compat fallback); `"deterministic"` when no model file was found. |
+| `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded; `"deterministic"` when no model file was found. Older BGE-small / MiniLM fallbacks were removed in v5.16. |
+| `model_polish` | `string` | `"qwen3-0.6b"` when the Qwen3 "brain" model is loaded -- as of v5.17 it acts as a *gated refiner* on top of the deterministic rich-listing summary (its prose replaces the listing only when it is at least as grounded in the window titles, measured by granite cosine). `"(not loaded)"` when the model isn't present; the rich-listing summary stands alone. Field name retained for backward compatibility. |
+| `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
 | `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
 | `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the one-liner shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
+| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the summary shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
 | `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
 
 **Notes:**
-- If no activities occurred in the 15-minute window, `one_liner` will be
-  `"User appears to be idle"` and `items[]` will be empty.
+- If no activities occurred in the lookback window, `summary` will be an
+  array containing `"User appears to be idle"` and `items[]` will be empty.
 - The summarizer runs every 60 seconds. Calling `GetRecentContext` between
   runs returns the result from the most recent completed cycle.
 - Snapshots are stored in memory (not persisted to disk). Restarting WARP
   clears the history.
 - The composer uses the sentence-encoder for **dynamic clustering, not bucket matching** —
   there is no fixed taxonomy of topics. Each cluster is induced from the
-  actual document, tab, and app titles in the window. If `models/bge-small.onnx`
-  (or the legacy `models/minilm.onnx`) + `models/vocab.txt` are missing the engine still runs and emits
+  actual document, tab, and app titles in the window. If the granite model
+  files under `models/granite/` are missing the engine still runs and emits
   `"model": "deterministic"`; consumers should treat both modes as a single
-  interface and just read `one_liner` / `items` / `thread_id` as documented.
+  interface and just read `summary` / `items` / `thread_id` as documented.
 
 ### GetRecentContexts Response
 
@@ -662,12 +672,12 @@ The shape varies with the requested `category`:
       "timestamp": 1750012345,
       "window_start": 1750011445,
       "window_end": 1750012345,
-      "one_liner": "Working on Context Inference (across Visual Studio & Edge) · + 2 other threads",
+      "summary": ["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "+ 2 other threads"],
       "activity_count": 47,
       "focus_seconds": 812,
       "dominant_focus_pct": 61.4,
       "confidence": 0.84,
-      "model": "bge-small-en-v1.5",
+      "model": "granite-embedding-small-english-r2",
       "thread_count": 3,
       "signal_types": ["focus", "file", "browsing"],
       "items": [ /* … same shape as GetRecentContext … */ ]
@@ -676,12 +686,12 @@ The shape varies with the requested `category`:
       "timestamp": 1750012045,
       "window_start": 1750011145,
       "window_end": 1750012045,
-      "one_liner": "Researching React Hooks · Reading about API Reference",
+      "summary": ["Researching React Hooks", "Reading about API Reference"],
       "activity_count": 31,
       "focus_seconds": 712,
       "dominant_focus_pct": 48.9,
       "confidence": 0.71,
-      "model": "bge-small-en-v1.5",
+      "model": "granite-embedding-small-english-r2",
       "thread_count": 2,
       "signal_types": ["focus", "browsing"],
       "items": [ /* … */ ]
@@ -731,7 +741,7 @@ The shape varies with the requested `category`:
 | Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
 | `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
 | `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
-| `GetRecentContext` returns an empty `one_liner` and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
+| `GetRecentContext` returns an empty `summary` array and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
 | `GetRecentContexts` returns `"recent_contexts": []` | History is empty (just started, or `ClearAll` was called). `history_count` will also be `0`. |
 | Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
 
@@ -924,23 +934,24 @@ For short-term memory or context drift over time, call:
 Snapshots are returned newest-first with material-change dedup, so the list
 reflects context *transitions* rather than 60-second polling artifacts.
 
-The composer uses a BERT WordPiece sentence-encoder (`BAAI/bge-small-en-v1.5`
-by default, with `sentence-transformers/all-MiniLM-L6-v2` supported as a
-transparent backward-compat fallback) for **dynamic semantic
-clustering** *and* **theme distillation** — *not* mapping to a fixed
-taxonomy. Two activities are merged into one *thread of work* iff their
-embeddings are similar to each other (cosine ≥ 0.65), and within each
-thread the dominant content tokens (after stripping stop-words, file
-extensions, and brand/app names) are scored by `frequency × (1 +
-cosine-to-cluster-centroid)` — the top 1-2 are emitted as the theme
-phrase. The verb is selected from a small fixed set (`Working on`,
-`Reviewing`, `Researching`, `Reading about`, `Discussing`, …) based on
-the dominant app type and content keywords. The verbatim per-app titles
-remain available in `items[]` for consumers that want them. If the
-model files are missing the engine still runs and reports
-`"model": "deterministic"` — themes are extracted by frequency alone,
-and clusters that yield no usable content tokens fall back to the
-prior verbatim format `<verb> "<title>" in <app>`.
+The composer uses `ibm-granite/granite-embedding-small-english-r2`
+(ModernBERT byte-level BPE, COIR-trained for code retrieval, 384-dim)
+when its files are present. Older BGE-small / MiniLM fallbacks were
+removed in v5.16; if the granite files are missing the engine still
+runs and reports `"model": "deterministic"`. The encoder drives
+**dynamic semantic clustering** *and* **theme distillation** — *not*
+mapping to a fixed taxonomy. Two activities are merged into one
+*thread of work* iff their embeddings are similar to each other
+(cosine ≥ 0.65), and within each thread the dominant content tokens
+(after stripping stop-words, file extensions, and brand/app names) are
+scored by `frequency × (1 + cosine-to-cluster-centroid)` — the top 1-2
+are emitted as the theme phrase. The verb is selected from a small
+fixed set (`Working on`, `Reviewing`, `Researching`, `Reading about`,
+`Discussing`, …) based on the dominant app type and content keywords.
+The verbatim per-app titles remain available in `items[]` for
+consumers that want them. In deterministic mode themes are extracted
+by frequency alone, and clusters that yield no usable content tokens
+fall back to the prior verbatim format `<verb> "<title>" in <app>`.
 
 ---
 
@@ -1006,7 +1017,7 @@ int main()
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
 
-    // Latest one-liner snapshot
+    // Latest context summary snapshot
     const char* req1 = R"({"op":"GetRecentContext"})";
     DWORD written = 0;
     WriteFile(hPipe, req1, (DWORD)strlen(req1), &written, nullptr);
@@ -1250,12 +1261,12 @@ data = query_warp({"window": "2h", "types": ["browsing"]})
 for e in data.get("browsing_activities", {}).get("events", []):
     print(f"  [{e['browser']}] {e['title']}")
 
-# --- Example: GetRecentContext (latest one-liner) ---
+# --- Example: GetRecentContext (latest context summary) ---
 context = query_warp({"op": "GetRecentContext"})
 rc = context.get("recent_context", {})
 print(f"\nCurrent context (confidence {rc.get('confidence', 0):.2f}, "
       f"{rc.get('activity_count', 0)} activities):")
-print(f"  {rc.get('one_liner', '(none)')}")
+print('  ' + ' / '.join(rc.get('summary', []) or ['(none)']))
 for item in rc.get("items", []):
     print(f"    - {item['app']}: {item['title']}  ({item['pct']:.0f}%)")
 
@@ -1263,7 +1274,7 @@ for item in rc.get("items", []):
 hist = query_warp({"op": "GetRecentContexts", "count": 20})
 print(f"\nLast {hist.get('returned', 0)} context snapshots:")
 for snap in hist.get("recent_contexts", []):
-    print(f"  [{snap['timestamp']}] {snap['one_liner']}")
+    print(f"  [{snap['timestamp']}] {' / '.join(snap.get('summary', []))}")
 
 # --- Example: QueryInferences for specific files ---
 inference = query_warp({
@@ -1343,7 +1354,7 @@ $browse.browsing_activities.events |
 $context = Query-Warp '{"op":"GetRecentContext"}'
 $rc = $context.recent_context
 Write-Host "`nCurrent context (confidence $([math]::Round($rc.confidence,2)), $($rc.activity_count) activities):"
-Write-Host "  $($rc.one_liner)"
+Write-Host "  $(($rc.summary -join ' / '))"
 foreach ($item in $rc.items) {
     Write-Host "    - $($item.app): $($item.title)  ($([math]::Round($item.pct,0))%)"
 }
@@ -1352,7 +1363,7 @@ foreach ($item in $rc.items) {
 $hist = Query-Warp '{"op":"GetRecentContexts","count":20}'
 Write-Host "`nLast $($hist.returned) context snapshots:"
 foreach ($snap in $hist.recent_contexts) {
-    Write-Host "  [$($snap.timestamp)] $($snap.one_liner)"
+    Write-Host "  [$($snap.timestamp)] $(($snap.summary -join ' / '))"
 }
 
 # QueryInferences for specific files
@@ -1451,7 +1462,7 @@ function queryWarp(request) {
         const context = await queryWarp({ op: 'GetRecentContext' });
         const rc = context.recent_context || {};
         console.log(`\nCurrent context (confidence ${(rc.confidence || 0).toFixed(2)}, ${rc.activity_count || 0} activities):`);
-        console.log(`  ${rc.one_liner || '(none)'}`);
+        console.log(`  ${(rc.summary || []).join(' / ') || '(none)'}`);
         for (const item of (rc.items || [])) {
             console.log(`    - ${item.app}: ${item.title}  (${item.pct.toFixed(0)}%)`);
         }
@@ -1460,7 +1471,7 @@ function queryWarp(request) {
         const hist = await queryWarp({ op: 'GetRecentContexts', count: 20 });
         console.log(`\nLast ${hist.returned || 0} context snapshots:`);
         for (const snap of (hist.recent_contexts || [])) {
-            console.log(`  [${snap.timestamp}] ${snap.one_liner}`);
+            console.log(`  [${snap.timestamp}] ${(snap.summary || []).join(' / ')}`);
         }
 
         // QueryInferences -- get recency scores for specific files
@@ -1698,7 +1709,466 @@ CREATE INDEX idx_inference_version    ON inference(version);
 
 ---
 
-*This documentation describes WARP API version 5.6.*
+*This documentation describes WARP API version 5.17.*
+
+*Changes from v5.16:*
+- ***Canonical summary is now a rich deterministic listing, not the
+  LLM output.***  Through v5.16 the Qwen3-0.6B "brain" generated the
+  user-facing `summary` (overwriting the algorithmic output).  An A/B
+  harness over 12 realistic scenarios -- running the actual Qwen3-0.6B
+  + granite encoder locally and scoring against human-authored gold
+  summaries with granite cosine + ROUGE-L + token coverage -- showed
+  this was a net loss:
+    - The 0.6B model's output was **rejected by the grounding gate
+      75-90% of the time** (it copies the few-shot examples or trips
+      the hallucination check), so the user was usually shown the
+      terse 1-token cluster theme (e.g. *"Working on Auth
+      Middleware"*) -- the "average and generic" summaries.
+    - When the LLM output *was* accepted it was, on average, **less
+      grounded** in the actual titles than a plain listing (granite
+      cos-to-titles 0.906 vs 0.920), because the 0.6B model drops
+      activity breadth.
+    - A 0.6B model fundamentally **cannot abstract** diverse titles
+      into a higher-level intent (*"auth_middleware.cpp + login.ts +
+      session.go"* -> *"authentication system"*); all it can do is
+      rephrase/list -- less completely than a deterministic listing.
+  The new `ComposeRichListing` composes
+  *"User is working on auth middleware, login handler and session
+  store in Visual Studio Code"* from the top distinct cleaned title
+  phrases.  Versus the prior summary it scored: granite cos-to-gold
+  **+0.016 (8 wins / 3 losses)**, cos-to-titles **+0.049**, ROUGE-L
+  **+0.205 (+80%)**, specificity **2x**, zero new hallucinations --
+  at **zero inference cost** and **full determinism**.  It also
+  *matches* an expensive best-of-N LLM on semantic fidelity.
+- ***The Qwen3 LLM is retained as a gated refiner, not removed.***
+  When loaded, its prose may still replace the listing -- but only
+  when it is at least as grounded in the window titles as the listing
+  (granite cosine, with a small tolerance).  So it can only help
+  (cleaner prose for a single-topic facet), never regress below the
+  much-better listing floor.  No new CPU cost: the LLM already ran in
+  v5.16; v5.17 adds a rich-listing floor + a groundedness check
+  (3 cheap granite embeds per facet).
+- ***No JSON shape change.***  `summary` / `summary_files` /
+  `summary_websites` / `summary_apps` / `summary_embedding` /
+  `model_polish` are unchanged on the wire; only the *content* of the
+  summary fields improves.  `model_polish` still reports `"qwen3-0.6b"`
+  vs `"(not loaded)"`.
+
+*Changes from v5.15:*
+- ***Removed BGE-small and MiniLM as supported sentence-encoder
+  fallbacks.***  The production stack has been granite + qwen
+  exclusively since v5.11, but the BGE-small and MiniLM fallback code
+  paths were still in `ContextInference::Init()` / `Embed()` and the
+  build pipeline was still downloading + bundling
+  `models/bge-small.onnx` + `models/vocab.txt` into every shipped
+  artefact (~130 MB).  None of this contributed to a customer-visible
+  configuration, but it inflated the test surface (the v5.14
+  fallback matrix had 8 rows), the shipped artefact size, and the
+  CI download time.
+- ***What was removed.***
+    - `BertTokenizer.h` header (WordPiece tokenizer used only by the
+      BGE / MiniLM paths).
+    - `ContextInference::m_tokenizer` (BertTokenizer member) and
+      `ContextInference::m_useGranite` (now always implicitly true
+      when `m_modelReady` is true).
+    - The Path-2 / Path-3 fallback branches in `Init()` -- it now
+      tries granite only.
+    - The BGE / MiniLM branch in `Embed()` (token-type-ids input,
+      manual mean-pool over `last_hidden_state`).
+    - The BGE-small download step in `.github/workflows/build.yml`
+      and the corresponding staging copy.
+    - The `bge-small.onnx` / `minilm.onnx` / `vocab.txt` post-build
+      copy targets in `WARP!.vcxproj`.
+- ***What didn't change (deliberately).***
+    - `model` field on snapshots still uses the same value strings;
+      with this change the only valid values are
+      `"granite-embedding-small-english-r2"` and `"deterministic"`.
+    - When granite is absent the engine still degrades gracefully
+      to deterministic mode (no semantic clustering, no
+      `summary_embedding`) -- identical to the v5.15
+      "no model file at all" behaviour.
+    - `summary_embedding` is still emitted in the same format when
+      granite IS loaded; nothing on the wire changes for normal
+      operation.
+- ***Effect on consumers.***  None for the granite-loaded path.  The
+  only observable change is that snapshots no longer report
+  `"bge-small-en-v1.5"` or `"all-MiniLM-L6-v2"` in the `model`
+  field, and the shipped zip is ~130 MB smaller (the BGE files were
+  the only sub-100-MB-per-platform component still in the bundle
+  after the v5.12 reorg).
+
+*Changes from v5.14:*
+- ***Fixed a recurring hallucination where the LLM-as-brain layer
+  would copy a few-shot example out of the system prompt verbatim
+  whenever the input loosely matched the example's app set.***  Most
+  visible failure mode: the model emitted
+  `"User is reading about indexer reliability across their emails
+  and chats (Outlook, Microsoft Teams)."` whenever the user had
+  Outlook + Teams open, regardless of what was actually in the
+  window titles.  This was the literal text of the few-shot
+  example, sometimes with a stray trailing `)` appended.
+- ***Root cause.***  The old grounding gate required only *at least
+  one* >= 4-char token from the LLM output to appear in the input.
+  For the indexer-reliability leak, the example mentioned the same
+  app names ("outlook", "teams") that the user actually had open,
+  so the leak was technically partially grounded -- enough to pass
+  the loose gate, even though the topic tokens ("indexer",
+  "reliability") were pure invention.
+- ***Fix (two-pronged).***
+    - Tightened the post-processing grounding gate in `Polish()`:
+      every >= 4-char *topic-bearing* token in the LLM output must
+      appear in the input items (app names, cleaned title, raw
+      title) or in the algorithmic topic hint.  Topic-bearing means
+      "not a discourse marker, generic verb, app-type noun, or
+      function word" -- those are weeded out via an explicit
+      `DiscourseStops()` set so the gate doesn't reject legitimate
+      connective text.  Fuzzy prefix/suffix match catches compound
+      tokens (e.g. `m365copilot` in the output matches `m365` +
+      `copilot` in input).
+    - Replaced the three concrete few-shot examples in the system
+      prompt with abstract placeholders (Q3 budget / customer
+      onboarding / team announcements) that are less domain-y and
+      explicitly labelled "do NOT copy their topic words; the
+      topic must come from the actual window titles you are
+      given".  Both layers (less-sticky examples + post-processing
+      gate) work together so even if the model still attempts a
+      verbatim copy, the gate drops the line.
+- ***Behavioural effect.***  Hallucinated lines are silently dropped
+  during post-processing.  If every generated line is rejected,
+  `Polish()` returns empty and the snapshot falls back to the
+  algorithmic cluster->theme summary (still correct, just less
+  natural).  False-positive rejections of legitimate phrasings are
+  the explicit design trade-off: showing the user invented content
+  is worse than showing them slightly-less-polished prose.
+- ***Pinned via test fixture.***  `scripts/test_hallucination_guard.py`
+  is a pure-Python port of the C++ guard that locks down 8 reject
+  cases (the original bug plus 7 related leak patterns) and 7
+  accept cases (legitimate rewrites, compound-word matching, etc.).
+  Run it before changing `DiscourseStops()` or `IsHallucination()`
+  in `LlmSummarizer.cpp`.
+
+*Changes from v5.13:*
+- ***Dynamic context inference now builds on top of the
+  confidence-weighted per-entity InferenceEngine instead of recomputing
+  recency / popularity from raw activity tables.***  Every snapshot
+  compose now does a single batch lookup against the inference store
+  (keyed by lowercased file path, exe path, or URL/title) and
+  multiplicatively boosts each in-window entry's effective focus
+  seconds by:
+
+      boost = 1 + log1p(recency_score / 50) + log1p(open_count_7d / 5)
+
+  Range: 1.0x (unknown entity) .. ~5.3x (high-recency, frequently-opened
+  entity).  The boost only changes ranking when in-window focus seconds
+  are comparable; a 10-minute focused session at 1.0x still wins over
+  a 5-minute session at 5.3x.
+- ***Why this is a strict win:***
+    - (a) **Consistency.**  The dynamic context summary and the
+      per-entity inference now agree on which entities matter.  A file
+      with recency_score=200 and open_count_7d=20 in the inference store
+      will no longer tie or lose to a similarly-focused but unknown
+      entity in the per-snapshot ranking.
+    - (b) **No wheel reinvention.**  The InferenceEngine already
+      maintains the exponential-decay recency score (TAU=48h) and
+      rolling open counts incrementally on every raw event with
+      confidence weighting applied at capture time.  Snapshots now
+      consume those precomputed weights instead of recomputing their
+      own popularity signal from `lastSeenTs` / visit count.
+    - (c) **Per-event confidence weighting flows through.**  A 30 s
+      focus session that the noise filter scored confidence=0.3
+      contributes less to open_count_7d than a confidence=1.0 session
+      of the same length.  By boosting via open_count_7d, the dynamic
+      context inference now inherits that confidence weighting without
+      having to re-read the per-event `confidence` column.
+- ***User-facing fields unchanged.***  `focus_seconds`,
+  `dominant_focus_pct`, and `items[].pct` continue to report **raw**
+  in-window dwell time -- the boost is an internal ranking signal that
+  never leaks into a user-visible percentage.  Otherwise "100% of
+  focus" would lose its meaning when a single boosted entry crossed
+  the raw window total.
+- ***Graceful degradation.***  When the InferenceEngine is not wired
+  (unit tests, custom embedders), `weightedFocusSecs` falls back to
+  `totalFocusSecs` and the ranking is identical to pre-v5.14
+  behaviour.
+
+*Changes from v5.12:*
+- ***Removed the `summary_polished` field (and the per-facet
+  `summary_files_polished` / `summary_websites_polished` /
+  `summary_apps_polished` variants) from the snapshot JSON.***  Under
+  the v5.12 "LLM-as-brain" architecture these fields were just
+  backward-compat aliases that always carried the same content as
+  `summary` / `summary_files` / `summary_websites` / `summary_apps`,
+  doubling the JSON payload for no information gain.  Consumers
+  should now read the canonical `summary*` fields directly.  The
+  `model_polish` string field is retained (still reports
+  `"qwen3-0.6b"` or `"(not loaded)"`) so callers can still tell
+  which pipeline produced the summary.
+- ***No semantic change.***  The summary content, the cluster->theme
+  topic-hint feeder, the LLM-as-brain rewrite step, and the granite
+  `summary_embedding` translator step all behave exactly as in v5.12 --
+  only the redundant alias fields were dropped from the wire format.
+
+*Changes from v5.11:*
+- ***New architecture: LLM as brain, granite as translator.***  The
+  cluster->theme algorithmic pipeline now runs as an INTERNAL topic
+  hint feeder for the Qwen3-0.6B LLM rather than as the user-facing
+  summary source.  When the LLM is loaded, the four summary fields
+  (`summary` + per-facet `summary_files` / `summary_websites` /
+  `summary_apps`) are GENERATED DIRECTLY BY THE LLM from the raw item
+  titles, with the algorithmic cluster->theme output passed as a
+  topic hint to keep grounding tight.  When the LLM isn't loaded,
+  `summary` falls back to the algorithmic cluster->theme output
+  unchanged -- graceful degradation.
+  *(In v5.12 these fields were mirrored into legacy `*_polished`
+  aliases; those aliases were removed in v5.13 -- see above.)*
+- ***New field: `summary_embedding` (float[384]).***  After the
+  canonical summary is finalized, the granite encoder produces a
+  384-dim L2-normalized vector representation of the joined summary
+  lines.  Suitable for similarity search / clustering across
+  snapshots in downstream consumers.  Always present in the response
+  (empty array when the granite model isn't loaded or the summary is
+  empty).  Floats are emitted with 6-decimal precision; total payload
+  is ~3-4 KB per snapshot.
+- ***Why this swap solved the previous quality complaints:***  earlier
+  revisions ran a two-stage pipeline (algorithmic `summary` +
+  Qwen3-polished `summary_polished`) where the two stages competed
+  for the user's attention -- if the polished version was
+  app-listing or hallucinated, the algorithmic version next to it
+  highlighted the contrast.  Promoting the LLM output to be the
+  canonical `summary` (with the algorithmic output as an internal
+  topic hint) eliminates that competition: there is one summary, it
+  reads as natural prose, and the topic hint from the cluster
+  pipeline keeps it grounded in the actual titles.
+
+*Changes from v5.10:*
+- ***Embedding model upgraded from `BAAI/bge-small-en-v1.5` to
+  `ibm-granite/granite-embedding-small-english-r2`.***  The dynamic
+  context-inference clusterer now uses the ModernBERT-based granite
+  encoder (47 M params, 384-dim, Apache 2.0, August 2025) instead of
+  BGE-small.  Granite is explicitly trained on COIR (Code Information
+  Retrieval) so it handles the code-heavy window titles WARP sees
+  (`auth.cpp`, `useEffect`, `node_modules`, `OnnxRuntimeGenAI`)
+  far better than BGE-small's WordPiece tokenizer, which would
+  shatter such tokens into 4-6 sub-pieces and dilute the semantic
+  signal.  Same 384-dim output -> the existing 0.65 cluster cosine
+  threshold and downstream theme/verb scoring are unchanged.
+  BGE-small + MiniLM remain as transparent fallbacks if the granite
+  files aren't present.
+- ***New: hand-rolled `ModernBertTokenizer.h`*** -- a header-only
+  byte-level BPE tokenizer modelled on the existing
+  `BertTokenizer.h` pattern (no JSON parser, no new NuGet packages).
+  Loads three flat artefacts produced at CI time from the upstream
+  `tokenizer.json` via `scripts/extract_modernbert_tokenizer.py`:
+  `vocab.txt` (one byte-level-encoded token per line, line N = id
+  N), `merges.txt` (one space-separated pair per line, in HF rank
+  order), and `special_tokens.txt` (cls/sep/pad/unk/mask IDs).
+  Implements NFC normalisation via Windows `NormalizeString`, the
+  standard 256-entry GPT-2 byte->visible-codepoint map, a
+  GPT-2-style pre-tokenizer hand-coded as a UTF-8 state machine
+  (English contractions, Unicode-block letter/digit/whitespace
+  classifiers, the `\s+(?!\S)` carve-out), and the lowest-rank-merge
+  BPE loop with the `ignore_merges` fast path.  Verified
+  **bit-exact** against `transformers.AutoTokenizer` for 15
+  representative inputs (ASCII code-y titles, contractions, NFC
+  accents, Greek, Japanese, Chinese mixed with English) using
+  `scripts/modernbert_tokenizer_ref.py` (Python spec) +
+  `scripts/tokenizer_test_driver.cpp` (standalone C++ harness).
+- ***`ContextInference::Embed()` is now model-aware:*** for granite
+  it sends `input_ids + attention_mask` (no `token_type_ids`) and
+  reads the model's bundled `sentence_embedding` output directly --
+  the ONNX graph already mean-pools.  The BGE / MiniLM legacy
+  branch still sends the BERT 3-input shape and mean-pools
+  `last_hidden_state` manually.
+- ***Snapshot `model` field*** can now take the value
+  `"granite-embedding-small-english-r2"` in addition to the existing
+  `"bge-small-en-v1.5"`, `"all-MiniLM-L6-v2"`, and `"deterministic"`.
+- ***Fixed: Qwen3 `<think>` block leaking into
+  `summary_polished`.***  Qwen3 ships with chain-of-thought
+  "thinking" mode enabled by default, which caused the polisher to
+  emit reasoning prelude text (`<think>`, `"First, I need to extract
+  the information from the user input..."`, etc.) instead of the
+  actual summary because the 96-token budget was being consumed by
+  the reasoning and never reached the answer.  `LlmSummarizer::
+  BuildPrompt()` now appends the official Qwen3 no-think sentinel
+  `<think>\n\n</think>\n\n` after the assistant header (replicating
+  what `enable_thinking=False` does in the upstream
+  `chat_template.jinja`); `Polish()` also strips any residual
+  `<think>...</think>` block in post-processing as a safety net.
+- ***Build pipeline:*** CI now downloads
+  `onnx-community/granite-embedding-small-english-r2-ONNX`
+  (`model_quantized.onnx` + `model_quantized.onnx_data`, ~52 MB
+  INT8) plus the upstream `tokenizer.json`, runs
+  `extract_modernbert_tokenizer.py` to produce the flat tokenizer
+  files, then drops `tokenizer.json` from the staged artefact to
+  keep the shipped model directory minimal.  The vcxproj copies the
+  entire `models/granite/` subtree at post-build on every platform
+  (x86 included -- granite is a pure ORT-CPU model, no ORT-GenAI
+  dependency).
+
+*Changes from v5.9:*
+- ***LLM polishing model upgraded from Qwen2.5-0.5B-Instruct to
+  `Qwen3-0.6B`.***  The polisher now uses the CPU-INT4 ORT-GenAI
+  bundle `xiaoyao9184/Qwen3-0.6B-onnx-genai`
+  (`cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4`, ~430 MB).
+  Qwen3 is a substantially stronger instruct-tuned model than
+  Qwen2.5 at the sub-1B tier (better instruction following,
+  fewer hallucinations on short structured prompts) while keeping
+  the same `<|im_start|>` / `<|im_end|>` chat template, so the
+  prompt and post-processing pipeline are unchanged.  The
+  `model_polish` field in snapshot responses now reads
+  `"qwen3-0.6b"` when loaded.
+- ***Build pipeline:*** the `Download LLM polishing model` step now
+  fetches the 6-file Qwen3 bundle (`chat_template.jinja`,
+  `genai_config.json`, `model.onnx`, `model.onnx.data`,
+  `tokenizer.json`, `tokenizer_config.json`) instead of the
+  10-file Qwen2.5 layout.  The staging step still bundles the
+  entire `models/qwen/` subtree verbatim, so any future
+  re-packaging works without code changes.
+- ***Dependency bumps required for Qwen3:***
+  `Microsoft.ML.OnnxRuntimeGenAI 0.7.0 -> 0.14.1` (the first
+  release line that registers `"qwen3"` as a supported model type;
+  0.7.0 fails with *unsupported model type* at `OgaCreateModel`)
+  and the transitive `Microsoft.ML.OnnxRuntime 1.22.0 -> 1.23.0`.
+  The C-API surface used by `LlmSummarizer.cpp` (`OgaCreateModel`,
+  `OgaCreateTokenizer`, `OgaTokenizerEncode`,
+  `OgaCreateGeneratorParams`, `OgaCreateGenerator`,
+  `OgaGenerator_AppendTokenSequences`,
+  `OgaGenerator_GenerateNextToken`,
+  `OgaGenerator_GetSequenceData`, `OgaTokenizerDecode` and the
+  matching `OgaDestroy*` entry points) is unchanged across
+  0.7 -> 0.14, and the ORT 1.22 -> 1.23 jump only affects the
+  underlying inference runtime DLL (no source changes needed in
+  `ContextInference.cpp`'s embedding path).
+- ***Embedding model deferred.***  Replacing BGE-small-en-v1.5 with
+  `google/embeddinggemma-300m` was evaluated but **not landed in
+  this revision**.  The architectural incompatibility is real and
+  blocking:
+    - embeddinggemma uses a SentencePiece BPE tokenizer
+      (`tokenizer.model`), whereas the in-tree
+      [`BertTokenizer`](BertTokenizer.h) is a hand-rolled WordPiece
+      implementation that loads `vocab.txt`.
+    - embeddinggemma produces 768-dim Matryoshka vectors;
+      `ContextInference::EMBED_DIM` is hard-coded to 384 and the
+      cluster centroid / cosine-similarity paths assume that size.
+    - The base `google/embeddinggemma-300m` repo is gated
+      (Gemma-license click-through); the community
+      `onnx-community/embeddinggemma-300m-ONNX` mirror is open
+      but still ships only sentencepiece tokenizer assets.
+  Landing the swap cleanly requires either
+  (a) pulling in `onnxruntime-extensions` to get a SentencePiece
+  tokenizer op, or (b) vendoring Google's `sentencepiece` C++
+  library into the build.  Both are tracked as follow-up work.
+
+*Changes from v5.8:*
+- ***Optional LLM polishing layer (`Qwen2.5-0.5B-Instruct`).***  Each
+  snapshot now carries a `summary_polished` field alongside the
+  existing template-composed `summary`.  When the LLM model files are
+  present under `models/qwen/` and the polisher is loaded, the
+  template summary + the per-app `items[]` are fed to a CPU-INT4
+  Qwen2.5-0.5B-Instruct as a structured prompt, and the natural-
+  prose rewrite is returned as 1-3 lines.  The polishing is purely
+  additive -- the template summary remains the source of truth and
+  is unchanged.  Polished output is **rejected** (empty array
+  returned) when:
+    - the LLM is not loaded (`model_polish == "(not loaded)"`)
+    - the inference times out (5 s hard limit)
+    - the output exceeds 160 chars per line or hallucinates content
+      not present in the input items (grounding check).
+- ***New fields on the snapshot:***
+    - `summary_polished` (string[]) -- polished version of the
+      category that matches the request.  Present in every response
+      (empty array when polishing was unavailable or rejected).
+    - `summary_files_polished`, `summary_websites_polished`,
+      `summary_apps_polished` (string[]) -- per-category polished
+      facets.  **Only present when `category == "all"`.**
+    - `model_polish` (string) -- `"qwen2.5-0.5b-instruct"` when the
+      polisher is loaded; `"(not loaded)"` otherwise.
+- ***Dependency:*** *`Microsoft.ML.OnnxRuntimeGenAI 0.7.0`* (separate
+  NuGet from `Microsoft.ML.OnnxRuntime`).  Ships its own BPE
+  tokenizer + KV-cache + sampling loop, so the integration is
+  ~200 lines of glue plus a model download.
+- ***Build pipeline:*** CI now downloads the CPU-INT4 Qwen ONNX
+  bundle (~330 MB) from
+  `microsoft/Qwen2.5-0.5B-Instruct-onnx/cpu-int4-rtn-block-32-acc-level-4`
+  on HuggingFace and stages it under `models/qwen/`.  The
+  `CopyOnnxRuntime` MSBuild target copies the entire subtree
+  verbatim to the output folder.  The ORT-GenAI NuGet only ships
+  x64 and ARM64 binaries -- x86 builds compile without the
+  polishing layer (graceful degrade).
+
+*Changes from v5.7:*
+- ***Umbrella detection on cross-cluster shared themes.***  When a single
+  content token appears in titles of at least 50% of the top clusters AND
+  those clusters together carry at least 50% of focus, the composer now
+  collapses them into a single descriptive line of the form
+
+      "Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"
+
+  (with `"Researching"` instead of `"Exploring"` when the absorbed
+  clusters are all browser-side, and `"Working on"` when they're all
+  editor-side).  Each absorbed sub-cluster contributes its most
+  distinctive non-umbrella token as a facet.  Facets are deduped and
+  capped at 4 in the phrase.
+
+  Example: three clusters about `Football Strategy.pdf`,
+  `Football Players.docx`, and `Football Match Broadcasting.pptx`
+  previously emitted three separate lines (`"Working on Football
+  Strategy"` / `"Working on Football Players"` / `"Working on
+  Broadcasting"`).  They now collapse into a single coherent line:
+
+      "Exploring Football and its various aspects like Strategy, Players and Broadcasting"
+
+  When the umbrella fires, the absorbed clusters are skipped in the
+  rest of the summary; remaining (non-absorbed) clusters get their
+  normal `<verb> <theme>` lines up to the 3-line cap.
+
+- ***Dropped the `"… + N other thread(s)"` trailing suffix.***  The
+  summary is now multi-line, so the per-line phrases stand on their
+  own — there's no need to apologize for over-flow with a meaningless
+  tail.  Clusters that don't fit the 3-line cap or don't meet the 5%
+  focus floor are simply dropped from the summary (they're still
+  counted in `thread_count` and visible in `items[]`).
+
+- ***No request- or response-shape changes.***  All field names
+  (`summary`, `summary_files`, `summary_websites`, `summary_apps`)
+  and types are unchanged from v5.7.  Existing consumers see only
+  better, more coherent summary lines.
+
+*Changes from v5.6:*
+- ***Context "one-liner" renamed to "context summary" and reshaped as
+  an array of 1-3 phrase lines.***  The single-string `one_liner`
+  field is replaced by a JSON-array `summary` field that holds
+  separate phrase strings (one per cluster of activity).  Consumers
+  render each entry on its own line, giving the user a multi-line
+  semantic summary instead of a single bullet-separated line.
+- ***Field renames:***
+  - `one_liner`           → `summary`           (now `string[]`, was `string`)
+  - `one_liner_files`     → `summary_files`     (now `string[]`, was `string`)
+  - `one_liner_websites`  → `summary_websites`  (now `string[]`, was `string`)
+  - `one_liner_apps`      → `summary_apps`      (now `string[]`, was `string`)
+- ***Composer changes:***
+  - Per-category bags (Files / Websites / Apps) no longer force every
+    entry into one virtual cluster.  Natural sentence-encoder
+    clustering runs over them, so each meaningful sub-thread becomes
+    its own summary line.  (The original "force single cluster"
+    workaround was needed because of pre-focus-weighted scoring; the
+    focus-weighted scoring introduced in v5.6 makes it unnecessary
+    and lets us get multi-line per-category summaries.)
+  - Hard cap of 3 lines on the "All" summary (was: "All" was a
+    single-string line of arbitrary length).  Each line is a
+    `<verb> <theme>` phrase optionally followed by an `(across X &
+    Y …)` tail.
+  - Per-cluster phrases are no longer joined with ` · `; each is a
+    separate array element.
+- ***UI button labels:*** "Show Recent Context" → "Show Context
+  Summary"; "Show Context History" → "Show Summary History".  The
+  IPC operation names `GetRecentContext` / `GetRecentContexts` stay
+  the same -- only the rendered field shape changes.
+- ***Backward compatibility:*** **None for the JSON field names.**
+  Consumers that read `one_liner` / `one_liner_files` / etc. must be
+  updated to read `summary` / `summary_files` / etc. and to expect
+  an array rather than a string.  The legacy `category=documents`
+  enum alias for `category=files` is preserved.
 
 *Changes from v5.5:*
 - ***`category` enum renamed: `"documents"` → `"files"`.*** *The

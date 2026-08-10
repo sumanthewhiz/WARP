@@ -8,7 +8,7 @@
 #include <atomic>
 #include <cstdint>
 
-#include "BertTokenizer.h"
+#include "ModernBertTokenizer.h"
 
 // Forward-declare the ONNX Runtime types so callers don't need to pull the
 // header into every translation unit.  All access lives behind opaque pointers.
@@ -23,20 +23,21 @@ class ActivityDatabase;
 class ForegroundMonitor;
 
 // One snapshot in the rolling history of "what is the user doing right now?".
-// Each snapshot is composed from the last 15 minutes of foreground / browsing /
-// app-launch / file activity.  The literal one-liner text is built from the
-// actual document, tab, and application titles captured in the window.
+// Each snapshot is composed from the configured lookback window of foreground /
+// browsing / app-launch / file activity (default 15 min, user-selectable from
+// 5 min to 30 days).  The literal **summary** text is built from the actual
+// document, tab, and application titles captured in the window, as a vector
+// of 1-3 short phrase lines (one per cluster of activity).
 //
 // When the optional sentence-encoder embedding model is available the
 // composer additionally runs **dynamic semantic clustering** on the per-app
 // descriptions: apps whose embeddings are close in the 384-dim sentence space
-// are merged into one "thread of work" so the one-liner can surface that the
+// are merged into one "thread of work" so the summary can surface that the
 // user has, e.g., the auth source file open in VS Code AND the Auth PR open in
 // Edge as a single thread instead of two unrelated lines.  The clusters are
 // formed *dynamically from the observed titles* -- there is no fixed bucket
-// list or pre-defined topic taxonomy.  Default model is
-// `BAAI/bge-small-en-v1.5` (`bge-small.onnx`); legacy installations with
-// `minilm.onnx` (all-MiniLM-L6-v2) continue to work transparently.
+// list or pre-defined topic taxonomy.  The supported model is
+// `ibm-granite/granite-embedding-small-english-r2` under `<models>\granite\`.
 //
 // When the model files are absent the composer falls back to a deterministic
 // per-app composition (every app is its own cluster).
@@ -46,13 +47,34 @@ struct ContextSnapshot
     int64_t       windowStartTs  = 0;   // Inclusive start of the lookback window (epoch s).
     int64_t       windowEndTs    = 0;   // Inclusive end of the lookback window (epoch s).
     int64_t       windowSeconds  = 0;   // Width of the lookback window (= windowEndTs - windowStartTs).
-    std::string   oneLiner;             // Combined "All" one-liner summary.
-    // Category-specific one-liners.  Each is composed independently from a
+    // Multi-line "context summary": 1-3 short lines (one per cluster
+    // of activity) that semantically describe what the user is doing.
+    // Each entry is a separate phrase; consumers render them as
+    // separate lines or join with newlines.  Empty vector means no
+    // usable activity in the window.
+    //
+    // Source of truth (v5.17): the canonical summary is a RICH
+    // DETERMINISTIC LISTING of the top cleaned title phrases
+    // ("User is working on auth middleware, login handler and session
+    // store in Visual Studio Code"), produced by ComposeRichListing.
+    // The cluster->theme token output is retained internally as the
+    // LLM topic hint.  When the optional Qwen3-0.6B "brain" model is
+    // loaded it may REFINE this listing into nicer prose, but its
+    // output only replaces the listing when it is at least as grounded
+    // in the actual window titles (granite cosine) -- so it can only
+    // help, never regress below the listing.  An A/B harness showed
+    // the listing matches the LLM on semantic fidelity while being
+    // more grounded, closer to a human reference, and ~2x more
+    // specific, at zero inference cost and full determinism.  There
+    // is no separate "polished" field; the canonical summary lives
+    // here.
+    std::vector<std::string> summary;
+    // Category-specific summaries.  Each is composed independently from a
     // *projection* of the same activity window so a consumer can ask
     // "what files has the user been in?", "what websites?", or "what
-    // apps?" without having to mentally separate them out of the combined
-    // line.  All three use the same dynamic-clustering + theme-distillation
-    // pipeline as the combined one -- only the input bag of titles differs.
+    // apps?" without having to mentally separate them out of the
+    // combined summary.  All three use the same dynamic-clustering +
+    // theme-distillation pipeline -- only the input bag of titles differs.
     //   * Files     -- ANY app where the user is engaged with a file: not
     //                  just whitelisted document-editor apps but ALSO any
     //                  app whose window title contains a recognized file
@@ -68,17 +90,25 @@ struct ContextSnapshot
     //                  desktop, version-control UIs, and anything else that
     //                  isn't engaged with a specific file.  Strictly
     //                  disjoint from Files and Websites.
-    // An empty string here means the category had no usable activity in the
-    // window.
-    std::string   oneLinerFiles;
-    std::string   oneLinerWebsites;
-    std::string   oneLinerApps;
+    // An empty vector here means the category had no usable activity in
+    // the window.
+    std::vector<std::string> summaryFiles;
+    std::vector<std::string> summaryWebsites;
+    std::vector<std::string> summaryApps;
+    // Granite-embedded vector of the combined `summary`, ready for
+    // similarity search / clustering across snapshots.  384-dim,
+    // L2-normalized, produced by the same
+    // `ibm-granite/granite-embedding-small-english-r2` ModernBERT
+    // encoder used internally for per-app clustering.  Empty when
+    // the embedding model is not loaded or the summary is empty.
+    std::vector<float> summaryEmbedding;
     int           activityCount  = 0;   // Number of raw signals considered.
     int           focusSeconds   = 0;   // Total foreground time in the window.
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
-    std::string   model;                // "bge-small-en-v1.5", "all-MiniLM-L6-v2", or "deterministic"
+    std::string   model;                // "granite-embedding-small-english-r2" or "deterministic"
+    std::string   modelPolish;          // "qwen3-0.6b" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
     // Bounded structured breakdown (top apps by focus seconds, capped at 5).
@@ -96,25 +126,24 @@ struct ContextSnapshot
 };
 
 // =====================================================================
-// Dynamic context-inference engine (replaces the old TopicInference, which
-// used a MiniLM model to map activities to ~50 *pre-defined* topic
-// buckets).  This engine instead uses a sentence-encoder (BGE-small by
-// default, MiniLM as a backward-compatibility fallback) to **dynamically
-// cluster** the
-// observed titles -- the one-liner is composed from the literal documents,
-// tabs, and apps the user is engaged with, with semantically related items
-// merged into "threads of work".
+// Dynamic context-inference engine.  Uses the granite sentence-encoder
+// (ModernBERT, 384-dim, ibm-granite/granite-embedding-small-english-r2)
+// to **dynamically cluster** the observed window/tab/app titles -- the
+// summary is composed from the literal documents, tabs, and apps the
+// user is engaged with, with semantically related items merged into
+// "threads of work".  No fixed taxonomy / pre-defined topic buckets.
 //
 // Lifecycle
-//   * Init(modelsDir) -- always returns true.  If the model files
-//     (`vocab.txt` + `bge-small.onnx`, or the legacy `minilm.onnx`) are
-//     present in `modelsDir` the embedding
-//     pipeline initializes; otherwise the engine still runs in a
-//     deterministic-only fallback mode.  Pass an empty wstring to skip the
-//     model load entirely.
+//   * Init(modelsDir) -- always returns true.  If the granite files
+//     under `modelsDir\granite\` (`model_quantized.onnx` plus the
+//     `vocab.txt` / `merges.txt` / `special_tokens.txt` extracted at
+//     build time from the upstream `tokenizer.json`) are present the
+//     embedding pipeline initializes; otherwise the engine still runs
+//     in a deterministic-only fallback mode.  Pass an empty wstring
+//     to skip the model load entirely.
 //   * Start(db, fg) -- spawns a background thread that wakes every 60 s,
 //     reads the last 15 minutes of activity from `db` plus the live
-//     foreground session from `fg`, composes a one-liner, and appends it
+//     foreground session from `fg`, composes a summary, and appends it
 //     to history when it materially changes (or every 5 min as a heartbeat
 //     -- whichever comes first).  The "latest" cache is always refreshed.
 //   * Stop()     -- joins the thread.
@@ -128,7 +157,7 @@ struct ContextSnapshot
 //
 // `category` is one of "all" (default), "files", "websites", "apps".
 // When supplied (and not "all") the response carries ONLY that
-// category's one-liner (as `one_liner`); the other categories are
+// category's summary (as `summary`); the other categories are
 // omitted from the response.  Backward-compat: the legacy value
 // "documents" is accepted and treated as "files".
 //
@@ -143,6 +172,9 @@ struct ContextSnapshot
 // History cap is 1440 (24 h at one snapshot per minute, with material-
 // change dedup the actual count is usually much smaller).
 // =====================================================================
+class LlmSummarizer;   // optional polishing layer, see LlmSummarizer.h
+class InferenceEngine; // confidence-weighted per-entity store, see InferenceEngine.h
+
 class ContextInference
 {
 public:
@@ -153,6 +185,34 @@ public:
     bool IsModelLoaded() const { return m_modelReady; }
     void Start(ActivityDatabase* db, ForegroundMonitor* fg);
     void Stop();
+
+    // Wire in (or detach with nullptr) the optional LLM polishing
+    // layer.  Caller retains ownership of the LlmSummarizer instance
+    // and must not destroy it while ContextInference is running.
+    // Calling this AFTER Start() is fine -- the polisher is read
+    // under a lock on every snapshot compose.
+    void SetLlmSummarizer(LlmSummarizer* llm);
+
+    // Wire in (or detach with nullptr) the confidence-weighted
+    // per-entity inference store.  When connected, ComposeSnapshot
+    // boosts each in-window entry's effective focus seconds using
+    // the entity's historical `recency_score` + `open_count_7d` from
+    // the store, so:
+    //   (a) the dynamic context inference and the per-entity
+    //       inference engine agree on which entities matter;
+    //   (b) we don't recompute popularity / recency signals from
+    //       scratch when the inference engine has already done it
+    //       incrementally on every raw event;
+    //   (c) cluster ranking + theme weighting incorporate the
+    //       confidence weighting that was applied at event-capture
+    //       time (a 30 s focus session that the noise filter scored
+    //       confidence=0.3 contributes less than a confidence=1.0
+    //       session of the same length, because the InferenceEngine
+    //       already amortized that confidence into open_count_7d).
+    // Caller retains ownership; must not destroy while
+    // ContextInference is running.  Calling this AFTER Start() is
+    // fine -- the engine is read under a lock on every compose.
+    void SetInferenceEngine(InferenceEngine* eng);
 
     void RunOnce();
     std::string GetRecentContext (const std::string& category    = "all",
@@ -175,18 +235,38 @@ private:
     std::mutex                   m_mutex;
 
     // ---- Sentence-encoder embedding pipeline (optional) ----------------
-    // Default model: BAAI/bge-small-en-v1.5 (384-dim, BERT WordPiece
-    // tokenizer, ~33 M params).  Compatible with the previous
-    // all-MiniLM-L6-v2 (same dim, same tokenizer); if `bge-small.onnx`
-    // isn't present, Init() falls back to `minilm.onnx` so legacy
-    // installations keep working without forcing a redownload.
-    BertTokenizer        m_tokenizer;
+    // Single supported model: ibm-granite/granite-embedding-small-english-r2
+    // (ModernBERT-based, 47 M params, byte-level BPE tokenizer, 384-dim,
+    // Apache 2.0, August 2025).  Granite is explicitly trained on code
+    // retrieval (COIR benchmark) so it handles code-y window titles
+    // (`auth.cpp`, `useEffect`, `node_modules`) robustly.
+    //
+    // Older BGE-small / MiniLM fallbacks were removed in v5.16 -- the
+    // production stack is granite + qwen exclusively, so the fallback
+    // surface added test/maintenance burden without contributing to a
+    // shipped configuration.  When the granite files are missing the
+    // engine still runs in deterministic-only mode (m_modelReady=false),
+    // exactly as before.
+    ModernBertTokenizer  m_mbTokenizer;
     Ort::Env*            m_ortEnv     = nullptr;
     Ort::SessionOptions* m_ortOpts    = nullptr;
     Ort::Session*        m_ortSession = nullptr;
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
-    std::string          m_modelName;        // e.g. "bge-small-en-v1.5"
+    std::string          m_modelName;        // "granite-embedding-small-english-r2" or empty
+
+    // Optional polishing layer.  Borrowed; not owned.
+    LlmSummarizer*       m_llm = nullptr;
+
+    // Optional confidence-weighted per-entity inference store.
+    // Borrowed; not owned.  When non-null, ComposeSnapshot uses
+    // `Lookup()` on every snapshot to bias the per-entry ranking
+    // and clustering by historical recency + popularity.  When
+    // null, ranking falls back to in-window focus seconds only --
+    // identical to pre-v5.14 behaviour, so unit tests / tooling
+    // that constructs a ContextInference without wiring the engine
+    // continues to work.
+    InferenceEngine*     m_inference = nullptr;
 
     // Compute a 384-dim L2-normalized sentence embedding for `text`.
     // Returns an empty vector if the model is not loaded or inference fails.

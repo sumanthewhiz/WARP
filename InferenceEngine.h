@@ -67,6 +67,26 @@ public:
                          int64_t             eventTs,
                          double              confidence = 1.0);
 
+    // Bulk typed lookup for in-process consumers (e.g. ContextInference)
+    // that need to read per-entity records without going through the
+    // JSON wire format used by HandleQueryInferences.  Returns one
+    // entry per input key in the same order; entries that don't
+    // exist in the inference store come back default-constructed
+    // (entityKey/entityType empty, all numeric fields zero).
+    //
+    // Reads cache first; missing entries fall through to a single DB
+    // round-trip per key.  Typical snapshot size (<50 keys) completes
+    // in microseconds once the cache is warm.
+    std::vector<InferenceRecord> Lookup(const std::vector<std::string>& keys);
+
+    // Public alias of the internal NormalizeKey() used by all
+    // OnXxxEvent() methods, exposed so callers can normalize their
+    // wide-path / URL keys to the same lowercased-UTF-8 form the
+    // per-entity records are stored under.  Without this, every
+    // caller would have to replicate the lowercase + UTF-8 logic
+    // and silently drift if the storage scheme ever changes.
+    static std::string NormalizeEntityKey(const std::wstring& widePath);
+
     // Batch lookup for QueryInferences op.
     // paths: list of entity keys to look up (already UTF-8 lowercase).
     // fields: which fields to include in the response (empty = all).

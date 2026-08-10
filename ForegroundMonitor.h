@@ -58,6 +58,7 @@ private:
 
     // State for the currently-tracked foreground session.
     mutable std::mutex m_stateMtx;
+    HWND               m_prevHwnd = nullptr;
     DWORD              m_prevPid = 0;
     std::wstring       m_prevExeName;
     std::wstring       m_prevExePath;

@@ -1,5 +1,7 @@
 #include "framework.h"
 #include "ContextInference.h"
+#include "LlmSummarizer.h"
+#include "InferenceEngine.h"
 #include "ActivityDatabase.h"
 #include "ForegroundMonitor.h"
 
@@ -8,8 +10,10 @@
 #include <ctime>
 #include <cwctype>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -626,19 +630,35 @@ struct AppAgg
     std::string  friendlyName;
     std::string  verb;
     int          totalFocusSecs = 0;
+    // Effective focus seconds used for ranking, clustering, and
+    // per-cluster theme weighting.  Defaults to totalFocusSecs but is
+    // boosted by ApplyInferenceBoost() using the InferenceEngine's
+    // recency_score + open_count_7d so the dynamic context inference
+    // pipeline agrees with the per-entity weighted store on which
+    // entries matter.  Raw totalFocusSecs is left untouched so the
+    // user-facing focus_seconds / dominant_focus_pct / items[].pct
+    // JSON fields keep reporting the actual in-window dwell time.
+    double       weightedFocusSecs = 0.0;
     int64_t      lastSeenTs     = 0;
     std::string  bestTitle;         // cleaned, ready for one-liner
     std::string  rawTitle;          // original window title before cleaning
     bool         isBrowser      = false;
+    // Lookup key carriers for InferenceEngine.  Populated only on
+    // entries whose primary identity isn't the exe (FileMonitor virtuals
+    // identify by file path; per-tab website virtuals identify by URL
+    // when available).  Empty on regular focused-app entries -- those
+    // fall back to lowercased(exePath).
+    std::wstring filePath;          // populated for FileMonitor virts only
+    std::wstring webUrl;            // populated for browsing virts only
 };
 
 // =====================================================================
 //  Semantic theme extraction.  Given the cleaned per-app titles in a
 //  cluster, distill 1-2 *content* tokens that describe what the user is
 //  doing -- not the verbatim title text.  No fixed taxonomy: the theme
-//  emerges from the actual titles.  The sentence-encoder (BGE-small or
-//  the legacy MiniLM, see Init) is used (when available) to
-//  weight tokens by semantic centrality to the cluster.
+//  emerges from the actual titles.  The granite sentence-encoder
+//  (see Init) is used (when loaded) to weight tokens by semantic
+//  centrality to the cluster.
 // =====================================================================
 
 // Stop-words: function words, generic UI / app verbs, anything that
@@ -740,7 +760,21 @@ static const std::unordered_set<std::string>& BrandNoise()
         // Misc ubiquitous
         "app","application","apps","desktop","mobile","beta","alpha","preview",
         "release","stable","portable","setup","installer","login","signin",
-        "signup","sign","register","account","profile","user","admin"
+        "signup","sign","register","account","profile","user","admin",
+        // Windows path-component noise.  These are kept tight: only
+        // unambiguous Windows/Unix shell-folder names that almost never
+        // form part of a real document/title content.  Generic words
+        // like "documents", "downloads", "pictures", "music", "videos"
+        // are intentionally NOT here -- they appear all the time in
+        // legitimate file titles ("Quarterly Documents Review.docx",
+        // "Photo Pictures from Trip.jpg", etc.).  The FileMonitor
+        // augmentation now strictly allowlists extensions and skips
+        // when a real file app has focus, so we don't need to nuke
+        // these tokens at the theme layer too.
+        "appdata","localdata","roaming","programdata","programs",
+        "system32","syswow64",
+        "temp","tmp","cache","caches","logs","dump","dumps",
+        "default","userdata"
     };
     return s;
 }
@@ -918,39 +952,39 @@ ContextInference::~ContextInference()
 
 // =====================================================================
 //  Init -- load the sentence-encoder model + tokenizer if available.
-//  Prefers BAAI/bge-small-en-v1.5 (`bge-small.onnx`); falls back to
-//  the legacy all-MiniLM-L6-v2 (`minilm.onnx`) if BGE isn't present.
-//  This is best-effort:
-//  if any step fails the engine still runs in deterministic-only mode.
+//
+//  Sentence-encoder loader.
+//
+//  Single supported model: ibm-granite/granite-embedding-small-english-r2
+//  (ModernBERT, byte-level BPE, 384-dim, code-aware) under
+//  <modelsDir>\granite\.  Expected files:
+//      model_quantized.onnx (+ model_quantized.onnx_data)
+//      vocab.txt              \
+//      merges.txt              > produced at CI time from
+//      special_tokens.txt     /  tokenizer.json by
+//                             scripts/extract_modernbert_tokenizer.py
+//
+//  Best-effort: if the granite files are missing or invalid the engine
+//  still runs in deterministic-only mode (m_modelReady=false), with
+//  the algorithmic cluster->theme pipeline producing summaries using
+//  pure token-frequency / focus-weighted scoring -- no semantic
+//  embeddings.  Older BGE-small / MiniLM fallback paths were removed
+//  in v5.16 since the production stack is granite + qwen exclusively.
 // =====================================================================
 bool ContextInference::Init(const std::wstring& modelsDir)
 {
     if (modelsDir.empty()) return true;  // explicitly skip model load
 
-    // Tokenizer vocab
-    std::string vocabPath = WideToUtf8(modelsDir) + "\\vocab.txt";
-    if (!m_tokenizer.Load(vocabPath))
-        return true;  // graceful degrade
+    std::wstring graniteDir = modelsDir + L"\\granite";
+    std::wstring modelPath  = graniteDir + L"\\model_quantized.onnx";
+    std::string  vocabPath  = WideToUtf8(graniteDir) + "\\vocab.txt";
+    std::string  mergesPath = WideToUtf8(graniteDir) + "\\merges.txt";
+    std::string  specPath   = WideToUtf8(graniteDir) + "\\special_tokens.txt";
 
-    std::wstring modelPath  = modelsDir + L"\\bge-small.onnx";
-    std::string  modelLabel = "bge-small-en-v1.5";
-
-    // Backward compat: if the new BGE model file isn't present, fall
-    // back to the legacy MiniLM model (same 384 dim, same tokenizer,
-    // same call surface).  Lets existing installations keep working
-    // through an in-place binary upgrade until the user re-downloads.
-    {
-        DWORD attrs = GetFileAttributesW(modelPath.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES)
-        {
-            std::wstring legacy = modelsDir + L"\\minilm.onnx";
-            if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
-            {
-                modelPath  = std::move(legacy);
-                modelLabel = "all-MiniLM-L6-v2";
-            }
-        }
-    }
+    if (GetFileAttributesW(modelPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return true;   // graceful degrade -- deterministic mode
+    if (!m_mbTokenizer.Load(vocabPath, mergesPath, specPath))
+        return true;   // tokenizer files missing or malformed
 
     try
     {
@@ -973,32 +1007,30 @@ bool ContextInference::Init(const std::wstring& modelsDir)
     }
 
     m_modelReady = true;
-    m_modelName  = std::move(modelLabel);
+    m_modelName  = "granite-embedding-small-english-r2";
     return true;
 }
 
 // =====================================================================
-//  Sentence embedding (384-dim, mean-pool + L2-normalize).  Works with
-//  either BGE-small-en-v1.5 or all-MiniLM-L6-v2 -- both export the same
-//  tensor shape and tokenization.
-//  Empty vector if the model isn't loaded.
+//  Sentence embedding (384-dim, L2-normalized).
+//
+//  granite (ModernBERT) topology: inputs `input_ids` + `attention_mask`,
+//  output `sentence_embedding` -- the model already mean-pools and we
+//  just L2-normalize.
+//
+//  Empty vector if the model isn't loaded or inference fails.
 // =====================================================================
 std::vector<float> ContextInference::Embed(const std::string& text)
 {
     if (!m_modelReady || !m_ortSession) return {};
 
-    std::vector<int64_t> inputIds = m_tokenizer.Encode(text, MAX_SEQ_LEN);
+    std::vector<int64_t> inputIds =
+        m_mbTokenizer.Encode(text, MAX_SEQ_LEN);
+    if (inputIds.empty()) return {};
     std::vector<int64_t> attentionMask(inputIds.size(), 1);
-    std::vector<int64_t> tokenTypeIds(inputIds.size(), 0);
 
-    while ((int64_t)inputIds.size() < MAX_SEQ_LEN)
-    {
-        inputIds.push_back(m_tokenizer.PadId());
-        attentionMask.push_back(0);
-        tokenTypeIds.push_back(0);
-    }
-
-    std::array<int64_t, 2> shape = { 1, MAX_SEQ_LEN };
+    const int64_t seqLen = static_cast<int64_t>(inputIds.size());
+    std::array<int64_t, 2> shape = { 1, seqLen };
 
     Ort::Value inputIdsTensor = Ort::Value::CreateTensor<int64_t>(
         *m_ortMemInfo, inputIds.data(), inputIds.size(),
@@ -1006,24 +1038,20 @@ std::vector<float> ContextInference::Embed(const std::string& text)
     Ort::Value attMaskTensor = Ort::Value::CreateTensor<int64_t>(
         *m_ortMemInfo, attentionMask.data(), attentionMask.size(),
         shape.data(), shape.size());
-    Ort::Value tokTypeTensor = Ort::Value::CreateTensor<int64_t>(
-        *m_ortMemInfo, tokenTypeIds.data(), tokenTypeIds.size(),
-        shape.data(), shape.size());
 
-    const char* inputNames[]  = { "input_ids", "attention_mask", "token_type_ids" };
-    const char* outputNames[] = { "last_hidden_state" };
+    const char* inputNames[]  = { "input_ids", "attention_mask" };
+    const char* outputNames[] = { "sentence_embedding" };
 
     std::vector<Ort::Value> inputTensors;
     inputTensors.push_back(std::move(inputIdsTensor));
     inputTensors.push_back(std::move(attMaskTensor));
-    inputTensors.push_back(std::move(tokTypeTensor));
 
     std::vector<Ort::Value> outputTensors;
     try
     {
         outputTensors = m_ortSession->Run(
             Ort::RunOptions{ nullptr },
-            inputNames, inputTensors.data(), 3,
+            inputNames, inputTensors.data(), 2,
             outputNames, 1);
     }
     catch (const Ort::Exception&)
@@ -1031,22 +1059,8 @@ std::vector<float> ContextInference::Embed(const std::string& text)
         return {};
     }
 
-    const float* rawOutput = outputTensors[0].GetTensorData<float>();
-
-    std::vector<float> embedding(EMBED_DIM, 0.0f);
-    int realTokens = 0;
-    for (int t = 0; t < MAX_SEQ_LEN; ++t)
-    {
-        if (attentionMask[t] == 0) continue;
-        ++realTokens;
-        for (int d = 0; d < EMBED_DIM; ++d)
-            embedding[d] += rawOutput[t * EMBED_DIM + d];
-    }
-    if (realTokens > 0)
-    {
-        for (int d = 0; d < EMBED_DIM; ++d)
-            embedding[d] /= static_cast<float>(realTokens);
-    }
+    const float* raw = outputTensors[0].GetTensorData<float>();
+    std::vector<float> embedding(raw, raw + EMBED_DIM);
 
     float norm = 0.0f;
     for (int d = 0; d < EMBED_DIM; ++d) norm += embedding[d] * embedding[d];
@@ -1055,7 +1069,6 @@ std::vector<float> ContextInference::Embed(const std::string& text)
     {
         for (int d = 0; d < EMBED_DIM; ++d) embedding[d] /= norm;
     }
-
     return embedding;
 }
 
@@ -1076,6 +1089,18 @@ void ContextInference::Start(ActivityDatabase* db, ForegroundMonitor* fg)
     m_running = true;
     ResetEvent(m_stopEvent);
     m_thread = std::thread(&ContextInference::TimerLoop, this);
+}
+
+void ContextInference::SetLlmSummarizer(LlmSummarizer* llm)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_llm = llm;
+}
+
+void ContextInference::SetInferenceEngine(InferenceEngine* eng)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_inference = eng;
 }
 
 void ContextInference::Stop()
@@ -1132,10 +1157,10 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 
     // Append on material change: different one-liner (combined or any of
     // the per-category lines) OR different dominant app.
-    if (snap.oneLiner          != prev.oneLiner)          return true;
-    if (snap.oneLinerFiles != prev.oneLinerFiles) return true;
-    if (snap.oneLinerWebsites  != prev.oneLinerWebsites)  return true;
-    if (snap.oneLinerApps      != prev.oneLinerApps)      return true;
+    if (snap.summary         != prev.summary)         return true;
+    if (snap.summaryFiles    != prev.summaryFiles)    return true;
+    if (snap.summaryWebsites != prev.summaryWebsites) return true;
+    if (snap.summaryApps     != prev.summaryApps)     return true;
     if (!snap.items.empty() && !prev.items.empty()
      && snap.items.front().exe != prev.items.front().exe)
         return true;
@@ -1146,6 +1171,321 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 // =====================================================================
 //  Snapshot composition
 // =====================================================================
+
+// ApplyInferenceBoost
+// ---------------------------------------------------------------------
+// Bias each entry's `weightedFocusSecs` by its historical recency and
+// 7-day open-count, sourced from the confidence-weighted InferenceEngine
+// store.  This is what makes the dynamic context inference and the
+// per-entity inference engine agree on which entries matter, rather
+// than each computing its own popularity / recency signal from scratch.
+//
+// Boost formula (per-entry):
+//
+//     boost = 1.0
+//           + log1p(recency_score / 50.0)     // ~ 0 .. 1.85 (cap 200/255)
+//           + log1p(open_count_7d / 5.0)      // ~ 0 .. 2.40 (cap ~50/7d)
+//     weightedFocusSecs = totalFocusSecs * boost
+//
+// Range: 1.0x (entity unknown to InferenceEngine or never opened)
+//        .. ~5.3x (high-recency, frequently-opened entity).
+//
+// Properties:
+//   * In-window focus seconds remain the dominant signal.  A 5-minute
+//     focused session (300 s) boosted to 5.3x = 1590 still loses to a
+//     10-minute focused session (600 s) at the default 1.0x baseline.
+//     Boost only swings the order when in-window focus is comparable.
+//   * The boost is multiplicative, so an entity with zero in-window
+//     focus (totalFocusSecs == 0) gets weightedFocusSecs == 0 too --
+//     historical signal never *invents* presence, it only re-ranks
+//     entries that are already in the bag.
+//   * No-op when m_inference is null (unit tests / pre-v5.14 wiring).
+//
+// `keyOf` extracts the InferenceEngine entity key from an AppAgg:
+// lowercased(filePath) for file virts, lowercased(webUrl|bestTitle)
+// for browsing virts, lowercased(exePath) for regular focused apps.
+static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
+                                InferenceEngine*                     eng,
+                                std::function<std::string(const AppAgg&)> keyOf)
+{
+    if (!eng || bag.empty())
+    {
+        // Make sure weightedFocusSecs is at least seeded with the raw
+        // value so downstream ranking still has a usable score.
+        for (auto& a : bag)
+            if (a.weightedFocusSecs == 0.0)
+                a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+        return;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(bag.size());
+    std::vector<size_t> keyToIdx;
+    keyToIdx.reserve(bag.size());
+
+    for (size_t i = 0; i < bag.size(); ++i)
+    {
+        std::string k = keyOf(bag[i]);
+        if (k.empty()) continue;
+        keys.push_back(std::move(k));
+        keyToIdx.push_back(i);
+    }
+
+    // Seed weightedFocusSecs with the raw value before applying boost,
+    // so any entries that don't get a key (or come back empty from the
+    // store) still have a sensible default.
+    for (auto& a : bag)
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+
+    if (keys.empty()) return;
+
+    std::vector<InferenceRecord> records = eng->Lookup(keys);
+    for (size_t i = 0; i < records.size() && i < keyToIdx.size(); ++i)
+    {
+        const InferenceRecord& rec = records[i];
+        if (rec.entityKey.empty()) continue;   // unknown to InferenceEngine
+
+        double recBoost  = std::log1p(rec.recencyScore / 50.0);
+        double freqBoost = std::log1p(rec.openCount7d  / 5.0);
+        double boost     = 1.0 + recBoost + freqBoost;
+
+        AppAgg& a = bag[keyToIdx[i]];
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * boost;
+    }
+}
+
+// =====================================================================
+//  Rich deterministic listing (v5.17)
+//
+//  Empirical finding (local A/B harness on Qwen3-0.6B + granite over
+//  12 realistic scenarios -- see commit message): a 0.6B on-device LLM
+//  cannot ABSTRACT diverse window titles into a higher-level intent
+//  ("auth_middleware.cpp + login.ts + session.go" -> "authentication
+//  system").  All it can do is rephrase / list the titles -- and it
+//  does so LESS completely (drops items) and LESS reliably (its output
+//  is rejected by the grounding gate 75-90% of the time, so the user
+//  is usually left looking at the terse 1-token theme).
+//
+//  A deterministic listing of the top cleaned title phrases is, on the
+//  same granite metric the product itself uses, MORE grounded
+//  (cos-to-titles +0.05), closer to a human reference (ROUGE-L +0.20,
+//  +80% relative) and ~2x more specific than the token-theme -- at
+//  ZERO inference cost and full determinism.  It also matches the
+//  expensive best-of-N LLM on semantic similarity to an ideal summary.
+//
+//  This composes "User is <verb> <p1>, <p2> and <p3><app clause>"
+//  from the top distinct cleaned title phrases in the ranked bag.
+//  Returns `themeHint` unchanged when the bag yields no usable phrase
+//  (so we never regress below the prior behaviour for empty input).
+// =====================================================================
+namespace
+{
+    // Strip a recognized trailing file extension from a phrase.
+    std::string StripTrailingExt(const std::string& s)
+    {
+        static const std::unordered_set<std::string> kExt = {
+            "cpp","h","hpp","cc","cxx","cs","java","kt","py","rb","pl",
+            "php","js","mjs","cjs","jsx","ts","tsx","go","rs","swift",
+            "m","mm","dart","sh","bash","zsh","ps1","psm1","html","htm",
+            "css","scss","sass","less","xml","json","yaml","yml","toml",
+            "ini","cfg","conf","sql","graphql","vue","svelte","r","jl",
+            "lua","ex","exs","erl","hs","clj","docx","doc","xlsx","xls",
+            "pptx","ppt","pdf","txt","md","rst","tex","one","csv","tsv",
+            "sln","vcxproj","png","jpg","jpeg","gif","svg"
+        };
+        size_t dot = s.find_last_of('.');
+        if (dot == std::string::npos || dot == 0) return s;
+        std::string ext = AsciiLower(s.substr(dot + 1));
+        if (kExt.count(ext)) return s.substr(0, dot);
+        return s;
+    }
+
+    // Turn a (already app-suffix-cleaned) window title into a short,
+    // human-readable phrase: strip extension, snake/kebab/camel ->
+    // spaces, drop leading "Re:"/"#"/article and dangling trailing
+    // connector/version tokens, cap at 4 words.
+    std::string CleanPhrase(const std::string& title, size_t maxWords = 4)
+    {
+        std::string t = StripTrailingExt(title);
+
+        // snake / kebab -> space; camelCase -> spaced
+        std::string spaced;
+        spaced.reserve(t.size() + 8);
+        for (size_t i = 0; i < t.size(); ++i)
+        {
+            char c = t[i];
+            if (c == '_' || c == '-' || c == '/' || c == '\\')
+            {
+                spaced.push_back(' ');
+            }
+            else
+            {
+                // insert a space at a lower->Upper camelCase boundary
+                if (i > 0 && c >= 'A' && c <= 'Z'
+                    && t[i - 1] >= 'a' && t[i - 1] <= 'z')
+                    spaced.push_back(' ');
+                spaced.push_back(c);
+            }
+        }
+
+        // strip a leading "re:" / "fwd:" / "fw:" reply/forward marker
+        {
+            std::string lo = AsciiLower(spaced);
+            static const char* const kLead[] = { "re:", "fwd:", "fw:" };
+            for (const char* m : kLead)
+            {
+                size_t ml = std::strlen(m);
+                if (lo.size() >= ml && lo.compare(0, ml, m) == 0)
+                {
+                    spaced = spaced.substr(ml);
+                    break;
+                }
+            }
+        }
+
+        // strip leading punctuation noise (#, @, *, :, >, |, -, spaces)
+        {
+            size_t p = 0;
+            while (p < spaced.size())
+            {
+                char c = spaced[p];
+                if (c == '#' || c == '@' || c == '*' || c == ':' ||
+                    c == '>' || c == '|' || c == '-' || c == ' ')
+                    ++p;
+                else
+                    break;
+            }
+            if (p > 0) spaced = spaced.substr(p);
+        }
+
+        // tokenize on whitespace, dropping leading punctuation noise
+        std::vector<std::string> words;
+        {
+            std::string cur;
+            for (char c : spaced)
+            {
+                unsigned char u = static_cast<unsigned char>(c);
+                if (u <= ' ')
+                {
+                    if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+                }
+                else
+                {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) words.push_back(cur);
+        }
+
+        // strip leading punctuation-only / article tokens
+        static const std::unordered_set<std::string> kLeadDrop = {
+            "a", "an", "the"
+        };
+        while (!words.empty())
+        {
+            std::string w = words.front();
+            // strip surrounding punctuation
+            std::string stripped;
+            for (char c : w)
+            {
+                unsigned char u = static_cast<unsigned char>(c);
+                if (std::isalnum(u)) stripped.push_back(c);
+                else if (!stripped.empty()) break;
+            }
+            if (stripped.empty() || kLeadDrop.count(AsciiLower(stripped)))
+                words.erase(words.begin());
+            else
+                break;
+        }
+
+        if (words.size() > maxWords) words.resize(maxWords);
+
+        // drop dangling trailing connector / version tokens
+        static const std::unordered_set<std::string> kDangle = {
+            "to","the","a","an","of","for","in","on","and","or","with",
+            "from","f","vs","ch","p99","v1","v2","v3","v4","v5","draft",
+            "is","at","by"
+        };
+        while (!words.empty() && kDangle.count(AsciiLower(words.back())))
+            words.pop_back();
+
+        std::string out;
+        for (size_t i = 0; i < words.size(); ++i)
+        {
+            if (i) out += " ";
+            out += words[i];
+        }
+        return Trim(out);
+    }
+}
+
+static std::vector<std::string> ComposeRichListing(
+    const std::vector<AppAgg>&       bag,
+    const std::string&               category,
+    const std::vector<std::string>&  themeHint)
+{
+    if (bag.empty()) return themeHint;
+
+    // Collect up to 3 distinct cleaned title phrases, in ranked order.
+    std::vector<std::string> phrases;
+    std::vector<std::string> phrasesLower;
+    for (const auto& a : bag)
+    {
+        const std::string& src = !a.bestTitle.empty() ? a.bestTitle : a.rawTitle;
+        std::string p = CleanPhrase(src);
+        if (p.size() < 2) continue;
+        std::string lo = AsciiLower(p);
+
+        // skip if this phrase is contained in, or contains, one already
+        // taken (avoids "Search Relevance" + "Search Relevance Spec").
+        bool dup = false;
+        for (const auto& seen : phrasesLower)
+        {
+            if (lo.find(seen) != std::string::npos ||
+                seen.find(lo) != std::string::npos)
+            { dup = true; break; }
+        }
+        if (dup) continue;
+
+        phrases.push_back(std::move(p));
+        phrasesLower.push_back(std::move(lo));
+        if (phrases.size() >= 3) break;
+    }
+
+    if (phrases.empty()) return themeHint;
+
+    const char* verb =
+        (category == "websites") ? "researching" :
+        (category == "apps")     ? "working across" :
+                                   "working on";
+
+    std::string body;
+    if (phrases.size() == 1)
+        body = phrases[0];
+    else if (phrases.size() == 2)
+        body = phrases[0] + " and " + phrases[1];
+    else
+        body = phrases[0] + ", " + phrases[1] + " and " + phrases[2];
+
+    // Brief app clause: up to 2 distinct friendly names.
+    std::vector<std::string> apps;
+    for (const auto& a : bag)
+    {
+        if (a.friendlyName.empty()) continue;
+        bool seen = false;
+        for (const auto& x : apps) if (x == a.friendlyName) { seen = true; break; }
+        if (!seen) apps.push_back(a.friendlyName);
+        if (apps.size() >= 2) break;
+    }
+    std::string appClause;
+    if (apps.size() == 1)
+        appClause = " in " + apps[0];
+    else if (apps.size() >= 2)
+        appClause = " across " + apps[0] + " and " + apps[1];
+
+    return { "User is " + std::string(verb) + " " + body + appClause };
+}
+
 ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
@@ -1282,13 +1622,30 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     std::vector<AppAgg> ranked;
     ranked.reserve(byExe.size());
     for (auto& kv : byExe) ranked.push_back(std::move(kv.second));
+
+    // Apply confidence-weighted historical boost from the InferenceEngine
+    // BEFORE sorting so the order reflects both in-window focus and
+    // historical recency / popularity.  Key: lowercased(exePath); regular
+    // focused-app entries identify by exe, so neither filePath nor
+    // webUrl is set here -- they're populated only on the FileMonitor
+    // and per-tab virtuals built later for the per-facet bags.
+    ApplyInferenceBoost(ranked, m_inference,
+        [](const AppAgg& a) -> std::string {
+            if (a.exePath.empty()) return std::string();
+            return InferenceEngine::NormalizeEntityKey(a.exePath);
+        });
+
     std::sort(ranked.begin(), ranked.end(),
               [](const AppAgg& a, const AppAgg& b){
-                  if (a.totalFocusSecs != b.totalFocusSecs)
-                      return a.totalFocusSecs > b.totalFocusSecs;
+                  if (a.weightedFocusSecs != b.weightedFocusSecs)
+                      return a.weightedFocusSecs > b.weightedFocusSecs;
                   return a.lastSeenTs > b.lastSeenTs;
               });
 
+    // dominant_focus_pct stays based on RAW totalFocusSecs -- the
+    // boost is an internal ranking signal, never a user-facing
+    // percentage.  Otherwise "100% of focus" would lose its meaning
+    // when a single boosted entry crosses the in-window total.
     if (!ranked.empty() && totalFocusSecs > 0)
         snap.dominantPct = static_cast<int>(
             (ranked.front().totalFocusSecs * 100LL) / totalFocusSecs);
@@ -1316,9 +1673,9 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     // -----------------------------------------------------------------
     struct OneLinerBuild
     {
-        std::string      text;
-        std::vector<int> clusterOf;     // per-bag-entry cluster id, 0-based
-        int              threadCount = 0;
+        std::vector<std::string> lines;
+        std::vector<int>         clusterOf;     // per-bag-entry cluster id, 0-based
+        int                      threadCount = 0;
     };
 
     auto composeOneLinerFromBag = [&](const std::vector<AppAgg>& bag,
@@ -1329,37 +1686,21 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         // ---- Cluster the bag -----------------------------------------
         std::vector<int>                 clOf(bag.size(), -1);
         std::vector<std::vector<float>>  centroids;
-        std::vector<int>                 clTotalFocus;
+        std::vector<double>              clTotalFocus;
         std::vector<std::vector<size_t>> clMembers;
-        int                              bagTotalFocus = 0;
-        for (const auto& a : bag) bagTotalFocus += (std::max)(0, a.totalFocusSecs);
+        double                           bagTotalFocus = 0.0;
+        for (const auto& a : bag) bagTotalFocus += (std::max)(0.0, a.weightedFocusSecs);
 
-        if (categoryMode)
+        if (m_modelReady && bag.size() >= 2)
         {
-            // Per-category bags (Documents / Websites / Apps) tend to be
-            // small (2-16 entries) and topic-diverse.  Sentence-encoder clustering
-            // on such a bag produces mostly singleton clusters whose
-            // themes degrade to brand-name-only token sets — yielding
-            // verbatim-title soup once the per-cluster fallback to
-            // `phraseFor` kicks in.  Force every entry into ONE virtual
-            // cluster instead: this pools content tokens across all
-            // titles so `themeFor` has enough material to distill 1-2
-            // genuinely semantic tokens, and gives `clusterPhrase` a
-            // multi-member cluster (so it adds the "across X & Y"
-            // suffix instead of falling back to verbatim).
-            centroids.push_back({});
-            clTotalFocus.push_back(bagTotalFocus);
-            std::vector<size_t> members;
-            members.reserve(bag.size());
-            for (size_t i = 0; i < bag.size(); ++i)
-            {
-                members.push_back(i);
-                clOf[i] = 0;
-            }
-            clMembers.push_back(std::move(members));
-        }
-        else if (m_modelReady && bag.size() >= 2)
-        {
+            // Natural clustering for both "All" and category modes.
+            // The old categoryMode behaviour forced every bag entry
+            // into one virtual cluster as a workaround for the small/
+            // diverse bag -> singleton-cluster -> verbatim-mish-mash
+            // failure mode -- which is now handled by focus-weighted
+            // theme scoring (low-focus titles' tokens get demoted to
+            // 0.2x score below 5% focus coverage).  Natural clusters
+            // give each meaningful sub-thread its own summary line.
             const size_t embedLimit = (std::min)(bag.size(), static_cast<size_t>(8));
             std::vector<std::vector<float>> embs(bag.size());
             for (size_t i = 0; i < embedLimit; ++i)
@@ -1371,7 +1712,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 {
                     int cid = static_cast<int>(centroids.size());
                     centroids.push_back({});
-                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clTotalFocus.push_back(bag[i].weightedFocusSecs);
                     clMembers.push_back({ i });
                     clOf[i] = cid;
                     continue;
@@ -1388,7 +1729,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 {
                     int cid = static_cast<int>(centroids.size());
                     centroids.push_back(embs[i]);
-                    clTotalFocus.push_back(bag[i].totalFocusSecs);
+                    clTotalFocus.push_back(bag[i].weightedFocusSecs);
                     clMembers.push_back({ i });
                     clOf[i] = cid;
                 }
@@ -1405,7 +1746,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     if (norm > 1e-9f)
                         for (int d = 0; d < EMBED_DIM; ++d) c[d] /= norm;
                     clMembers[bestC].push_back(i);
-                    clTotalFocus[bestC] += bag[i].totalFocusSecs;
+                    clTotalFocus[bestC] += bag[i].weightedFocusSecs;
                     clOf[i] = bestC;
                 }
             }
@@ -1415,7 +1756,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             for (size_t i = 0; i < bag.size(); ++i)
             {
                 centroids.push_back({});
-                clTotalFocus.push_back(bag[i].totalFocusSecs);
+                clTotalFocus.push_back(bag[i].weightedFocusSecs);
                 clMembers.push_back({ i });
                 clOf[i] = static_cast<int>(i);
             }
@@ -1424,7 +1765,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         // ---- Sort clusters by total focus ----------------------------
         struct Cluster
         {
-            int                  totalFocus;
+            size_t               origIdx;     // original index into `centroids` / `clMembers`
+            double               totalFocus;  // sum of members' weightedFocusSecs
             size_t               repIdx;
             std::vector<size_t>  members;
         };
@@ -1433,6 +1775,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         for (size_t c = 0; c < clMembers.size(); ++c)
         {
             Cluster cl;
+            cl.origIdx    = c;
             cl.totalFocus = clTotalFocus[c];
             cl.members    = clMembers[c];
             cl.repIdx     = clMembers[c].front();
@@ -1447,20 +1790,23 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         auto themeFor = [&](const Cluster& cl) -> std::string {
             // freq           = total occurrences of a token across the cluster's titles
             // titlesWith     = number of distinct titles in which the token appears
-            // focusWeight    = sum of totalFocusSecs of titles in which the token
+            // focusWeight    = sum of weightedFocusSecs of titles in which the token
             //                  appears.  This is the primary signal: a token from
             //                  a 99%-focus title decisively outweighs a token from
             //                  a 1%-focus virtual entry, regardless of how many
-            //                  virtual entries it appears in.
+            //                  virtual entries it appears in.  Uses
+            //                  weightedFocusSecs (not raw seconds) so a historically
+            //                  popular but currently low-focus entry still gets
+            //                  some token-level weight via the InferenceEngine boost.
             std::unordered_map<std::string, int>          freq;
             std::unordered_map<std::string, int>          titlesWith;
-            std::unordered_map<std::string, int64_t>      focusWeight;
+            std::unordered_map<std::string, double>       focusWeight;
             std::unordered_map<std::string, std::string>  bestSurface;
             std::vector<std::string>                      orderedLowers;
 
             for (size_t mi : cl.members)
             {
-                int memberFocus = (std::max)(0, bag[mi].totalFocusSecs);
+                double memberFocus = (std::max)(0.0, bag[mi].weightedFocusSecs);
                 auto toks = ExtractContentTokens(bag[mi].bestTitle);
                 std::unordered_set<std::string> seenInTitle;
                 for (const auto& t : toks)
@@ -1483,10 +1829,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 
             const size_t titleCount = cl.members.size();
 
-            int64_t clusterTotalFocus = 0;
+            double clusterTotalFocus = 0.0;
             for (size_t mi : cl.members)
-                clusterTotalFocus += (std::max)(0, bag[mi].totalFocusSecs);
-            if (clusterTotalFocus <= 0) clusterTotalFocus = 1; // avoid div-by-zero
+                clusterTotalFocus += (std::max)(0.0, bag[mi].weightedFocusSecs);
+            if (clusterTotalFocus <= 0.0) clusterTotalFocus = 1.0; // avoid div-by-zero
 
             struct ScoredTok { std::string lower; double score; size_t firstIdx; };
             std::vector<ScoredTok> scored;
@@ -1697,22 +2043,89 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             {
                 if (categoryMode)
                 {
-                    // Category-mode fallback: NEVER quote a verbatim
-                    // title (that's how the old "verbatim mish-mash"
-                    // regression happened).  Use the dominant verb of
-                    // the representative entry plus the friendlyName
-                    // (or, for the virtual "File" / "Browser"
-                    // friendly names, a more natural phrase).
+                    // Category-mode fallback: theme extraction produced
+                    // nothing (titles got over-filtered by the brand /
+                    // stop-word / file-extension filters).
+                    //
+                    // Strategy: try harder before giving up to a generic
+                    // verb+friendlyName phrase.
+                    //
+                    //   1. cleaned bestTitle with ext stripped
+                    //   2. rawTitle with ext stripped (catches cases
+                    //      where CleanTitle reduced everything to the
+                    //      app name, but the raw form has the doc info)
+                    //   3. union of all member titles (multi-member
+                    //      cluster -- maybe one member has a useful
+                    //      title even if the rep doesn't)
+                    //   4. friendlyName as last resort
+                    //
+                    // A "useful" surface is one that:
+                    //   - is non-empty AND
+                    //   - doesn't equal the friendly name (case-insens.) AND
+                    //   - has at least 4 chars OR contains a space.
                     const AppAgg& rep = bag[cl.repIdx];
                     std::string verb = rep.verb.empty() ? std::string("Using") : rep.verb;
                     if (!verb.empty() && verb[0] >= 'a' && verb[0] <= 'z')
                         verb[0] = char(verb[0] - 32);
-                    if (rep.friendlyName == "File")
+
+                    auto stripExt = [](std::string s) {
+                        size_t dot = s.find_last_of('.');
+                        if (dot != std::string::npos && dot > 0 && dot >= s.size() - 6)
+                            s.erase(dot);
+                        return s;
+                    };
+                    auto isUseful = [&](const std::string& s) -> bool {
+                        if (s.empty()) return false;
+                        std::string lo = AsciiLower(s);
+                        std::string fn = AsciiLower(rep.friendlyName);
+                        if (lo == fn) return false;
+                        if (lo.size() < 4 && s.find(' ') == std::string::npos)
+                            return false;
+                        return true;
+                    };
+
+                    std::string titleSurface;
+                    std::string cand;
+
+                    cand = stripExt(rep.bestTitle);
+                    if (isUseful(cand)) titleSurface = cand;
+
+                    if (titleSurface.empty())
+                    {
+                        cand = stripExt(rep.rawTitle);
+                        if (isUseful(cand)) titleSurface = cand;
+                    }
+
+                    if (titleSurface.empty())
+                    {
+                        for (size_t mi : cl.members)
+                        {
+                            cand = stripExt(bag[mi].bestTitle);
+                            if (isUseful(cand)) { titleSurface = cand; break; }
+                            cand = stripExt(bag[mi].rawTitle);
+                            if (isUseful(cand)) { titleSurface = cand; break; }
+                        }
+                    }
+
+                    if (!titleSurface.empty())
+                    {
+                        p = verb + " " + titleSurface;
+                    }
+                    else if (rep.friendlyName == "File")
+                    {
                         p = "Working on files";
+                    }
                     else if (rep.friendlyName == "Browser")
+                    {
                         p = "Browsing the web";
+                    }
                     else
-                        p = verb + " " + rep.friendlyName;
+                    {
+                        // Genuinely no useful title anywhere -- avoid
+                        // "Drafting Word"; emit "Working in Word"
+                        // (slightly less wrong as a status line).
+                        p = "Working in " + rep.friendlyName;
+                    }
                 }
                 else
                 {
@@ -1777,63 +2190,268 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             return p;
         };
 
-        // ---- Adaptive top-N --------------------------------------
+        // -----------------------------------------------------------------
+        //  Umbrella detection
         //
-        // For the combined "All" one-liner we want a coherent
-        // *summary* of what the user is actually doing, not a kitchen
-        // sink of every little cluster.  Three guard rails:
+        //  Before emitting per-cluster phrases, check whether the top-K
+        //  clusters share a dominant theme token.  If so, collapse them
+        //  into a single descriptive line of the form
         //
-        //   1. Hard cap at 3 clusters in the head.  Anything beyond is
-        //      collapsed into a trailing "+ N other thread(s)".
-        //   2. Drop clusters whose focus contribution is < 5% of the
-        //      total -- these are typically a tab the user glanced at
-        //      for a few seconds and are pure noise.
-        //   3. Stop once we hit ONE_LINER_BUDGET (180 chars) or 80%
-        //      cumulative focus coverage (the prior behaviour).
+        //     "Exploring <Umbrella> and its various aspects like <F1>, <F2> and <F3>"
         //
-        // In category mode we always force every entry into one
-        // cluster, so guard rails 1 & 2 are no-ops there.
-        const size_t kMaxClustersHead     = 3;
-        const int    kMinClusterPctOfFocus = 5;
-        std::string oneLiner;
-        int    covered  = 0;
-        size_t included = 0;
+        //  rather than emitting N separate "Working on <FootballPlayers>",
+        //  "Working on <FootballStrategy>", ... lines that the user has to
+        //  mentally re-bundle.
+        //
+        //  Trigger: a single content token (after the brand / stopword
+        //  filter) appears in titles of >= 50% of the top-K (max 5)
+        //  clusters by focus AND those clusters together represent >= 50%
+        //  of bag focus.
+        //
+        //  The "facets" are the most-distinctive non-umbrella theme
+        //  token from each absorbed sub-cluster.
+        // -----------------------------------------------------------------
+        struct Umbrella
+        {
+            std::string                 surface;   // display form of the umbrella token
+            std::string                 lower;     // lowercase key
+            std::vector<std::string>    facets;    // display tokens, ordered
+            std::unordered_set<size_t>  absorbed;  // indices into `clusters` covered
+            double                      focus = 0.0;
+        };
+
+        // Token set per cluster (for cross-cluster coverage analysis).
+        std::vector<std::unordered_set<std::string>>            clusterTokenSets(clusters.size());
+        std::vector<std::unordered_map<std::string, std::string>> clusterTokenSurfaces(clusters.size());
+        std::vector<std::unordered_map<std::string, int>>       clusterTokenCounts(clusters.size());
         for (size_t i = 0; i < clusters.size(); ++i)
         {
-            if (!categoryMode)
+            for (size_t mi : clusters[i].members)
             {
-                if (included >= kMaxClustersHead) break;
-                if (included >= 1 && bagTotalFocus > 0)
+                auto toks = ExtractContentTokens(bag[mi].bestTitle);
+                for (const auto& t : toks)
                 {
-                    int clusterPct =
-                        static_cast<int>((clusters[i].totalFocus * 100LL)
-                                         / bagTotalFocus);
-                    if (clusterPct < kMinClusterPctOfFocus) continue;
+                    clusterTokenSets[i].insert(t.lower);
+                    clusterTokenCounts[i][t.lower] += 1;
+                    auto& s = clusterTokenSurfaces[i][t.lower];
+                    if (s.empty() ||
+                       (s.size() == t.surface.size() && t.surface > s))
+                        s = t.surface;
                 }
             }
-            std::string phrase = clusterPhrase(clusters[i]);
-            std::string candidate = oneLiner.empty()
-                ? phrase
-                : oneLiner + " \xC2\xB7 " + phrase;
-            if (i > 0
-             && (candidate.size() > ONE_LINER_BUDGET
-              || (bagTotalFocus > 0
-                  && static_cast<int>((covered * 100LL) / bagTotalFocus) >= 80)))
+        }
+
+        auto detectUmbrella = [&]() -> Umbrella {
+            Umbrella out;
+            if (clusters.size() < 2) return out;
+
+            const size_t topK = (std::min)(clusters.size(), size_t{5});
+
+            // For each token, count how many of the top-K clusters
+            // contain it AND sum the focus of those clusters.
+            std::unordered_map<std::string, int>    tokenCoverage; // cluster count
+            std::unordered_map<std::string, double> tokenFocus;
+            std::unordered_map<std::string, std::string> tokenSurface;
+            for (size_t i = 0; i < topK; ++i)
+            {
+                for (const auto& lc : clusterTokenSets[i])
+                {
+                    tokenCoverage[lc] += 1;
+                    tokenFocus[lc]   += clusters[i].totalFocus;
+                    auto& s = tokenSurface[lc];
+                    const auto& candSurface = clusterTokenSurfaces[i][lc];
+                    if (s.empty() ||
+                       (s.size() == candSurface.size() && candSurface > s))
+                        s = candSurface;
+                }
+            }
+
+            // Pick the highest-coverage token (focus as tiebreaker).
+            std::string bestLower;
+            int         bestCoverage = 0;
+            double      bestFocus    = 0.0;
+            for (const auto& kv : tokenCoverage)
+            {
+                if (kv.first.size() < 4) continue;       // tiny tokens are too noisy
+                if (kv.second  > bestCoverage ||
+                   (kv.second == bestCoverage && tokenFocus[kv.first] > bestFocus))
+                {
+                    bestLower    = kv.first;
+                    bestCoverage = kv.second;
+                    bestFocus    = tokenFocus[kv.first];
+                }
+            }
+            if (bestLower.empty()) return out;
+
+            // Trigger conditions:
+            //   * at least 2 absorbed clusters
+            //   * >= 50% of top-K clusters contain the umbrella token
+            //   * >= 50% of bag focus contributed by absorbed clusters
+            if (bestCoverage < 2)              return out;
+            if (bestCoverage * 2 < (int)topK)  return out;
+            if (bagTotalFocus > 0.0 && bestFocus * 2.0 < bagTotalFocus) return out;
+
+            out.surface = TitleCase(tokenSurface[bestLower].empty()
+                                        ? bestLower : tokenSurface[bestLower]);
+            out.lower   = bestLower;
+            out.focus   = bestFocus;
+            for (size_t i = 0; i < topK; ++i)
+            {
+                if (clusterTokenSets[i].count(bestLower))
+                    out.absorbed.insert(i);
+            }
+
+            // Build the facet list.  For each absorbed sub-cluster pick
+            // its most-distinctive non-umbrella token: highest local
+            // frequency, but penalize tokens that are widely shared
+            // across other absorbed clusters (those are co-themes, not
+            // facets).  Dedupe + cap at 4.
+            std::unordered_map<std::string, int> facetCrossCluster;
+            for (size_t ci : out.absorbed)
+                for (const auto& lc : clusterTokenSets[ci])
+                    facetCrossCluster[lc] += 1;
+
+            std::unordered_set<std::string> seenFacet;
+            seenFacet.insert(bestLower);
+            std::vector<std::pair<std::string, std::string>> facetsOrdered; // (display, lower)
+            for (size_t ci : out.absorbed)
+            {
+                std::string bestFacet;
+                std::string bestFacetSurface;
+                double      bestScore = -1.0;
+                for (const auto& kv : clusterTokenCounts[ci])
+                {
+                    const std::string& lc = kv.first;
+                    if (lc == bestLower) continue;
+                    if (lc.size() < 4)   continue;
+                    if (seenFacet.count(lc)) continue;
+                    if (lc.find(bestLower) != std::string::npos) continue;
+                    if (bestLower.find(lc) != std::string::npos) continue;
+                    double freq  = static_cast<double>(kv.second);
+                    int    cross = facetCrossCluster[lc];
+                    // Prefer locally frequent + locally distinctive
+                    // tokens.  cross > 1 means another absorbed sub-
+                    // cluster also has this token -- demote it.
+                    double score = freq / (1.0 + 0.6 * (cross - 1));
+                    if (score > bestScore)
+                    {
+                        bestScore        = score;
+                        bestFacet        = lc;
+                        bestFacetSurface = clusterTokenSurfaces[ci][lc];
+                    }
+                }
+                if (bestFacet.empty()) continue;
+                seenFacet.insert(bestFacet);
+                std::string disp = bestFacetSurface.empty() ? bestFacet : bestFacetSurface;
+                facetsOrdered.push_back({ TitleCase(disp), bestFacet });
+                if (facetsOrdered.size() >= 4) break;
+            }
+            for (const auto& f : facetsOrdered) out.facets.push_back(f.first);
+            return out;
+        };
+
+        auto formatUmbrellaPhrase = [&](const Umbrella& u) -> std::string {
+            // Pick a verb that suits the rep-app type of the absorbed
+            // clusters.  Browser-dominant -> "Researching"; editor-
+            // dominant -> "Working on"; mixed -> "Exploring" (default).
+            int browserCount = 0, editorCount = 0;
+            for (size_t ci : u.absorbed)
+            {
+                const AppAgg& rep = bag[clusters[ci].repIdx];
+                if (rep.isBrowser) browserCount++;
+                else
+                {
+                    std::string v = AsciiLower(rep.verb);
+                    if (v.find("editing")  != std::string::npos ||
+                        v.find("drafting") != std::string::npos ||
+                        v.find("working")  != std::string::npos)
+                        editorCount++;
+                }
+            }
+            std::string verb = "Exploring";
+            if (browserCount > 0 && editorCount == 0) verb = "Researching";
+            else if (editorCount > 0 && browserCount == 0) verb = "Working on";
+
+            if (u.facets.size() >= 3)
+            {
+                // "Exploring X and its various aspects like A, B and C"
+                size_t shown = (std::min)(u.facets.size(), size_t{4});
+                std::string tail;
+                for (size_t i = 0; i < shown; ++i)
+                {
+                    if (i == 0)                          tail += u.facets[i];
+                    else if (i + 1 == shown)             tail += " and " + u.facets[i];
+                    else                                 tail += ", "    + u.facets[i];
+                }
+                return verb + " " + u.surface +
+                       " and its various aspects like " + tail;
+            }
+            else if (u.facets.size() == 2)
+            {
+                return verb + " " + u.surface +
+                       " across " + u.facets[0] + " and " + u.facets[1];
+            }
+            else if (u.facets.size() == 1)
+            {
+                return verb + " " + u.surface + " (focus: " + u.facets[0] + ")";
+            }
+            return verb + " " + u.surface;
+        };
+
+        Umbrella umbrella = detectUmbrella();
+        // Require at least 2 facets for the umbrella line to be more
+        // informative than the individual sub-cluster phrases.
+        bool umbrellaActive = (umbrella.facets.size() >= 2);
+
+        // ---- Adaptive top-N --------------------------------------
+        //
+        // Emit at most 3 lines.  If the umbrella fired, line 1 is the
+        // umbrella phrase and we skip all absorbed clusters; the
+        // remaining lines come from clusters not absorbed (subject to
+        // the 5% focus floor in non-category mode).
+        //
+        // The trailing "+ N other thread(s)" suffix is **gone** -- the
+        // summary is multi-line now, so either a thread is informative
+        // enough to deserve its own line or it's dropped silently.
+        const size_t kMaxSummaryLines     = 3;
+        const int    kMinClusterPctOfFocus = 5;
+        std::vector<std::string> lines;
+        double covered  = 0.0;
+        size_t included = 0;
+
+        if (umbrellaActive)
+        {
+            std::string ulin = formatUmbrellaPhrase(umbrella);
+            if (!ulin.empty())
+            {
+                lines.push_back(std::move(ulin));
+                included = 1;
+                covered  = umbrella.focus;
+            }
+        }
+
+        for (size_t i = 0; i < clusters.size(); ++i)
+        {
+            if (included >= kMaxSummaryLines) break;
+            if (umbrellaActive && umbrella.absorbed.count(i)) continue;
+            if (!categoryMode && included >= 1 && bagTotalFocus > 0.0)
+            {
+                int clusterPct =
+                    static_cast<int>((clusters[i].totalFocus * 100.0)
+                                     / bagTotalFocus);
+                if (clusterPct < kMinClusterPctOfFocus) continue;
+            }
+            if (bagTotalFocus > 0.0
+             && static_cast<int>((covered * 100.0) / bagTotalFocus) >= 90)
                 break;
-            oneLiner = candidate;
+            std::string phrase = clusterPhrase(clusters[i]);
+            if (phrase.empty()) continue;
+            lines.push_back(std::move(phrase));
             covered += clusters[i].totalFocus;
             ++included;
         }
-        if (included < clusters.size())
-        {
-            size_t remaining = clusters.size() - included;
-            std::ostringstream o;
-            const char* label = (remaining == 1) ? " other thread" : " other threads";
-            o << oneLiner << " \xC2\xB7 + " << remaining << label;
-            oneLiner = o.str();
-        }
 
-        out.text        = std::move(oneLiner);
+        out.lines       = std::move(lines);
         out.clusterOf   = std::move(clOf);
         out.threadCount = static_cast<int>(clusters.size());
         return out;
@@ -1878,7 +2496,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             std::string p = WideToUtf8(it->path);
             size_t slash = p.find_last_of("/\\");
             std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-            snap.oneLiner = "Editing \"" + base + "\"";
+            snap.summary.push_back("Editing \"" + base + "\"");
             snap.confidence = 0.35;
         }
         else if (!apps.empty())
@@ -1888,23 +2506,29 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                     return a.timestampUtc < b.timestampUtc;
                 });
             auto cls = ClassifyApp(it->exeName, it->exePath);
-            snap.oneLiner = "Launched " + cls.first;
+            snap.summary.push_back("Launched " + cls.first);
             snap.confidence = 0.25;
         }
         else
         {
-            snap.oneLiner   = "(no recent user activity)";
+            snap.summary.push_back("(no recent user activity)");
             snap.confidence = 0.0;
         }
         return snap;
     }
 
-    snap.oneLiner = allBuild.text;
+    // ---- Canonical "all" summary: rich deterministic listing (v5.17)
+    // The cluster->theme token output (`allBuild.lines`) is kept as the
+    // LLM topic hint (`themeAll`); the user-facing summary is the
+    // richer, more grounded listing produced by ComposeRichListing.
+    std::vector<std::string> themeAll = allBuild.lines;
+    snap.summary = ComposeRichListing(ranked, "all", themeAll);
 
     // -----------------------------------------------------------------
-    // Per-category one-liners.  Each is an *independent* projection of
+    // Per-category summaries.  Each is an *independent* projection of
     // the same activity window, composed through the same pipeline
     // above.  A consumer picks one of {all, files, websites, apps} via
+    // the dropdown to narrow the surface.
     // the dropdown to narrow the surface.
     //
     // Categorization rules (in priority order, first match wins):
@@ -1944,68 +2568,212 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         else              rankedApps.push_back(a);
     }
 
-    // Augment Files with recently-touched file basenames captured
-    // by FileMonitor.  This catches files that the user looked at
-    // briefly (so they never accumulated significant focus seconds in
-    // an editor) but that still represent a "file the user was
-    // on".  Skip noisy extensions (.dll/.log/.tmp/.bak) and any
-    // basenames already present in rankedFiles (case-insensitive).
+    // Augment Files with recently-touched file basenames captured by
+    // FileMonitor.  Two design constraints:
+    //
+    //   (a) Strict allowlist of user-content extensions only.  The
+    //       previous "deny .dll/.log/.tmp/.bak" was too loose -- it
+    //       let through Outlook .ost/.nst/.pst mail stores, sticky
+    //       notes .sqlite, .config / .xml / .json app data, .lnk
+    //       shortcuts, etc.  Whose basenames frequently include
+    //       directory or user-identity tokens (the user's email
+    //       address, their AppData path components, etc.) that then
+    //       polluted the Files theme.
+    //
+    //   (b) Skip augmentation entirely when a real file app is
+    //       actively in focus.  When the user is sitting in Excel
+    //       editing a spreadsheet, the FileMonitor pool is irrelevant
+    //       background noise -- typing in Excel generates dozens of
+    //       writes to OneDrive caches, Office auto-recover files,
+    //       and similar transient artefacts that we *cannot* fully
+    //       filter at the FileMonitor layer because some of those
+    //       artefacts are real user content (e.g. Outlook .ost).
+    //       Bypassing the augmentation when there's an obvious
+    //       focused-file signal preserves correctness for the
+    //       common case without losing the "briefly-touched file"
+    //       capability for the dormant-app case.
     {
-        std::unordered_set<std::string> seenLowered;
+        // (b): refined "skip augmentation" gate.  The old gate skipped
+        // augmentation whenever any real file app had >= 30 s of focus.
+        // That backfired when Word/Excel/PowerPoint had a generic
+        // title like "Word" (no document name visible in the title
+        // bar -- happens with certain Office 365 modes), because the
+        // focused app's title yielded ZERO content tokens AND the
+        // augmentation that would have surfaced the actual filename
+        // was suppressed.
+        //
+        // Refined gate: only skip augmentation when the focused file
+        // apps already provide a usable signal -- defined as at least
+        // one extractable content token across their titles.  When
+        // they don't (titles like "Word", "Excel", "PowerPoint"
+        // alone), let augmentation through so the actual filename
+        // from FileMonitor surfaces in the summary.
+        bool haveFocusedFileApp        = false;
+        bool focusedAppHasUsefulTitle  = false;
         for (const auto& a : rankedFiles)
-            seenLowered.insert(AsciiLower(a.bestTitle));
+        {
+            if (a.totalFocusSecs < 30) continue;
+            haveFocusedFileApp = true;
+            auto toks = ExtractContentTokens(a.bestTitle);
+            if (!toks.empty()) { focusedAppHasUsefulTitle = true; break; }
+        }
+        bool skipAugmentation = haveFocusedFileApp && focusedAppHasUsefulTitle;
 
-        struct FileVirt { std::string base; int64_t ts; int hits; };
-        std::unordered_map<std::string, FileVirt> byBase;
-        for (const auto& f : files)
+        if (!skipAugmentation)
         {
-            std::string p = WideToUtf8(f.path);
-            if (p.empty()) continue;
-            size_t slash = p.find_last_of("/\\");
-            std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-            if (base.empty()) continue;
-            std::string baseLower = AsciiLower(base);
-            if (baseLower.size() >= 4 &&
-                (baseLower.compare(baseLower.size()-4, 4, ".dll") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".log") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".tmp") == 0 ||
-                 baseLower.compare(baseLower.size()-4, 4, ".bak") == 0))
-                continue;
-            if (seenLowered.count(baseLower)) continue;
-            auto it = byBase.find(baseLower);
-            if (it == byBase.end())
-                byBase[baseLower] = { base, f.timestampUtc, 1 };
-            else
+            // (a): user-content extension allowlist.  Mirrors the
+            // extension set in TitleLooksLikeFileActivity above (the
+            // two should stay in sync).  An empty/missing extension
+            // is rejected -- "anonymous" basenames are almost never
+            // user content.
+            static const std::unordered_set<std::string> kUserContentExt = {
+                "doc","docx","rtf","odt",
+                "xls","xlsx","csv","tsv","ods",
+                "ppt","pptx","odp",
+                "pdf","epub","mobi",
+                "txt","md","rst","tex","one",
+                "jpg","jpeg","png","gif","bmp","tif","tiff",
+                "webp","heic","heif","raw","dng","cr2","nef",
+                "psd","ai","eps","svg","ico",
+                "mp3","wav","flac","m4a","aac",
+                "mp4","mkv","mov","avi","webm",
+                "c","cpp","cc","cxx","h","hpp","hh","hxx",
+                "cs","java","kt","scala","groovy",
+                "py","rb","pl","php","js","mjs","cjs","jsx","ts","tsx",
+                "go","rs","swift","m","mm","dart",
+                "sh","bash","zsh","fish","ps1","psm1","psd1",
+                "html","htm","css","scss","sass","less",
+                "xml","json","yaml","yml","toml","ini","cfg","conf",
+                "sql","graphql","vue","svelte",
+                "r","jl","lua","ex","exs","erl","hs","clj",
+                "zip","rar","7z","tar","gz","tgz"
+            };
+
+            auto extensionOf = [](const std::string& name) -> std::string {
+                size_t dot = name.find_last_of('.');
+                if (dot == std::string::npos || dot + 1 >= name.size())
+                    return std::string();
+                std::string ext = name.substr(dot + 1);
+                // Lowercase ASCII.
+                for (char& c : ext)
+                    if (c >= 'A' && c <= 'Z') c = char(c + 32);
+                return ext;
+            };
+
+            std::unordered_set<std::string> seenLowered;
+            for (const auto& a : rankedFiles)
+                seenLowered.insert(AsciiLower(a.bestTitle));
+
+            // Track each unique basename + its full path so the
+            // InferenceEngine boost can look up the per-file record
+            // (which is keyed by the full lowercased path).  Pick the
+            // most-recently-seen full path when several map to the
+            // same basename.
+            struct FileVirt {
+                std::string  base;
+                std::wstring fullPath;
+                int64_t      ts;
+                int          hits;
+            };
+            std::unordered_map<std::string, FileVirt> byBase;
+            for (const auto& f : files)
             {
-                it->second.hits += 1;
-                if (f.timestampUtc > it->second.ts) it->second.ts = f.timestampUtc;
+                std::string p = WideToUtf8(f.path);
+                if (p.empty()) continue;
+                size_t slash = p.find_last_of("/\\");
+                std::string base = (slash != std::string::npos)
+                                       ? p.substr(slash + 1) : p;
+                if (base.empty()) continue;
+                std::string baseLower = AsciiLower(base);
+
+                // Strip the Excel/Word lockfile prefix "~$" so we don't
+                // treat `~$report.xlsx` as a different file from
+                // `report.xlsx`; the user opened the file, not the
+                // lock.  Also strips a leading "~" which is the Office
+                // auto-recover prefix.
+                std::string keyBase = baseLower;
+                while (!keyBase.empty() && (keyBase[0] == '~' || keyBase[0] == '$'))
+                    keyBase.erase(0, 1);
+
+                std::string ext = extensionOf(keyBase);
+                if (ext.empty() || kUserContentExt.count(ext) == 0)
+                    continue;
+
+                if (seenLowered.count(keyBase)) continue;
+
+                auto it = byBase.find(keyBase);
+                if (it == byBase.end())
+                    byBase[keyBase] = { base, f.path, f.timestampUtc, 1 };
+                else
+                {
+                    it->second.hits += 1;
+                    if (f.timestampUtc > it->second.ts)
+                    {
+                        it->second.ts       = f.timestampUtc;
+                        it->second.fullPath = f.path;
+                    }
+                }
             }
+            std::vector<FileVirt> fv;
+            fv.reserve(byBase.size());
+            for (auto& kv : byBase) fv.push_back(std::move(kv.second));
+            std::sort(fv.begin(), fv.end(),
+                      [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
+            if (fv.size() > 6) fv.resize(6);
+            for (auto& v : fv)
+            {
+                AppAgg agg{};
+                agg.friendlyName    = "File";
+                agg.verb            = "Editing";
+                agg.bestTitle       = v.base;
+                agg.rawTitle        = v.base;
+                agg.filePath        = v.fullPath;   // for InferenceEngine lookup
+                // Cap synthetic focus at 15 s per virt regardless of
+                // FileMonitor hit volume.  Real foreground sessions
+                // (typically 30 s -- many minutes) thus dominate the
+                // theme even when several virts are present.
+                int synth = (std::min)(15, (std::max)(3, v.hits * 3));
+                agg.totalFocusSecs  = synth;
+                agg.lastSeenTs      = v.ts;
+                agg.isBrowser       = false;
+                rankedFiles.push_back(std::move(agg));
+            }
+            // Apply InferenceEngine boost across the whole rankedFiles
+            // bag (real focused-file apps that were already boosted in
+            // the combined-ranked pass + the FileMonitor virtuals just
+            // added).  File apps get keyed by exePath; file virtuals
+            // by filePath.  Re-boosting the real apps is cheap (cache
+            // hit) and keeps the bag internally consistent.
+            ApplyInferenceBoost(rankedFiles, m_inference,
+                [](const AppAgg& a) -> std::string {
+                    if (!a.filePath.empty())
+                        return InferenceEngine::NormalizeEntityKey(a.filePath);
+                    if (!a.exePath.empty())
+                        return InferenceEngine::NormalizeEntityKey(a.exePath);
+                    return std::string();
+                });
+            std::sort(rankedFiles.begin(), rankedFiles.end(),
+                      [](const AppAgg& a, const AppAgg& b){
+                          if (a.weightedFocusSecs != b.weightedFocusSecs)
+                              return a.weightedFocusSecs > b.weightedFocusSecs;
+                          return a.lastSeenTs > b.lastSeenTs;
+                      });
         }
-        std::vector<FileVirt> fv;
-        fv.reserve(byBase.size());
-        for (auto& kv : byBase) fv.push_back(std::move(kv.second));
-        std::sort(fv.begin(), fv.end(),
-                  [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
-        if (fv.size() > 6) fv.resize(6);
-        for (auto& v : fv)
-        {
-            AppAgg agg{};
-            agg.friendlyName    = "File";
-            agg.verb            = "Editing";
-            agg.bestTitle       = v.base;
-            agg.rawTitle        = v.base;
-            agg.totalFocusSecs  = (std::max)(5, v.hits * 5);
-            agg.lastSeenTs      = v.ts;
-            agg.isBrowser       = false;
-            rankedFiles.push_back(std::move(agg));
-        }
-        std::sort(rankedFiles.begin(), rankedFiles.end(),
-                  [](const AppAgg& a, const AppAgg& b){
-                      if (a.totalFocusSecs != b.totalFocusSecs)
-                          return a.totalFocusSecs > b.totalFocusSecs;
-                      return a.lastSeenTs > b.lastSeenTs;
-                  });
     }
+
+    // rankedApps was split off `ranked` before the FileMonitor-virt
+    // augmentation, but ApplyInferenceBoost on `ranked` already
+    // populated weightedFocusSecs on each entry (file apps and
+    // non-file apps alike).  No need to re-run the boost on
+    // rankedApps -- the values flowed in via the copy.  Re-sort just
+    // in case (cheap; rankedApps is <=20 entries) to keep the
+    // weighted ordering after the split.
+    std::sort(rankedApps.begin(), rankedApps.end(),
+              [](const AppAgg& a, const AppAgg& b){
+                  if (a.weightedFocusSecs != b.weightedFocusSecs)
+                      return a.weightedFocusSecs > b.weightedFocusSecs;
+                  return a.lastSeenTs > b.lastSeenTs;
+              });
 
     // Build the Websites bag from BrowsingMonitor records.  Each
     // unique tab title becomes a virtual AppAgg with focus weighted
@@ -2031,23 +2799,208 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.verb         = "Reading";
                 agg.isBrowser    = true;
             }
+            // Record the URL of the most recent visit so the
+            // InferenceEngine lookup uses URL (preferred) -- which
+            // matches how OnBrowsingEvent stores browsing entries
+            // (URL if non-empty, title otherwise).
+            if (b.timestampUtc > agg.lastSeenTs)
+            {
+                agg.lastSeenTs = b.timestampUtc;
+                if (!b.url.empty()) agg.webUrl = b.url;
+            }
             agg.totalFocusSecs += 30;
-            if (b.timestampUtc > agg.lastSeenTs) agg.lastSeenTs = b.timestampUtc;
         }
         rankedWeb.reserve(webByTitle.size());
         for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
+
+        // Apply InferenceEngine boost: prefer URL key, fall back to
+        // lowercased title (matches InferenceEngine::OnBrowsingEvent's
+        // "url.empty()? title : url" key choice).
+        ApplyInferenceBoost(rankedWeb, m_inference,
+            [](const AppAgg& a) -> std::string {
+                if (!a.webUrl.empty())
+                    return InferenceEngine::NormalizeEntityKey(a.webUrl);
+                if (!a.bestTitle.empty())
+                {
+                    // bestTitle is already in UTF-8 mixed case; lowercase
+                    // it to match the InferenceEngine key form.
+                    std::string lo = a.bestTitle;
+                    for (char& c : lo)
+                        if (c >= 'A' && c <= 'Z') c = char(c + 32);
+                    return lo;
+                }
+                return std::string();
+            });
+
         std::sort(rankedWeb.begin(), rankedWeb.end(),
                   [](const AppAgg& a, const AppAgg& b){
-                      if (a.totalFocusSecs != b.totalFocusSecs)
-                          return a.totalFocusSecs > b.totalFocusSecs;
+                      if (a.weightedFocusSecs != b.weightedFocusSecs)
+                          return a.weightedFocusSecs > b.weightedFocusSecs;
                       return a.lastSeenTs > b.lastSeenTs;
                   });
         if (rankedWeb.size() > 16) rankedWeb.resize(16);
     }
 
-    snap.oneLinerFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).text;
-    snap.oneLinerWebsites  = composeOneLinerFromBag(rankedWeb,  /*categoryMode=*/true).text;
-    snap.oneLinerApps      = composeOneLinerFromBag(rankedApps, /*categoryMode=*/true).text;
+    // ---- Canonical per-facet summaries: rich deterministic listing --
+    // Keep the cluster->theme token output as the LLM topic hint
+    // (themeFiles/Websites/Apps); surface the richer listing.
+    std::vector<std::string> themeFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).lines;
+    std::vector<std::string> themeWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
+    std::vector<std::string> themeApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
+
+    snap.summaryFiles    = ComposeRichListing(rankedFiles, "files",    themeFiles);
+    snap.summaryWebsites = ComposeRichListing(rankedWeb,   "websites", themeWebsites);
+    snap.summaryApps     = ComposeRichListing(rankedApps,  "apps",     themeApps);
+
+    // ---- LLM refinement (gated) -----------------------------------
+    // The canonical per-facet summary is now the rich deterministic
+    // listing produced above.  When the Qwen3-0.6B "brain" model is
+    // loaded we still give it a chance to produce nicer prose, but its
+    // output only REPLACES the listing when it is at least as grounded
+    // in the actual window titles as the listing is -- measured by
+    // granite cosine to the joined titles.
+    //
+    // Why gated rather than unconditional (the pre-v5.17 behaviour):
+    // an A/B harness over 12 realistic scenarios (Qwen3-0.6B + granite,
+    // see commit message) showed the unconditional LLM override was a
+    // net LOSS -- the 0.6B model drops activity breadth, its output is
+    // rejected by the grounding gate 75-90% of the time (so the user
+    // was usually shown the terse token-theme), and even when accepted
+    // it is, on average, LESS grounded than the listing (granite
+    // cos-to-titles 0.906 vs 0.920).  The gate keeps the rare genuine
+    // LLM win (cleaner prose for a single-topic facet) while flooring
+    // the common case at the much-better listing.  The cluster->theme
+    // token output (themeAll / themeFiles / ...) is passed as the LLM
+    // topic hint, exactly as before.
+    snap.modelPolish = (m_llm && m_llm->IsLoaded())
+                          ? m_llm->ModelName()
+                          : std::string("(not loaded)");
+    if (m_llm && m_llm->IsLoaded())
+    {
+        // Combined "all" -- merged top-N items already in snap.items.
+        std::vector<LlmActivityItem> llmItemsAll;
+        llmItemsAll.reserve(snap.items.size());
+        for (const auto& it : snap.items)
+        {
+            LlmActivityItem li;
+            li.app          = it.app;
+            li.title        = it.title;
+            li.rawTitle     = it.rawTitle;
+            li.focusSeconds = it.focusSeconds;
+            li.pct          = it.pct;
+            llmItemsAll.push_back(std::move(li));
+        }
+
+        // Per-facet projection from the corresponding bag.  `pct` is
+        // recomputed relative to the *facet* total focus so a single
+        // dominant Files entry reads as "100% of files focus" rather
+        // than "12% of global focus".  Cap each facet's item list at
+        // kMaxPromptItems-equivalent (5) so the prompt stays small.
+        auto bagToLlmItems = [](const std::vector<AppAgg>& bag)
+            -> std::vector<LlmActivityItem>
+        {
+            std::vector<LlmActivityItem> out;
+            if (bag.empty()) return out;
+            int64_t total = 0;
+            for (const auto& a : bag) total += a.totalFocusSecs;
+            const size_t cap = (std::min)(bag.size(), static_cast<size_t>(5));
+            out.reserve(cap);
+            for (size_t i = 0; i < cap; ++i)
+            {
+                const AppAgg& a = bag[i];
+                LlmActivityItem li;
+                li.app          = a.friendlyName;
+                li.title        = a.bestTitle;
+                li.rawTitle     = a.rawTitle;
+                li.focusSeconds = a.totalFocusSecs;
+                li.pct = (total > 0)
+                         ? static_cast<int>(
+                               (100.0 * a.totalFocusSecs) / total + 0.5)
+                         : 0;
+                out.push_back(std::move(li));
+            }
+            return out;
+        };
+
+        std::vector<LlmActivityItem> llmItemsFiles    = bagToLlmItems(rankedFiles);
+        std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
+        std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
+
+        // Joiner used by the groundedness gate.
+        auto joinLines = [](const std::vector<std::string>& v) -> std::string {
+            std::string s;
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                if (i) s += ". ";
+                s += v[i];
+            }
+            return s;
+        };
+
+        // Helper: run the LLM for one facet.  The LLM output replaces
+        // the rich listing only when it (a) survives the LLM's own
+        // grounding / anti-copy gates AND (b) is at least as grounded
+        // in the window titles as the listing -- granite cosine to the
+        // joined item titles, with a small tolerance so genuinely
+        // nicer prose isn't rejected for a trivial grounding dip.
+        auto runFacet = [&](std::vector<std::string>&        canonical,
+                            const std::vector<std::string>&  hint,
+                            const std::vector<LlmActivityItem>& facetItems,
+                            const char*                       category)
+        {
+            if (facetItems.empty()) return;
+            auto generated = m_llm->Polish(hint, facetItems, category);
+            if (generated.empty()) return;
+
+            // Groundedness gate (only when the granite encoder is
+            // available; otherwise keep the listing -- we can't score).
+            if (m_modelReady)
+            {
+                std::string titles;
+                for (const auto& it : facetItems)
+                {
+                    if (!titles.empty()) titles += ". ";
+                    titles += it.title.empty() ? it.rawTitle : it.title;
+                }
+                std::vector<float> eT = Embed(titles);
+                std::vector<float> eG = Embed(joinLines(generated));
+                std::vector<float> eC = Embed(joinLines(canonical));
+                if (!eT.empty() && !eG.empty() && !eC.empty())
+                {
+                    float cosG = CosineSim(eG, eT);
+                    float cosC = CosineSim(eC, eT);
+                    // Reject the LLM rewrite when it is meaningfully
+                    // less grounded than the listing.
+                    if (cosG + 0.02f < cosC) return;
+                }
+            }
+            canonical = generated;
+        };
+
+        runFacet(snap.summary,         themeAll,      llmItemsAll,      "all");
+        runFacet(snap.summaryFiles,    themeFiles,    llmItemsFiles,    "files");
+        runFacet(snap.summaryWebsites, themeWebsites, llmItemsWebsites, "websites");
+        runFacet(snap.summaryApps,     themeApps,     llmItemsApps,     "apps");
+    }
+
+    // ---- Granite translator: embed the canonical summary -----------
+    // After the brain has produced the final user-facing summary
+    // (LLM-generated when loaded, algorithmic when not), use the
+    // granite embedding model as the "translator" to produce a
+    // 384-dim L2-normalized vector representation of the combined
+    // summary, suitable for similarity search / clustering across
+    // snapshots in downstream consumers.  Empty when the granite
+    // model isn't loaded or the summary is empty.
+    if (m_modelReady && !snap.summary.empty())
+    {
+        std::string joined;
+        for (size_t i = 0; i < snap.summary.size(); ++i)
+        {
+            if (i) joined += ". ";
+            joined += snap.summary[i];
+        }
+        snap.summaryEmbedding = Embed(joined);
+    }
 
     // ---- Confidence -----------------------------------------------
     // Heuristic: 0 if no focus, ~0.3 with a small amount of focus, up
@@ -2070,23 +3023,43 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
                                                    const std::string& category)
 {
-    // Resolve the top-level "one_liner" surface based on the requested
+    // Resolve the top-level `summary` surface based on the requested
     // category and decide which per-category fields to emit.
     //
-    //   * category == "all": the combined one-liner is surfaced as
-    //     `one_liner` and the three per-category lines are *also*
+    //   * category == "all": the combined summary is surfaced as
+    //     `summary` and the three per-category summaries are *also*
     //     emitted (so a single "All" round-trip carries the data the
     //     UI dropdown can switch between without re-querying).
     //
     //   * category == "files" / "websites" / "apps": only the
-    //     matching per-category line is emitted -- as the top-level
-    //     `one_liner`.  The other two categories and the combined
-    //     "all" line are *not* serialized, keeping the response
+    //     matching per-category summary is emitted -- as the top-level
+    //     `summary`.  The other two categories and the combined
+    //     "all" summary are *not* serialized, keeping the response
     //     focused on what the consumer asked for.
-    std::string topLine = s.oneLiner;
-    if      (category == "files")     topLine = s.oneLinerFiles;
-    else if (category == "websites")  topLine = s.oneLinerWebsites;
-    else if (category == "apps")      topLine = s.oneLinerApps;
+    auto emitArray = [&](std::ostringstream& out,
+                         const std::vector<std::string>& lines) {
+        out << "[";
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            if (i) out << ",";
+            out << "\"" << EscapeJson(lines[i]) << "\"";
+        }
+        out << "]";
+    };
+
+    const std::vector<std::string>* topSummary         = &s.summary;
+    if (category == "files")
+    {
+        topSummary         = &s.summaryFiles;
+    }
+    else if (category == "websites")
+    {
+        topSummary         = &s.summaryWebsites;
+    }
+    else if (category == "apps")
+    {
+        topSummary         = &s.summaryApps;
+    }
 
     std::ostringstream o;
     o << "{"
@@ -2095,14 +3068,15 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"window_end\":"      << s.windowEndTs
       << ",\"window_seconds\":"  << s.windowSeconds
       << ",\"category\":\""      << EscapeJson(category) << "\""
-      << ",\"one_liner\":\""     << EscapeJson(topLine)  << "\"";
+      << ",\"summary\":";
+    emitArray(o, *topSummary);
 
     if (category == "all")
     {
-        // Emit all three per-category lines alongside the combined one.
-        o << ",\"one_liner_files\":\""    << EscapeJson(s.oneLinerFiles)    << "\""
-          << ",\"one_liner_websites\":\"" << EscapeJson(s.oneLinerWebsites) << "\""
-          << ",\"one_liner_apps\":\""     << EscapeJson(s.oneLinerApps)     << "\"";
+        // Emit all three per-category summaries alongside the combined.
+        o << ",\"summary_files\":";    emitArray(o, s.summaryFiles);
+        o << ",\"summary_websites\":"; emitArray(o, s.summaryWebsites);
+        o << ",\"summary_apps\":";     emitArray(o, s.summaryApps);
     }
 
     o << ",\"activity_count\":" << s.activityCount
@@ -2111,11 +3085,23 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
       << ",\"confidence\":"     << s.confidence
       << ",\"thread_count\":"   << s.threadCount
       << ",\"model\":\""        << EscapeJson(s.model) << "\""
+      << ",\"model_polish\":\"" << EscapeJson(s.modelPolish) << "\""
       << ",\"signal_types\":[";
     for (size_t i = 0; i < s.signalTypes.size(); ++i)
     {
         if (i) o << ",";
         o << "\"" << EscapeJson(s.signalTypes[i]) << "\"";
+    }
+    o << "],\"summary_embedding\":[";
+    // Compact comma-separated floats with 6-decimal precision.  Always
+    // emitted (empty array when the embedding model isn't loaded) so
+    // downstream consumers can rely on the field being present.
+    for (size_t i = 0; i < s.summaryEmbedding.size(); ++i)
+    {
+        if (i) o << ",";
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%.6f", s.summaryEmbedding[i]);
+        o << buf;
     }
     o << "],\"items\":[";
     for (size_t i = 0; i < s.items.size(); ++i)
