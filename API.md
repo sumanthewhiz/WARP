@@ -1,58 +1,82 @@
 # WARP Activity API -- Integration Guide
 
-> **Version:** 4.0
-> **Pipe endpoint:** `\\.\pipe\WarpFileActivityAPI`
-> **Transport:** Windows Named Pipe (message mode)
-> **Encoding:** UTF-8 JSON
+> **API version:** 2 -- every response carries `"api_version": 2`; v1 requests keep working
+> **Server:** `ApiServer` in WARP 6.0 (replaces the v1 `QueryApi`)
+> **Pipe endpoints:** `\\.\pipe\WarpFileActivityAPI-<SessionId>` (preferred) and `\\.\pipe\WarpFileActivityAPI` (legacy, same-session clients only)
+> **Transport:** local Windows named pipe, message mode, one JSON request -> one JSON response, keep-alive (reconnect when the server closes a connection)
+> **Encoding:** UTF-8 JSON (strict RFC 8259)
 
-This document describes how third-party applications running on the same Windows
-machine can connect to the WARP service and query activity history -- including
-file/folder events, application launches, and browsing activity -- as well as
-precomputed per-entity inference data (recency scores, access counts, edit
-timestamps) to make better-informed decisions in their own workflows.
+This document describes how applications running on the same Windows machine, in the
+same user session, can connect to WARP and query activity history -- file, app-launch,
+app-focus and browsing events -- together with precomputed per-entity engagement
+(scores, counts, human-readable reasons), an incremental change feed, the work
+session / work thread history and a summary of what the user is doing right now.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+  - [What Changed in API v2](#what-changed-in-api-v2)
 - [Prerequisites](#prerequisites)
 - [Connection](#connection)
+  - [Pipe Details](#pipe-details)
+  - [Connection Lifecycle](#connection-lifecycle)
+  - [Server Deadlines](#server-deadlines)
+  - [Verifying the Server](#verifying-the-server)
+- [Access Control](#access-control)
+  - [Caller Identification](#caller-identification)
+  - [Policy Settings](#policy-settings)
+  - [Scopes](#scopes)
+- [Limits](#limits)
 - [Request Format](#request-format)
-  - [Predefined Time Window](#1-predefined-time-window)
-  - [Custom Time Range](#2-custom-time-range-in-seconds)
-  - [Default Query](#3-default-query)
-  - [Event Type Filtering](#4-event-type-filtering)
-  - [Inference Operations](#5-inference-operations)
+- [Responses and Errors](#responses-and-errors)
+  - [Error Format](#error-format)
+  - [Error Codes](#error-codes)
+- [Entity Keys and Normalization](#entity-keys-and-normalization)
+- [Operations](#operations)
+  - [Operation Summary](#operation-summary)
+  - [1. Raw Events (v1)](#1-raw-events-v1)
+  - [2. Inference Lookups (v1-compatible)](#2-inference-lookups-v1-compatible)
     - [QueryInferences](#queryinferences)
     - [GetInferenceDeltas](#getinferencedeltas)
+  - [3. Entities](#3-entities)
+    - [ScoreEntities](#scoreentities)
+    - [TopEntities](#topentities)
+    - [SearchActivity](#searchactivity)
+    - [GetChanges](#getchanges)
+    - [WaitForChanges](#waitforchanges)
+  - [4. Timeline and History](#4-timeline-and-history)
+    - [QueryTimeline](#querytimeline)
+    - [GetWorkThreads](#getworkthreads)
+    - [GetRelated](#getrelated)
+  - [5. Context](#5-context)
     - [GetRecentContext](#getrecentcontext)
     - [GetRecentContexts](#getrecentcontexts)
-- [Response Format](#response-format)
-  - [Top-Level Structure](#top-level-structure)
-  - [File Activity Fields](#file-activity-fields)
-  - [File Action Types](#file-action-types)
-  - [App Launch Activity Fields](#app-launch-activity-fields)
-  - [Browsing Activity Fields](#browsing-activity-fields)
-- [Inference Response Format](#inference-response-format)
-  - [QueryInferences Response](#queryinferences-response)
-  - [GetInferenceDeltas Response](#getinferencedeltas-response)
-  - [GetRecentContext Response](#getrecentcontext-response)
-  - [GetRecentContexts Response](#getrecentcontexts-response)
-  - [Inference Record Fields](#inference-record-fields)
-- [Error Handling](#error-handling)
-- [Data Retention & Limits](#data-retention--limits)
+    - [GetCurrentContext](#getcurrentcontext)
+    - [Context Snapshot Fields](#context-snapshot-fields)
+  - [6. Status and Control](#6-status-and-control)
+    - [Ping](#ping)
+    - [GetStatus](#getstatus)
+    - [Purge](#purge)
+    - [Pause and Resume](#pause-and-resume)
+- [Entity Records and Scores](#entity-records-and-scores)
+  - [Entity Record Fields](#entity-record-fields)
+  - [Score Fields](#score-fields)
+  - [How Scores Work](#how-scores-work)
+- [Data Retention](#data-retention)
 - [Integration Patterns](#integration-patterns)
-  - [Recent File Picker](#1-recent-file-picker)
-  - [Backup & Sync Engine](#2-backup--sync-engine)
-  - [Security Auditing](#3-security-auditing)
-  - [Developer Tooling](#4-developer-tooling)
-  - [Smart Cleanup Utility](#5-smart-cleanup-utility)
-  - [App Usage Analytics](#6-app-usage-analytics)
-  - [Browsing History Dashboard](#7-browsing-history-dashboard)
-  - [Smart File Ranking](#8-smart-file-ranking)
-  - [Incremental Inference Sync](#9-incremental-inference-sync)
-  - [Semantic Context Awareness](#10-semantic-context-awareness)
+  - [Recent Items Picker](#1-recent-items-picker)
+  - [Context-Aware Ranking](#2-context-aware-ranking)
+  - [Local Index Sync](#3-local-index-sync)
+  - [Backup & Sync Engine](#4-backup--sync-engine)
+  - [Security Auditing](#5-security-auditing)
+  - [Developer Tooling](#6-developer-tooling)
+  - [Smart Cleanup Utility](#7-smart-cleanup-utility)
+  - [App Usage Analytics](#8-app-usage-analytics)
+  - [Browsing History Dashboard](#9-browsing-history-dashboard)
+  - [Work Resumption](#10-work-resumption)
+  - [Semantic Context Awareness](#11-semantic-context-awareness)
 - [Client Examples](#client-examples)
   - [C++ (Win32)](#c-win32)
   - [C# (.NET)](#c-net)
@@ -69,32 +93,67 @@ timestamps) to make better-informed decisions in their own workflows.
 
 ## Overview
 
-WARP continuously records three categories of user activity on the local PC:
+WARP continuously records user activity on the local PC:
 
-| Event Type | What is Captured | Source |
+| Event type | What is captured | Source |
 |---|---|---|
-| **File activity** | Creates, opens, modifications, deletions, renames of files and folders | `ReadDirectoryChangesW`, `SHChangeNotifyRegister`, NT Kernel Logger ETW |
-| **App launches** | Every user-initiated application start (exe name, path, PID) | Process table polling via `CreateToolhelp32Snapshot` (every 2 seconds) |
-| **Browsing activity** | Browser page title changes and URLs when a browser is in the foreground | Foreground window polling via `GetForegroundWindow` + `GetWindowText` (every 3 seconds) |
+| **File activity** | Opens, creates, modifications, deletes, renames and downloads of files | Kernel file I/O ETW, NTFS USN journal, shell Recent items, Office MRU (see the `source` field) |
+| **App launches** | User-visible process starts: exe name and path, PID, parent process, AUMID of packaged apps | Kernel process ETW |
+| **App focus** | Foreground sessions: app, window title, start / end, active (non-idle) seconds and the document or page that was shown | WinEvent foreground hooks + presence |
+| **Browsing** | Title, canonical (privacy-filtered) URL and host of the page shown in a supported browser | UI Automation |
+| **Presence** | `active` / `passive` / `away` / `locked` / `asleep` intervals | Input idle time, media / microphone / camera use, lock and power state |
 
-All events are stored in a local SQLite database with a 30-day rolling window. Any
-Windows process running on the same machine can connect to the WARP named pipe and
-retrieve this history as structured JSON, optionally filtered by event type.
+Content from private browsing windows and from the apps, window titles, domains and
+folders excluded in WARP's settings is not recorded.
+
+On top of the raw events WARP maintains:
+
+- **Entities** -- one record per file, app and web page / document with decayed engagement,
+  counts and a per-type percentile score, plus a global change feed.
+- **History** -- work sessions (presence split by gaps of 15 minutes or more), work threads
+  (groups of entities used together, resumable across days, with a project anchor) and
+  co-occurrence edges between entities.
+- **Context** -- a summary of what the user is doing, recomposed every
+  `ContextCadenceSeconds` (default 60 s), together with the entities behind it.
+
+Everything is stored locally in SQLite (`%LOCALAPPDATA%\WARP\activity.db`). Raw events are
+kept for 30 days and entities / history for 395 days by default (see
+[Data Retention](#data-retention)).
 
 **Typical use cases:**
 
-| Use Case | How WARP Helps |
+| Use case | Operation |
 |---|---|
-| Show "recently opened" files | Query `file` type, filter for `OPEN` actions |
-| Incremental backup | Query `file` type, filter `CREATE` + `MODIFY` actions since last sync |
-| Audit trail | Query all types for the full 30-day window |
-| Dev tooling | Query `file` type for `MODIFY` actions matching your project directory |
-| Smart cleanup | Query `file` type for 30 days, find untouched files |
-| App usage analytics | Query `app_launch` type to see which apps were used and when |
-| Browsing dashboard | Query `browsing` type to review page titles and URLs visited |
-| Smart file ranking | Use `QueryInferences` to get recency scores and open counts for a set of files |
-| Incremental inference sync | Use `GetInferenceDeltas` to stream changes since your last known version watermark |
-| Dynamic context awareness | Use `GetRecentContext` for the latest **context summary** (1–3 phrase lines describing what the user is doing right now — e.g., `["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "Researching React Hooks"]`); use `GetRecentContexts` for short-term memory (last *N* snapshots, newest first) |
+| "Recent" / "frequent" files, apps or pages | [`TopEntities`](#topentities) |
+| Rank or boost a candidate list (search results, file picker, launcher) | [`ScoreEntities`](#scoreentities), optionally with `"context": "current"` |
+| Find something the user worked on by name | [`SearchActivity`](#searchactivity) |
+| Keep a local index in sync | [`GetChanges`](#getchanges) + [`WaitForChanges`](#waitforchanges) |
+| Audit or replay a time range | [`QueryTimeline`](#querytimeline) (paged) or [raw events](#1-raw-events-v1) |
+| "What was I working on yesterday?" | [`GetWorkThreads`](#getworkthreads), `QueryTimeline` with `sessions` / `threads` |
+| "Items related to this file" | [`GetRelated`](#getrelated) |
+| What is the user doing right now? | [`GetCurrentContext`](#getcurrentcontext), [`GetRecentContext`](#getrecentcontext) |
+| Context drift / short-term memory | [`GetRecentContexts`](#getrecentcontexts) |
+| v1 integrations (recency scores, delta sync) | [`QueryInferences`](#queryinferences), [`GetInferenceDeltas`](#getinferencedeltas) |
+| Health checks and diagnostics | [`Ping`](#ping), [`GetStatus`](#getstatus) |
+
+### What Changed in API v2
+
+API v2 is served by `ApiServer` (WARP 6.0), which replaces the v1 `QueryApi`. v1 requests --
+raw event queries, `QueryInferences`, `GetInferenceDeltas`, `GetRecentContext` and
+`GetRecentContexts` -- keep their request and response shapes. What changed:
+
+| Area | v1 (`QueryApi`) | v2 (`ApiServer`) |
+|---|---|---|
+| Versioning | no version field | `"api_version": 2` is the first member of every response, including errors |
+| Pipe | one global name, default security | per-session name `WarpFileActivityAPI-<SessionId>` (the legacy name is kept for same-session clients), explicit DACL, medium integrity label, remote clients rejected |
+| Callers | anonymous | identified by PID, session and image; optional allow-list and scopes (see [Access Control](#access-control)) |
+| Errors | silent fallbacks: malformed JSON, an unknown `op` or an unknown `window` returned the last hour of raw events | structured errors `{"ok": false, "error": {"code", "message"}}` (see [Error Codes](#error-codes)) |
+| Sizes | 64 KB buffers; larger responses were cut off | requests up to 1 MiB; responses of any size (read until the message is complete); hard row limits with `truncated` flags and cursors |
+| Connections | one request per connection | keep-alive: up to 256 requests per connection; the server closes a kept-alive connection after any response while other clients are waiting, so clients must be ready to reconnect |
+| Server resources | unlimited instances, no deadlines | 8 workers, 64 queued connections (beyond that: a `busy` error), per-connection deadlines, at most 4 concurrent long-polls |
+| Operations | raw events + 4 ops | raw events + 18 ops: adds `ScoreEntities`, `TopEntities`, `SearchActivity`, `GetChanges`, `WaitForChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetCurrentContext`, `Ping`, `GetStatus`, `Purge`, `Pause` and `Resume` |
+| Raw events | file, app launch, browsing | adds `app_focus`, `confidence`, `source`, `entity_key`, `limit`, `min_confidence`, `truncated` and paging with `before_id` / `next_before_id` |
+| Inference `version` | per-entity counter | the global `change_seq` (monotonic across all entities); `GetInferenceDeltas` also returns `deleted`, `next_version`, `current_version`, `more` and `reset` |
 
 ---
 
@@ -102,10 +161,10 @@ retrieve this history as structured JSON, optionally filtered by event type.
 
 | Requirement | Details |
 |---|---|
-| **WARP must be running** | The named pipe is only available while the WARP process is active. WARP runs as a system-tray application and starts automatically if configured. |
-| **Administrator privileges** | WARP itself requires admin to start (for kernel-level ETW tracing). Your client application does **not** need admin privileges to connect to the pipe. |
-| **Same machine** | The pipe is local-only (`\\.\pipe\...`). Remote connections are not supported. |
-| **Windows 10 or later** | WARP uses NT Kernel Logger ETW, which requires Windows 10+. |
+| **WARP running in your session** | WARP is a per-user tray (or `--headless`) application that runs elevated in the interactive session; every Windows session has its own instance and its own pipe. While nothing listens, opening the pipe fails with `ERROR_FILE_NOT_FOUND` (2). |
+| **No elevation for clients** | The pipe grants read/write access to the interactive user at medium integrity, so ordinary (non-elevated) desktop apps of that user can connect. Low-integrity and AppContainer (sandboxed UWP / MSIX) processes can connect only when policy `ApiAllowAppContainerClients` = 1. Processes of other user accounts cannot connect (SYSTEM and elevated administrators can). |
+| **Same machine** | Remote (SMB) clients are rejected. |
+| **Windows 10 or later** | Required by WARP. Clients only need the Win32 named-pipe API, available from any language or runtime. |
 
 ---
 
@@ -115,742 +174,1612 @@ retrieve this history as structured JSON, optionally filtered by event type.
 
 | Property | Value |
 |---|---|
-| **Pipe name** | `\\.\pipe\WarpFileActivityAPI` |
-| **Pipe mode** | `PIPE_TYPE_MESSAGE \| PIPE_READMODE_MESSAGE` |
-| **Access** | `GENERIC_READ \| GENERIC_WRITE` |
-| **Concurrency** | `PIPE_UNLIMITED_INSTANCES` -- multiple clients can connect simultaneously |
-| **Max message size** | 64 KB (65,536 bytes) for both request and response buffers |
+| **Pipe name (preferred)** | `\\.\pipe\WarpFileActivityAPI-<SessionId>`, where `<SessionId>` is the Windows session of the client process (`ProcessIdToSessionId(GetCurrentProcessId(), &id)`; .NET: `Process.GetCurrentProcess().SessionId`). |
+| **Pipe name (legacy)** | `\\.\pipe\WarpFileActivityAPI`, kept for v1 clients. Served only to clients in the same session as the WARP instance that owns it; callers from other sessions get [`wrong_session`](#error-codes), whose message names the pipe to use. When several sessions run WARP (fast user switching, RDP) only one instance can own the legacy name. |
+| **Pipe mode** | `PIPE_TYPE_MESSAGE \| PIPE_READMODE_MESSAGE` -- every request and every response is exactly one message. |
+| **Client access** | Open with `GENERIC_READ \| GENERIC_WRITE`, then switch the handle to `PIPE_READMODE_MESSAGE`. |
+| **Security descriptor** | `D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019f;;;<user SID>)S:(ML;;NW;;;ME)` -- network logons denied, SYSTEM and Administrators full access, the interactive user (the account WARP runs as) `FILE_GENERIC_READ \| FILE_GENERIC_WRITE` (`0x12019f`), medium mandatory label. With `ApiAllowAppContainerClients` = 1 WARP adds `(A;;0x12019f;;;AC)` (all AppContainers) and uses the low label `S:(ML;;NW;;;LW)`. The descriptor is built when the API starts. |
+| **Remote clients** | Rejected (`PIPE_REJECT_REMOTE_CLIENTS` and the `NU` deny entry). |
+| **Instances** | Unlimited; a new instance is armed before each accepted connection is handed to a worker. The 64 KiB pipe buffers are not a message-size limit. |
+| **Name squatting** | WARP creates the first instance of each name with `FILE_FLAG_FIRST_PIPE_INSTANCE`. If another process already owns the name, WARP logs it, retries every 10 s and reports `session_pipe_owned` / `legacy_pipe_owned` = `false` in [`GetStatus`](#getstatus). Clients should [verify the server](#verifying-the-server). |
 
 ### Connection Lifecycle
 
-1. **Open** the pipe with `CreateFile` (or your language's equivalent).
-2. **Set message mode** via `SetNamedPipeHandleState` with `PIPE_READMODE_MESSAGE`.
-3. **Write** a single UTF-8 JSON request message.
-4. **Read** a single UTF-8 JSON response message.
-5. **Close** the pipe handle.
+1. **Compute the pipe name** from your session id (see above).
+2. **Open** it with `CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL)`.
+   - `ERROR_PIPE_BUSY` (231): call `WaitNamedPipeW(name, timeout)` and retry.
+   - `ERROR_FILE_NOT_FOUND` (2): WARP is not running in this session. (WARP builds before
+     API v2 only expose the legacy name; a client may fall back to it.)
+   - `ERROR_ACCESS_DENIED` (5): see [Troubleshooting](#troubleshooting).
+3. **Optionally verify the server** with `GetNamedPipeServerProcessId` (see
+   [Verifying the Server](#verifying-the-server)).
+4. **Set message mode**: `DWORD mode = PIPE_READMODE_MESSAGE;`
+   `SetNamedPipeHandleState(h, &mode, NULL, NULL)`.
+5. **Write** one UTF-8 JSON request with a single `WriteFile` call (one message, at most 1 MiB).
+6. **Read** the response: call `ReadFile` until it succeeds; while it fails with
+   `ERROR_MORE_DATA` (234), keep what was read and call it again. Responses are routinely
+   larger than any fixed buffer.
+7. **Send further requests** on the same handle (keep-alive) or **close** it.
 
-Each connection is one request -> one response -> close. To make multiple queries,
-open a new connection for each.
+Requests on one connection are processed strictly in order: send the next request only
+after the previous response has been read completely.
+
+**Be ready to reconnect.** The server may close a kept-alive connection after any response
+(see below). A reply that was written is still delivered -- the server only closes its
+handle, so the client can read it to the end. The closure shows up on the next request:
+when `WriteFile` or `ReadFile` fails with `ERROR_NO_DATA` (232),
+`ERROR_PIPE_NOT_CONNECTED` (233) or `ERROR_BROKEN_PIPE` (109), open a new connection and
+send the request again -- every operation except `Purge`, `Pause` and `Resume` is
+read-only and safe to repeat.
+
+### Server Deadlines
+
+| Deadline | Value | What happens |
+|---|---|---|
+| First request | 5 s after a worker picks up the connection | connection closed without a response |
+| Next request on a kept-alive connection | 10 s idle | connection closed |
+| Other connections waiting in the accept queue | checked after every response | connection closed after the response: the worker moves on to the waiting client, and you reconnect for your next request |
+| Delivering a response | 30 s (the client must keep reading) | connection closed |
+| Requests per connection | 256 | connection closed after the 256th response |
+| Request size | 1 MiB | `request_too_large` is returned, then the connection is closed |
+| Rejected client (`wrong_session`, `unauthorized`) | first request | the error answers the first request, then the connection is closed |
+
+An open connection occupies one of the 8 server workers until it is closed; queued
+connections are served as workers free up. When all workers are busy and 64 connections
+are already queued, a new connection is answered with
+`{"api_version":2,"ok":false,"error":{"code":"busy","message":"the server is busy; retry shortly"}}`
+and closed (counted as `busy` in [`GetStatus`](#getstatus)). The error is written as soon
+as the connection is accepted, possibly before your request: if your `WriteFile` fails, a
+`ReadFile` can still return it. Back off and retry. A zero-byte message also closes the
+connection.
+
+### Verifying the Server
+
+Any process of the user could create a pipe with WARP's name while WARP is not running
+(WARP itself detects squatting when it starts, see above). Before sending sensitive
+requests, check who serves the pipe:
+
+1. `GetNamedPipeServerProcessId(h, &pid)` returns the server's PID.
+2. Resolve the image path of that PID (`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
+   `QueryFullProcessImageNameW`) and check that it is WARP's executable (`WARP!.exe` in its
+   install location; optionally verify its signature).
+3. [`GetStatus`](#getstatus) reports WARP's own `pid`; it must equal the PID from step 1.
+
+---
+
+## Access Control
+
+### Caller Identification
+
+For every connection WARP calls `GetNamedPipeClientProcessId` and
+`GetNamedPipeClientSessionId` and resolves the client's image path with
+`QueryFullProcessImageNameW`. The checks below use the lower-cased exe **file name**
+(e.g. `myapp.exe`); only the control scope compares the full path.
+
+1. **Session** (legacy pipe only): a client from another session gets `wrong_session`.
+2. **Allow-list**: when `ApiAllowedClients` is non-empty, a client whose exe name is not
+   listed (or cannot be determined) gets `unauthorized`.
+3. **Activity scope**: when `ApiRestrictActivityScope` = 1, only exe names listed in
+   `ApiActivityClients` receive the activity scope (titles, URLs, paths, timeline);
+   everyone else gets `forbidden` for the activity operations (see [Scopes](#scopes)).
+4. **Control scope**: `Purge`, `Pause` and `Resume` are accepted only when the client's full
+   image path equals WARP's own executable -- i.e. the WARP command line
+   (`WARP!.exe --status`, `--pause [minutes]`, `--resume`, `--purge-hours <n>`,
+   `--purge-domain <host>`, `--purge-path <folder>`) or WARP's tray UI. Every other client
+   gets `forbidden`.
+
+`wrong_session` and `unauthorized` answer the first request and close the connection;
+`forbidden` is returned per request and the connection stays usable.
+
+### Policy Settings
+
+Settings are layered: defaults <- `HKCU\Software\WARP` <- `HKLM\Software\Policies\WARP`
+(IT policy, 64-bit view; policy values win and are locked). Lists are `REG_MULTI_SZ` (or a
+`;`-separated `REG_SZ`) of exe file names. WARP reads them at start-up; restart WARP after
+changing them.
+
+| Value | Type | Default | Effect |
+|---|---|---|---|
+| `ApiAllowedClients` | list | empty = any local client that passes the pipe DACL | Exe names allowed to use the API; others get `unauthorized`. |
+| `ApiRestrictActivityScope` | DWORD 0/1 | 0 | 1 = only `ApiActivityClients` get the activity scope. |
+| `ApiActivityClients` | list | empty | Exe names granted the activity scope while `ApiRestrictActivityScope` = 1. |
+| `ApiAllowAppContainerClients` | DWORD 0/1 | 0 | 1 = AppContainer and low-integrity clients may open the pipe (adds the `AC` entry and a low integrity label). |
+
+### Scopes
+
+| Scope | Operations | Without the scope |
+|---|---|---|
+| none (any client allowed to connect) | `Ping`, `GetStatus`, `QueryInferences`, `ScoreEntities`, `WaitForChanges` | -- |
+| **activity** (`kActivityOps`, plus raw event queries) | raw event queries (no `op`), `GetInferenceDeltas`, `TopEntities`, `SearchActivity`, `GetChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetRecentContext`, `GetRecentContexts`, `GetCurrentContext` | `forbidden` |
+| **control** (`kControlOps`) | `Purge`, `Pause`, `Resume` | `forbidden` |
+
+Clients without the activity scope can still score entities they already know:
+`ScoreEntities` then omits `display_name` and `title`, and `QueryInferences` never returns
+names or titles. `GetStatus` answers every client, but only WARP's own executable (control
+scope) also receives the database, log and data-folder paths, recent log messages, capture
+error texts, the media / microphone / camera flags and the effective settings; other
+clients get the health summary (see [GetStatus](#getstatus)).
+
+---
+
+## Limits
+
+| Limit | Value | When exceeded |
+|---|---|---|
+| Request size | 1 MiB (`kMaxRequestBytes`) | `request_too_large`, connection closed |
+| JSON nesting depth | 32 | `invalid_json` |
+| Server workers | 8 (one connection each) | connections wait in the queue; a kept-alive connection is closed after its current response while others wait |
+| Accept queue | 64 connections | `busy` error, connection closed (`GetStatus.api.busy`) |
+| Requests per connection | 256 | connection closed |
+| Concurrent `WaitForChanges` | 4 (server-wide) | immediate answer with `retry_after_ms: 1000` |
+| `WaitForChanges.timeout_ms` | default 20000, clamped to 0-25000 | clamped |
+| Keys per `QueryInferences` / `ScoreEntities` | 5000 | `too_many_keys` |
+| `SearchActivity.query` | 512 bytes (at most 8 search tokens are used) | `invalid_request` |
+| Raw events `limit` | default 5000, clamped to 1-50000 per event type | `truncated: true` + `next_before_id` |
+| Raw events `seconds` | must be > 0; capped at 400 days | `invalid_request` / capped |
+| `QueryTimeline.limit` | default 1000, clamped to 1-20000 per event type | `next_cursor` |
+| `QueryTimeline` sessions / threads | 500 sessions, 50 threads (not paged) | cut |
+| `GetChanges.limit` | default 1000, clamped to 1-5000 (upserts + deletes) | `more: true` |
+| `GetInferenceDeltas.limit` | default 5000, clamped to 1-5000 | `more: true` |
+| `TopEntities.limit` | default 50, clamped to 1-1000 | clamped |
+| `SearchActivity.limit` | default 25, clamped to 1-200 | clamped |
+| `GetWorkThreads.limit` | default 20, clamped to 1-200 (top 15 members per thread) | clamped |
+| `GetRelated.limit` | default 20, clamped to 1-100 | clamped |
+| `GetRecentContexts.count` | default 10 (also for values <= 0), max 200 | clamped |
+| Context `window_seconds` | clamped to 0-30 days, then snapped to an allowed window | snapped |
+| `Pause.minutes` | default 60, clamped to 1-10080 (7 days) | clamped |
+
+Out-of-range numbers are clamped silently; parameters of the wrong JSON type are treated as
+absent (their default applies).
 
 ---
 
 ## Request Format
 
-Send a single UTF-8 JSON object. The following fields are supported:
+Every request is one JSON object, UTF-8 encoded, parsed strictly (RFC 8259: no comments,
+trailing commas, single quotes, `NaN`, BOM or trailing data).
 
-### 1. Predefined Time Window
-
-```json
-{ "window": "<window_code>" }
-```
-
-| Code | Time Range | Seconds |
-|---|---|---|
-| `15m` | Last 15 minutes | 900 |
-| `30m` | Last 30 minutes | 1,800 |
-| `1h` | Last 1 hour | 3,600 |
-| `2h` | Last 2 hours | 7,200 |
-| `6h` | Last 6 hours | 21,600 |
-| `24h` | Last 24 hours | 86,400 |
-| `7d` | Last 7 days | 604,800 |
-| `15d` | Last 15 days | 1,296,000 |
-| `30d` | Last 30 days | 2,592,000 |
-
-**Example -- get the last 6 hours of activity:**
-
-```json
-{"window":"6h"}
-```
-
-### 2. Custom Time Range (in seconds)
-
-```json
-{ "seconds": <positive_integer> }
-```
-
-Any positive integer is accepted. The value represents the number of seconds to
-look back from the current time.
-
-**Example -- get the last 5 minutes:**
-
-```json
-{"seconds":300}
-```
-
-### 3. Default Query
-
-```json
-{}
-```
-
-An empty JSON object (or any request without a `window` or `seconds` field)
-defaults to the **last 1 hour**.
-
-### 4. Event Type Filtering
-
-Any request can include a `"types"` array to specify which event categories to
-include in the response:
-
-```json
-{ "window": "1h", "types": ["file", "app_launch", "browsing"] }
-```
-
-| Type value | Description |
+| Rule | Detail |
 |---|---|
-| `file` | File/folder activity (creates, opens, modifications, deletes, renames) |
-| `app_launch` | Application launch events (exe name, path, PID) |
-| `browsing` | Browsing activity events (browser, page title, URL) |
+| `op` | String naming the operation, case-sensitive. A request without `op` (or with an empty `op`) is a v1 [raw event query](#1-raw-events-v1). |
+| Unknown members | Ignored. If a member appears twice, the last one wins. |
+| Wrong types | A parameter of the wrong type falls back to its default (`"limit": "10"` is treated as absent). Exception: `paths` / `keys` must be arrays (`invalid_request`). |
+| Numbers | Integer parameters given with a fraction are truncated toward zero. |
+| Timestamps | Unix epoch **seconds**, UTC, in requests and responses. |
+| Aliases | `paths` / `keys`, `since` / `since_seq`, `window_seconds` / `window_secs` (see each operation). |
 
-**If `"types"` is omitted**, all three event types are returned (backward
-compatible with v1.0 clients that don't send `"types"`).
+```json
+{"op": "TopEntities", "type": "file", "limit": 10}
+```
+
+---
+
+## Responses and Errors
+
+Every response is one JSON object whose first member is `"api_version": 2`.
+
+- v2 operations add `"ok": true` on success.
+- v1-shaped responses -- raw events, `QueryInferences`, `GetInferenceDeltas`,
+  `GetRecentContext`, `GetRecentContexts` -- keep their v1 shape and carry **no** `ok`
+  member on success. Treat a response without an `error` member as a success.
+- Errors always carry `"ok": false` and an `error` object.
+- Strings are valid UTF-8 (invalid sequences become U+FFFD) and control characters are
+  escaped; `NaN` is written as `null`.
+- Integers are 64-bit. `paused_until` is `9223372036854775807` (INT64_MAX) while capture is
+  paused until resumed -- more than JavaScript's `Number` represents exactly.
+- New members may be added to response objects; ignore members you do not know.
+
+### Error Format
+
+```json
+{"api_version":2,"ok":false,"error":{"code":"invalid_request","message":"'query' is required"}}
+```
+
+`code` is stable and meant for programs; `message` is human-readable and may change.
+
+### Error Codes
+
+| Code | Meaning | Typical causes | Connection |
+|---|---|---|---|
+| `invalid_json` | The request is not valid JSON; the message includes the byte offset. | malformed or truncated JSON, invalid UTF-8, nesting deeper than 32 | stays open |
+| `invalid_request` | Valid JSON, but not a valid request. | not an object; unknown `window`; `seconds` <= 0; `paths` / `keys` not an array; missing or over-long `query`; `horizon` not `short` / `long` / `blend` (`ScoreEntities`, `TopEntities`); `type` not `file` / `app` / `url` (`TopEntities`, `SearchActivity`); invalid `start` / `end`; missing `key` / `entity_key` (`GetRelated`); `Purge` without exactly one kind of criterion, or with `start` > `end`; `Pause` `until` not in the future | stays open |
+| `unknown_op` | `op` names no operation. | typo, wrong case, operation from a newer API version | stays open |
+| `too_many_keys` | More than 5000 keys in one request. | `QueryInferences`, `ScoreEntities` | stays open |
+| `unavailable` | A component the operation needs is not running. | the activity store is not open (every operation except `Ping` and `GetStatus` then fails this way); entity store, history engine or context inference not started; pause not supported | stays open |
+| `forbidden` | The client lacks the scope the operation needs. | activity operation while `ApiRestrictActivityScope` = 1 and the exe is not in `ApiActivityClients`; `Purge` / `Pause` / `Resume` from any program other than WARP | stays open |
+| `unauthorized` | The client is not in the allow-list. | `ApiAllowedClients` is set and does not list the client's exe name | closed after the response |
+| `wrong_session` | Legacy pipe used from another Windows session. | the message names the per-session pipe to use | closed after the response |
+| `busy` | The server is saturated: all 8 workers are busy and 64 connections are already queued. | written as soon as the connection is accepted, possibly before your request; back off and retry | closed |
+| `request_too_large` | The request exceeds 1 MiB. | | closed after the response |
+| `internal_error` | Unexpected failure while handling the request (including out of memory). | also a `Purge` that did not complete (store busy or closed) | stays open |
+| `locked` | `Pause` / `Resume` could not change the pause state. | `PausedUntilUtc` is set by policy, or the registry write failed; returned inside the normal `Pause` / `Resume` response together with `paused` and `paused_until` | stays open |
+
+---
+
+## Entity Keys and Normalization
+
+Entities -- files, apps and web pages / documents -- are identified by an `entity_key`
+that is shared by every operation, by the raw events (`entity_key`, `doc_key`) and by the
+context snapshots. Keys are lower-cased with the invariant locale and returned as UTF-8.
+
+| `entity_type` | Key | Example |
+|---|---|---|
+| `file` | canonical full path: `\\?\` and `\Device\Mup\` prefixes unwrapped, `/` -> `\`, `.` / `..` resolved, duplicate and trailing separators and NTFS stream suffixes removed, 8.3 short names expanded | `c:\users\alice\documents\report.docx` |
+| `app` | the exe path as a file key, or `aumid:` + the AUMID for packaged apps | `c:\program files\microsoft vs code\code.exe`, `aumid:microsoft.windowsterminal_8wekyb3d8bbwe!app` |
+| `url` | a stable document identity when the site is recognized (`gh:`, `ado:`, `jira:`, `gdoc:`, `gdrive:`, `spo:`, `spo-path:`, `od:`, `figma:`, `yt:`), otherwise the canonical, privacy-filtered URL; the page title for pages without a URL | `gh:contoso/app#pr12`, `https://learn.microsoft.com/windows/win32/ipc/named-pipes` |
+
+Operations that take **raw identifiers** -- `QueryInferences.paths`, `ScoreEntities.keys`,
+`GetRelated.key`, `Purge.key` -- normalize every string the way WARP's own producers do.
+The first matching rule wins:
+
+1. A key WARP hands out is used as it is (case-folded): strings starting with `aumid:`,
+   `doc:`, `yt:`, `gdoc:`, `gdrive:`, `spo:`, `spo-path:`, `od:`, `gh:`, `ado:`, `figma:` or
+   `jira:` (prefix matched case-insensitively, followed by at least one character).
+2. A drive-letter path (`C:\...`, `C:/...`) or UNC path (`\\server\share\...`) is a file
+   path -> file key.
+3. A string containing `!` and no `\` or `/` is a raw packaged-app AUMID
+   (`Family_hash!App`) -> `aumid:<aumid>`.
+4. A URL or bare domain is canonicalized (fragment, user info and most query parameters
+   removed; sign-in, password-manager, banking and patient-portal hosts excluded) and mapped
+   to its document identity or canonical URL. Excluded or unusable URLs normalize to an
+   empty key and are never found.
+5. Anything else is treated as a file path -> file key.
+
+Responses echo your exact strings: `QueryInferences` keys its `results` by them and
+`ScoreEntities` returns `key` (yours) next to `entity_key` (normalized).
+
+**Round trips.** Every `entity_key` WARP returns -- file keys, exe-path and `aumid:` app
+keys, document identities and canonical URLs -- normalizes to itself, so keys from
+`GetChanges`, `TopEntities`, `SearchActivity` or `current_entities[]` can be passed straight
+back. The exception are pages recorded without a URL, which are keyed by their lower-cased
+title: a title that contains `!`, `:`, `/` or `\`, or looks like a domain, may not
+round-trip. For those use the `entity_key` parameter of `GetRelated` or `Purge`, which is
+used verbatim.
+
+---
+
+## Operations
+
+### Operation Summary
+
+| Op | Group | Scope | Purpose |
+|---|---|---|---|
+| *(none)* | [Raw events (v1)](#1-raw-events-v1) | activity | Raw events of a recent window |
+| `QueryInferences` | [Inference (v1)](#queryinferences) | -- | Per-entity records for keys you supply |
+| `GetInferenceDeltas` | [Inference (v1)](#getinferencedeltas) | activity | v1 change feed |
+| `ScoreEntities` | [Entities](#scoreentities) | -- | Scores, records and reasons for keys you supply |
+| `TopEntities` | [Entities](#topentities) | activity | Top-N entities by engagement |
+| `SearchActivity` | [Entities](#searchactivity) | activity | Search entity names and titles |
+| `GetChanges` | [Entities](#getchanges) | activity | Change feed: upserts and deletes since a cursor |
+| `WaitForChanges` | [Entities](#waitforchanges) | -- | Long-poll until the change sequence moves |
+| `QueryTimeline` | [Timeline](#querytimeline) | activity | Events, work sessions and threads of a time range, paged |
+| `GetWorkThreads` | [History](#getworkthreads) | activity | Work threads with their member entities |
+| `GetRelated` | [History](#getrelated) | activity | Entities used together with an entity |
+| `GetRecentContext` | [Context](#getrecentcontext) | activity | Latest context snapshot for a window |
+| `GetRecentContexts` | [Context](#getrecentcontexts) | activity | Recent snapshot history, newest first |
+| `GetCurrentContext` | [Context](#getcurrentcontext) | activity | Presence, foreground window, latest snapshot, current thread |
+| `Ping` | [Status](#ping) | -- | Liveness and product version |
+| `GetStatus` | [Status](#getstatus) | -- | Health, statistics, settings |
+| `Purge` | [Control](#purge) | control | Delete recorded data |
+| `Pause` / `Resume` | [Control](#pause-and-resume) | control | Pause or resume capture |
+
+### 1. Raw Events (v1)
+
+A request without `op` returns the raw events of a recent window, grouped by event type.
+This is the v1 query; v2 adds app-focus sessions, a row limit and a confidence filter.
+Requires the activity scope.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `window` | string | -- | `15m`, `30m`, `1h`, `2h`, `6h`, `24h`, `7d`, `15d` or `30d`; any other value -> `invalid_request`. Takes precedence over `seconds`. |
+| `seconds` | integer | -- | Look-back in seconds; must be > 0 (`invalid_request` otherwise); capped at 400 days. |
+| *(neither)* | | 1 hour | |
+| `types` | string[] | all four | `file`, `app_launch`, `browsing`, `app_focus`. Unknown values are ignored; if no valid value remains, all types are returned. |
+| `limit` | integer | 5000 | Maximum events **per type**, clamped to 1-50000. |
+| `min_confidence` | number | 0.0 | Drops events whose `confidence` is lower. |
+| `before_id` | integer or object | -- | Paging: pass back a `next_before_id` to get the events older than that row. A number applies to every requested type (ids are per type, so use it with a single type); an object keyed by type -- `{"file": 1041, "browsing": 877}`, keys `file`, `app_launch`, `browsing`, `app_focus` -- pages each type separately (types without a key start from the newest event). |
+
+The query covers `[now - window, now + 60 s]` (the slack admits slightly future
+timestamps); the response reports `window_start` = now - window and `window_end` = now. The
+window is re-evaluated on every call, so pages fetched later see a slightly later window;
+to page through a fixed range, use [`QueryTimeline`](#querytimeline).
+
+| `window` | Seconds |
+|---|---|
+| `15m` | 900 |
+| `30m` | 1,800 |
+| `1h` | 3,600 |
+| `2h` | 7,200 |
+| `6h` | 21,600 |
+| `24h` | 86,400 |
+| `7d` | 604,800 |
+| `15d` | 1,296,000 |
+| `30d` | 2,592,000 |
 
 **Examples:**
 
 ```json
-{"window":"15m","types":["file"]}
+{"window":"6h"}
 {"seconds":300,"types":["app_launch","browsing"]}
-{"window":"1h","types":["file","app_launch","browsing"]}
-{"types":["browsing"]}
+{"window":"24h","types":["file"],"limit":200,"min_confidence":0.5}
+{"window":"24h","types":["file"],"limit":200,"before_id":1041}
+{"window":"1h","before_id":{"file":1041,"app_focus":312}}
+{"types":["app_focus"]}
 {}
 ```
 
-### 5. Inference Operations
+**Response** (`{"window":"1h","limit":2}`, abbreviated):
 
-In addition to raw event queries, the pipe supports three **inference operations**
-that return precomputed analytics. Inference requests are identified by the `"op"`
-field. These operations do **not** use `"window"`, `"seconds"`, or `"types"`.
+```json
+{
+  "api_version": 2,
+  "window_start": 1760000400,
+  "window_end": 1760004000,
+  "file_activities": {
+    "count": 2,
+    "truncated": true,
+    "events": [
+      {
+        "id": 1042,
+        "timestamp": 1760003990,
+        "action": "MODIFY",
+        "path": "C:\\Users\\Alice\\Documents\\report.docx",
+        "source": "etw",
+        "confidence": 1.0,
+        "entity_key": "c:\\users\\alice\\documents\\report.docx"
+      },
+      {
+        "id": 1041,
+        "timestamp": 1760003900,
+        "action": "RENAME",
+        "path": "C:\\Users\\Alice\\Documents\\report.docx",
+        "old_path": "C:\\Users\\Alice\\Documents\\draft.docx",
+        "source": "etw",
+        "confidence": 0.9,
+        "entity_key": "c:\\users\\alice\\documents\\report.docx"
+      }
+    ],
+    "next_before_id": 1041
+  },
+  "app_launch_activities": { "count": 0, "truncated": false, "events": [] },
+  "browsing_activities":   { "count": 0, "truncated": false, "events": [] },
+  "app_focus_activities":  { "count": 0, "truncated": false, "events": [] }
+}
+```
+
+- A section appears only for requested types, in the order file, app launch, browsing,
+  app focus. There is no `ok` member (v1 shape).
+- Events are newest first (by `timestamp`, then `id`; app-focus sessions by their end).
+  App-focus sessions are included when they overlap the window.
+- `count` is the number of events returned. `truncated` is `true` when more than `limit`
+  events matched; `next_before_id` (present only then) is the `id` of the oldest event
+  returned. Repeat the request with `"before_id": next_before_id` (or an object collecting
+  the `next_before_id` of several types) for the next page. A `before_id` whose row has
+  meanwhile been deleted (retention, purge) returns an empty page; start again without it.
+- `id` sequences are independent per event type.
+
+#### Raw Event Fields
+
+**File** (`file_activities.events[]`):
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `id` | integer | always | Row id. |
+| `timestamp` | integer | always | Unix seconds (UTC). |
+| `action` | string | always | See [File Action Types](#file-action-types). |
+| `path` | string | always | Full path, original casing. |
+| `old_path` | string | renames | Previous path. |
+| `source` | string | always | Producer: `etw`, `rdcw`, `shell`, `usn`, `recent` or `mru`. |
+| `confidence` | number | always | 0-1: how likely the event reflects the user's own action rather than background activity. |
+| `entity_key` | string | always | File [entity key](#entity-keys-and-normalization) (empty if none). |
+
+**App launch** (`app_launch_activities.events[]`):
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `id` | integer | always | Row id. |
+| `timestamp` | integer | always | Launch time. |
+| `exe_name` | string | always | Executable file name, e.g. `notepad.exe`. |
+| `exe_path` | string | always | Full path of the executable. |
+| `pid` | integer | always | Process id. |
+| `confidence` | number | always | 0-1. |
+| `creator_exe` | string | when known | Executable that started the process. |
+| `aumid` | string | packaged apps | Application User Model ID. |
+
+**Browsing** (`browsing_activities.events[]`):
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `id` | integer | always | Row id. |
+| `timestamp` | integer | always | When the page was shown. |
+| `browser` | string | always | Friendly browser name, e.g. `Microsoft Edge`, `Google Chrome`, `Firefox`. |
+| `title` | string | always | Page title. |
+| `url` | string | when known | Canonical, privacy-filtered URL. |
+| `host` | string | when known | Host name. |
+| `confidence` | number | always | 0-1. |
+| `entity_key` | string | always | Page / document entity key. |
+
+**App focus** (`app_focus_activities.events[]`):
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `id` | integer | always | Row id. |
+| `timestamp` | integer | always | Session end (v1 compatibility). |
+| `exe_name` / `exe_path` | string | always | Foreground application. |
+| `window_title` | string | always | Window title. |
+| `duration_secs` | integer | always | Wall-clock length of the session. |
+| `start_ts` / `end_ts` | integer | always | Session start / end. |
+| `active_secs` | integer | always | Seconds with the user present (idle / away time excluded). |
+| `doc_key` | string | when resolved | Entity key of the document or page shown. |
+| `doc_display` | string | with `doc_key` | Path or URL of that document / page. |
+| `doc_type` | string | with `doc_key` | `file`, `url` or `webdoc`. |
+| `confidence` | number | always | 0-1. |
+
+#### File Action Types
+
+| Action | Meaning | `old_path` |
+|---|---|---|
+| `OPEN` | A file was opened. | no |
+| `CREATE` | A file was created. | no |
+| `MODIFY` | A file was written / saved. | no |
+| `DELETE` | A file was deleted. | no |
+| `RENAME` | A file was renamed or moved. | **yes** |
+| `DOWNLOAD` | A file was downloaded from the web. | no |
+
+### 2. Inference Lookups (v1-compatible)
+
+These v1 operations keep their v1 request and response shapes (no `ok` member on
+success). New code should prefer [`ScoreEntities`](#scoreentities) (adds scores, names and
+reasons) and [`GetChanges`](#getchanges) (full records with names).
 
 #### QueryInferences
 
-Batch-lookup inference records for a list of entity keys (file paths, exe paths,
-or URLs). Keys are matched case-insensitively (the engine normalizes to lowercase
-internally).
+Looks up the entity records of the identifiers you pass. No scope required.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `paths` (alias `keys`) | string[] | required | File paths, exe paths, URLs or AUMIDs, [normalized](#entity-keys-and-normalization) by WARP. Not an array -> `invalid_request`; more than 5000 -> `too_many_keys`; non-string elements are skipped. `paths` wins when both are present. |
+| `fields` | string[] | all | Projection. Names: `entity_type`, `last_event_ts`, `last_open_ts`, `last_edit_ts`, `open_count_7d`, `open_count_30d`, `open_count_total`, `recency_score`, `version`, `updated_at`, `entity_key`, `score`, `last_active_ts`, `active_secs_7d`. |
 
 ```json
 {
   "op": "QueryInferences",
   "paths": [
     "C:\\Users\\Alice\\Documents\\report.docx",
-    "C:\\Windows\\System32\\notepad.exe",
-    "https://github.com/pulls"
-  ]
+    "c:\\users\\alice\\documents\\REPORT.DOCX",
+    "https://example.com/never-visited"
+  ],
+  "fields": ["entity_type", "last_open_ts", "open_count_7d", "recency_score", "version", "score"]
 }
 ```
 
-An optional `"fields"` array limits which fields are included in each result
-object. If omitted, all fields are returned.
+**Response:**
 
 ```json
 {
-  "op": "QueryInferences",
-  "paths": ["C:\\Users\\Alice\\Documents\\report.docx"],
-  "fields": ["recency_score", "last_open_ts", "open_count_7d"]
-}
-```
-
-**Available field names:** `entity_type`, `last_event_ts`, `last_open_ts`,
-`last_edit_ts`, `open_count_7d`, `open_count_30d`, `open_count_total`,
-`recency_score`, `version`, `updated_at`.
-
-#### GetInferenceDeltas
-
-Retrieve all inference records whose `version` is greater than a given watermark.
-Returns up to **5 000 records** per call, ordered by ascending `version`.
-
-```json
-{
-  "op": "GetInferenceDeltas",
-  "since_version": 0
-}
-```
-
-Pass `0` to get all records. On subsequent calls, pass the highest `version` value
-you received in the previous response to get only new/updated records.
-
-```json
-{
-  "op": "GetInferenceDeltas",
-  "since_version": 1042
-}
-```
-
-#### GetRecentContext
-
-Retrieve the **latest context-summary** snapshot from the `ContextInference`
-summarizer.  The summary is a JSON array of 1–3 short phrase lines (one per
-cluster of activity) that describe what the user is actively doing.
-
-Every 60 seconds, WARP gathers all activities from the lookback window
-(overlaying the user's currently-active foreground window as a virtual focus
-row), classifies each app via a layered classifier (~80-entry exact-match table
-→ vendor-path heuristics → exe-name fallback), and composes a human-readable
-context summary that names the actual documents, browser tabs, and
-apps the user is working with — not a fixed bucket label.
-
-```json
-{
-  "op": "GetRecentContext",
-  "category": "all",
-  "window_seconds": 900
-}
-```
-
-| Param | Type | Default | Notes |
-|---|---|---|---|
-| `category` | `string` | `"all"` | One of `all`, `files`, `websites`, `apps`. Controls **both** which summary is surfaced as the top-level `summary` field **and** the response shape: `"all"` returns the combined summary plus all three per-category summaries; any other value returns only the matching category's summary. The legacy value `documents` is accepted as a backward-compat alias for `files`. |
-| `window_seconds` | `integer` | `900` (= 15 min) | Activity lookback span. Snapped to the nearest of: 300, 900, 1800, 3600, 7200, 21600, 86400, 604800, 1296000, 2592000 (5 min, 15 min, 30 min, 1 h, 2 h, 6 h, 24 h, 7 d, 15 d, 30 d). 15 min serves the cached snapshot from the 60-sec timer; any other value composes fresh on demand. |
-
-The response is grounded in observed window titles and tab names, so it stays
-accurate as the user moves between projects, customers, or topics — there is
-no fixed taxonomy to fall out of.
-
-#### GetRecentContexts
-
-Retrieve the last *N* snapshots from the rolling history buffer, **newest
-first**. Useful for charting context drift over time, building a short-term
-memory for an LLM agent, or rendering a "what was I doing" timeline.
-
-```json
-{
-  "op": "GetRecentContexts",
-  "count": 10,
-  "category": "all",
-  "window_seconds": 900
-}
-```
-
-| Param | Type | Default | Notes |
-|---|---|---|---|
-| `count` | `integer` | `10` | Hard-capped at 200 to keep responses under the 64 KB pipe buffer. Negative or zero values are treated as the default. |
-| `category` | `string` | `"all"` | Same semantics as `GetRecentContext` — applied to every snapshot in the response. |
-| `window_seconds` | `integer` | `900` | Filters history to snapshots whose `timestamp` falls within the last `window_seconds`.  Larger values include more historical rows; each row's underlying compute window stays at the rolling-history cadence (15 min). |
-
-History entries are de-duplicated on append: a new snapshot is recorded only on
-**material change** — different summary, different dominant app, or a
-5-minute heartbeat — so the returned list reflects context *transitions*
-rather than 60-second polling artifacts.
-
----
-
-## Response Format
-
-The response is a single UTF-8 JSON message. Event types are **segregated at the
-root level** -- each requested type appears as a separate top-level object. Only
-the types that were requested (or all, if `"types"` was omitted) are included.
-
-### Top-Level Structure
-
-```json
-{
-    "file_activities": {
-        "count": <integer>,
-        "events": [ ... ]
-    },
-    "app_launch_activities": {
-        "count": <integer>,
-        "events": [ ... ]
-    },
-    "browsing_activities": {
-        "count": <integer>,
-        "events": [ ... ]
-    }
-}
-```
-
-Each section has:
-- `count` -- the number of events in that category.
-- `events` -- an array of event objects, ordered **most recent first** (descending
-  by `timestamp`).
-
-### File Activity Fields
-
-| Field | Type | Presence | Description |
-|---|---|---|---|
-| `id` | `integer` | Always | Auto-increment database row ID. |
-| `timestamp` | `integer` | Always | Unix epoch seconds (UTC). |
-| `action` | `string` | Always | The type of file/folder activity. See [File Action Types](#file-action-types). |
-| `path` | `string` | Always | Full absolute path. Backslashes are JSON-escaped as `\\`. |
-| `old_path` | `string` | **RENAME only** | The previous full path before the rename/move. |
-
-**Example event:**
-
-```json
-{
-    "id": 1042,
-    "timestamp": 1750012345,
-    "action": "CREATE",
-    "path": "C:\\Users\\Alice\\Documents\\report.docx"
-}
-```
-
-### File Action Types
-
-| Action | Meaning | `old_path` present? |
-|---|---|---|
-| `CREATE` | A new file or folder was created. | No |
-| `OPEN` | A file or folder was opened / accessed. | No |
-| `MODIFY` | A file or folder was written to. | No |
-| `DELETE` | A file or folder was deleted. | No |
-| `RENAME` | A file or folder was renamed or moved. | **Yes** |
-
-### App Launch Activity Fields
-
-| Field | Type | Presence | Description |
-|---|---|---|---|
-| `id` | `integer` | Always | Auto-increment database row ID. |
-| `timestamp` | `integer` | Always | Unix epoch seconds (UTC) when the process was first detected. |
-| `exe_name` | `string` | Always | Executable filename (e.g. `"notepad.exe"`). |
-| `exe_path` | `string` | Always | Full path to the executable. Backslashes are JSON-escaped. |
-| `pid` | `integer` | Always | Process ID at launch time. |
-
-**Example event:**
-
-```json
-{
-    "id": 15,
-    "timestamp": 1750012400,
-    "exe_name": "notepad.exe",
-    "exe_path": "C:\\Windows\\System32\\notepad.exe",
-    "pid": 12340
-}
-```
-
-**Notes:**
-- Only interactive user-session processes are captured (session >= 1).
-- System processes (svchost, dwm, csrss, SearchIndexer, Defender, etc.) are excluded.
-- WARP's own process is excluded.
-
-### Browsing Activity Fields
-
-| Field | Type | Presence | Description |
-|---|---|---|---|
-| `id` | `integer` | Always | Auto-increment database row ID. |
-| `timestamp` | `integer` | Always | Unix epoch seconds (UTC). |
-| `browser` | `string` | Always | Browser identifier. See table below. |
-| `title` | `string` | Always | Page title (browser suffix stripped). |
-| `url` | `string` | **Optional** | URL if extractable from the title bar; absent otherwise. |
-
-**Browser identifiers:**
-
-| Value | Browser |
-|---|---|
-| `chrome` | Google Chrome |
-| `msedge` | Microsoft Edge |
-| `firefox` | Mozilla Firefox |
-| `brave` | Brave |
-| `opera` | Opera |
-| `vivaldi` | Vivaldi |
-| `ie` | Internet Explorer |
-
-**Example event:**
-
-```json
-{
-    "id": 8,
-    "timestamp": 1750012350,
-    "browser": "chrome",
-    "title": "GitHub - Pull Requests",
-    "url": "https://github.com/pulls"
-}
-```
-
-**Notes:**
-- Events are only captured while a recognized browser window is in the foreground.
-- Duplicate titles (same browser + same title) are suppressed until the title changes.
-- Common browser suffixes ("- Google Chrome", "- Microsoft Edge", etc.) are stripped.
-
----
-
-## Inference Response Format
-
-### QueryInferences Response
-
-```json
-{
-  "now": 1750012345,
+  "api_version": 2,
+  "now": 1760004000,
   "results": {
     "C:\\Users\\Alice\\Documents\\report.docx": {
       "entity_type": "file",
-      "last_event_ts": 1750012000,
-      "last_open_ts": 1750012000,
-      "last_edit_ts": 1750011500,
+      "last_open_ts": 1760003990,
       "open_count_7d": 12,
-      "open_count_30d": 45,
-      "open_count_total": 45,
-      "recency_score": 187.3,
-      "version": 58,
-      "updated_at": 1750012000
+      "recency_score": 212.8,
+      "version": 58231,
+      "score": 0.97
     },
-    "C:\\Windows\\System32\\notepad.exe": {
-      "entity_type": "app",
-      "last_event_ts": 1749998000,
-      "last_open_ts": 1749998000,
-      "last_edit_ts": 0,
-      "open_count_7d": 3,
-      "open_count_30d": 10,
-      "open_count_total": 10,
-      "recency_score": 42.1,
-      "version": 22,
-      "updated_at": 1749998000
+    "c:\\users\\alice\\documents\\REPORT.DOCX": {
+      "entity_type": "file",
+      "last_open_ts": 1760003990,
+      "open_count_7d": 12,
+      "recency_score": 212.8,
+      "version": 58231,
+      "score": 0.97
     },
-    "https://github.com/pulls": {}
+    "https://example.com/never-visited": {}
   }
 }
 ```
 
-- The `"results"` object is keyed by the **exact strings you sent** in `"paths"`
-  (not the normalized form).
-- If an entity has never been seen by WARP, its value is an empty object `{}`.
-- If `"fields"` was specified, only those fields appear in each result object.
-- `"now"` is the server-side Unix epoch timestamp at query time.
+- `results` is keyed by the **exact strings you sent**; different spellings of the same
+  entity each get their own member. Duplicate input strings produce duplicate member names.
+- An empty object means WARP has no record for that identifier (never seen, deleted,
+  excluded or not normalizable).
+- Fields are written in the order of the list above, whatever the order of `fields`.
+  Counts are confidence-weighted and rounded; `score` is the blend-horizon percentile (see
+  [Entity Records and Scores](#entity-records-and-scores)); `version` equals the entity's
+  `change_seq`; `updated_at` is when the record was last written.
 
-### GetInferenceDeltas Response
+#### GetInferenceDeltas
+
+The v1 change feed (activity scope): the same data and semantics as
+[`GetChanges`](#getchanges) with deletes always included, in v1 field names.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `since_version` | integer | 0 | Cursor; 0 = everything. Negative values count as 0. |
+| `limit` | integer | 5000 | Changes per call (`deltas` + `deleted`), clamped to 1-5000. |
+
+```json
+{"op": "GetInferenceDeltas", "since_version": 58000}
+```
+
+**Response:**
 
 ```json
 {
-  "now": 1750012345,
+  "api_version": 2,
+  "now": 1760004000,
   "deltas": [
     {
       "entity_key": "c:\\users\\alice\\documents\\report.docx",
       "entity_type": "file",
-      "last_event_ts": 1750012000,
-      "last_open_ts": 1750012000,
-      "last_edit_ts": 1750011500,
+      "last_event_ts": 1760003990,
+      "last_open_ts": 1760003990,
+      "last_edit_ts": 1760003990,
       "open_count_7d": 12,
       "open_count_30d": 45,
-      "open_count_total": 45,
-      "recency_score": 187.3,
-      "version": 58,
-      "updated_at": 1750012000
+      "open_count_total": 61,
+      "recency_score": 212.8,
+      "version": 58231,
+      "updated_at": 1760003991
+    }
+  ],
+  "deleted": [
+    { "entity_key": "c:\\users\\alice\\documents\\old.docx", "entity_type": "file", "version": 58102, "reason": "deleted" }
+  ],
+  "next_version": 58240,
+  "current_version": 58240,
+  "more": false,
+  "reset": false
+}
+```
+
+- `version` is the global change sequence (`change_seq`), not a per-entity counter: it is
+  monotonic across all entities, so values jump.
+- Pass `next_version` back as `since_version` instead of computing it from the records,
+  and call again immediately while `more` is `true`.
+- `reset: true` (with empty arrays and `next_version: 0`): the cursor predates a clear-all
+  or deletes that are no longer retained -- drop your cache and restart from 0.
+- `deleted[].reason`: `deleted`, `renamed`, `purge` or `retention`.
+
+### 3. Entities
+
+Entity operations read the per-entity engagement model. Results carry the
+[entity record fields](#entity-record-fields); scoring operations add the
+[score fields](#score-fields).
+
+#### ScoreEntities
+
+Scores the identifiers you pass -- e.g. to rank search results or a file picker. No scope
+required (without the activity scope, `display_name` and `title` are omitted).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `keys` (alias `paths`) | string[] | required | File paths, exe paths, URLs or AUMIDs ([normalized](#entity-keys-and-normalization)). Not an array -> `invalid_request`; more than 5000 -> `too_many_keys`. Non-string elements produce `found: false` with an empty `key`. `keys` wins when both are present. |
+| `horizon` | string | `blend` | `short` (days), `long` (weeks) or `blend`; any other value -> `invalid_request` (`'horizon' must be short, long or blend`). |
+| `reasons` | bool | `true` | Include `reasons[]`. |
+| `context` | string | -- | `"current"` adds `context_boost` to every result and `current_thread` to the response (only while the history engine runs). |
+
+```json
+{
+  "op": "ScoreEntities",
+  "keys": ["C:\\Users\\Alice\\Documents\\report.docx", "https://example.com/never-visited"],
+  "horizon": "short",
+  "context": "current"
+}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "now": 1760004000,
+  "horizon": "short",
+  "current_thread": 42,
+  "results": [
+    {
+      "key": "C:\\Users\\Alice\\Documents\\report.docx",
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "found": true,
+      "entity_type": "file",
+      "display_name": "C:\\Users\\Alice\\Documents\\report.docx",
+      "last_event_ts": 1760003990,
+      "last_open_ts": 1760003990,
+      "last_edit_ts": 1760003990,
+      "last_active_ts": 1760003950,
+      "open_count_7d": 12,
+      "open_count_30d": 45,
+      "open_count_total": 61,
+      "edit_count_total": 30,
+      "active_secs_7d": 5400,
+      "active_secs_total": 40210,
+      "distinct_days": 14,
+      "recency_score": 212.8,
+      "change_seq": 58231,
+      "score": 0.97,
+      "prior": 31.2,
+      "short_term": 31.2,
+      "long_term": 118.6,
+      "reasons": ["edited today", "90 min active in the last 7 days", "used on 5 of the last 7 days",
+                  "recurring: used on 14 different days", "last used just now"],
+      "context_boost": 0.92
     },
     {
-      "entity_key": "c:\\windows\\system32\\notepad.exe",
-      "entity_type": "app",
-      "last_event_ts": 1749998000,
-      "last_open_ts": 1749998000,
-      "last_edit_ts": 0,
-      "open_count_7d": 3,
-      "open_count_30d": 10,
-      "open_count_total": 10,
-      "recency_score": 42.1,
-      "version": 22,
-      "updated_at": 1749998000
+      "key": "https://example.com/never-visited",
+      "entity_key": "https://example.com/never-visited",
+      "found": false,
+      "context_boost": 0.0
     }
   ]
 }
 ```
 
-- `"deltas"` is an array ordered by ascending `version`.
-- Entity keys are in **lowercase normalized form**.
-- At most 5 000 records are returned per call. If you receive exactly 5 000, call
-  again with `since_version` set to the highest `version` in the response.
-- All fields are always present in delta records (no field projection).
+- `results` are in request order; `key` is your string, `entity_key` the normalized key.
+- Results with `found: false` carry only `key`, `entity_key`, `found` (and `context_boost`).
+- `context_boost` (0-1) says how close the entity is to the current work thread: 0.5-1.0
+  for members of the thread (by member weight), below 0.5 for entities that co-occurred with
+  its members, 0 otherwise or when there is no current thread. A simple ranking is
+  `score + w * context_boost`.
 
-### GetRecentContext Response
+#### TopEntities
 
-The shape varies with the requested `category`:
+The most engaged entities (activity scope).
 
-* **`category == "all"` (default).** The response carries the **combined**
-  summary as `summary` plus all three per-category summaries
-  (`summary_files` / `_websites` / `_apps`), so a UI that wants to
-  switch facets locally can do so without re-querying.
-* **`category == "files" | "websites" | "apps"`.** Only the matching
-  per-category summary is returned (as `summary`). The other
-  categories — including the combined "all" summary — are **omitted**,
-  keeping the response focused on what the caller asked for.
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `type` | string | all types | `file`, `app` or `url`; any other value -> `invalid_request`. |
+| `limit` | integer | 50 | Clamped to 1-1000. |
+| `horizon` | string | `blend` | `short`, `long` or `blend` (see [How Scores Work](#how-scores-work)); any other value -> `invalid_request`. |
 
-Each `summary` is a JSON **array** of 1–3 short phrase strings (one per
-cluster of activity).  Consumers render them as separate lines.
+```json
+{"op": "TopEntities", "type": "file", "limit": 3, "horizon": "short"}
+```
 
-**Example — `category == "all"`, `window_seconds = 900`:**
+**Response** (abbreviated):
 
 ```json
 {
-  "recent_context": {
-    "timestamp": 1750012345,
-    "window_start": 1750011445,
-    "window_end": 1750012345,
-    "window_seconds": 900,
-    "category": "all",
-    "summary": [
-      "Working on Context Inference (across Visual Studio & Edge)",
-      "Discussing Daily Standup (across Teams & Outlook)",
-      "Researching React Hooks"
-    ],
-    "summary_files":    ["Editing Context Inference module", "Drafting Daily Standup notes"],
-    "summary_websites": ["Researching React Hooks", "Reviewing GitHub PR for ContextInference"],
-    "summary_apps":     ["Discussing in Slack & Teams", "Triaging Outlook inbox"],
-    "activity_count": 47,
-    "focus_seconds": 812,
-    "dominant_focus_pct": 61.4,
-    "confidence": 0.84,
-    "model": "granite-embedding-small-english-r2",
-    "thread_count": 3,
-    "signal_types": ["focus", "file", "browsing"],
-    "items": [
-      { "app": "Visual Studio",  "exe": "devenv.exe",        "title": "ContextInference.cpp - WARP", "raw_title": "● ContextInference.cpp - WARP! - Microsoft Visual Studio",                        "focus_seconds": 498, "pct": 61.4, "thread_id": 1 },
-      { "app": "Edge",           "exe": "msedge.exe",        "title": "ContextInference PR review",  "raw_title": "ContextInference PR review · sumanthewhiz/WARP · Pull Request #34 — Microsoft Edge", "focus_seconds": 184, "pct": 22.7, "thread_id": 1 },
-      { "app": "GitHub Desktop", "exe": "GitHubDesktop.exe", "title": "WARP - dev",                  "raw_title": "WARP - dev — GitHub Desktop",                                                       "focus_seconds":  60, "pct":  7.4, "thread_id": 1 },
-      { "app": "Slack",          "exe": "slack.exe",         "title": "Slack - WARP channel",        "raw_title": "Slack - WARP channel — Slack",                                                      "focus_seconds":  52, "pct":  6.4, "thread_id": 2 },
-      { "app": "Outlook",        "exe": "OUTLOOK.EXE",       "title": "Inbox - Suman Ghosh",         "raw_title": "Inbox - Suman Ghosh - Outlook",                                                     "focus_seconds":  18, "pct":  2.2, "thread_id": 3 }
-    ]
-  },
-  "category": "all",
-  "window_seconds": 900,
-  "history_count": 12
+  "api_version": 2,
+  "ok": true,
+  "now": 1760004000,
+  "horizon": "short",
+  "results": [
+    {
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "entity_type": "file",
+      "display_name": "C:\\Users\\Alice\\Documents\\report.docx",
+      "last_event_ts": 1760003990,
+      /* ... remaining entity record fields ... */
+      "score": 0.97,
+      "prior": 31.2,
+      "short_term": 31.2,
+      "long_term": 118.6,
+      "reasons": ["edited today", "90 min active in the last 7 days", "last used just now"]
+    }
+  ]
 }
 ```
 
-**Example — `category == "files"` (same shape for `"websites"` and `"apps"`):**
+- With a `type`, results are ordered by `prior` (decayed engagement), then by
+  `last_event_ts`. Without one, the three types are merged by `score` (percentiles are
+  comparable across types), then by `prior`.
+- `reasons` are always included.
+
+#### SearchActivity
+
+Finds entities by name or title (activity scope).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `query` | string | required | Missing or empty -> `invalid_request`; at most 512 bytes. Split into word tokens (letters, digits and non-ASCII characters; case-insensitive; at most 8). Every token must match the display name or title; the last token also matches as a prefix. |
+| `type` | string | all types | `file`, `app` or `url`; any other value -> `invalid_request`. |
+| `limit` | integer | 25 | Clamped to 1-200. |
+
+```json
+{"op": "SearchActivity", "query": "quarterly rep", "type": "file", "limit": 5}
+```
+
+**Response** -- like `TopEntities` without `horizon`, plus `relevance`:
 
 ```json
 {
-  "recent_context": {
-    "timestamp": 1750012345,
-    "window_start": 1750011445,
-    "window_end": 1750012345,
-    "window_seconds": 900,
-    "category": "files",
-    "summary": ["Editing Context Inference module", "Drafting Daily Standup notes"],
-    "activity_count": 47,
-    "focus_seconds": 812,
-    "dominant_focus_pct": 61.4,
-    "confidence": 0.84,
-    "model": "granite-embedding-small-english-r2",
-    "thread_count": 3,
-    "signal_types": ["focus", "file", "browsing"],
-    "items": [ /* same shape as above; always reflects the All clustering */ ]
-  },
-  "category": "files",
-  "window_seconds": 900,
-  "history_count": 12
+  "api_version": 2,
+  "ok": true,
+  "now": 1760004000,
+  "results": [
+    {
+      "entity_key": "c:\\users\\alice\\documents\\quarterly-report.txt",
+      "entity_type": "file",
+      "display_name": "C:\\Users\\Alice\\Documents\\quarterly-report.txt",
+      /* ... remaining entity record fields ... */
+      "relevance": 1.0,
+      "score": 0.81,
+      "prior": 4.34,
+      "short_term": 5.9,
+      "long_term": 7.1,
+      "reasons": ["edited today", "last used 3 h ago"]
+    }
+  ]
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `timestamp` | `integer` | Unix epoch seconds (UTC) when this snapshot was produced. |
-| `window_start` / `window_end` | `integer` | Bounds of the lookback window (Unix epoch seconds, UTC). |
-| `window_seconds` | `integer` | Width of the lookback window in seconds. Echoes the requested `window_seconds` after normalisation to the nearest allowed value. |
-| `category` | `string` | Echo of the requested category (`all` / `files` / `websites` / `apps`). |
-| `summary` | `string[]` | Array of 1–3 short phrase lines describing what the user is actively doing. Equals the **combined** summary when `category == "all"`; equals the matching per-category summary otherwise. Render each entry on its own line. |
-| `summary_files` | `string[]` | **Only present when `category == "all"`.** Composed from any app where the user is engaged with a real file: code editors / IDEs, Office apps, OneNote / Notion / Obsidian, PDF readers, image viewers / editors (Photos / IrfanView / Paint / Paint.NET / GIMP), design tools — **plus** any arbitrary app whose window title contains a recognized file extension (e.g. `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.png`, `.cpp`, `.json`, `.txt`, `.md`, …) — **plus** recent file basenames from `FileMonitor`. |
-| `summary_websites` | `string[]` | **Only present when `category == "all"`.** Composed from browser tab titles, aggregated per unique cleaned title. |
-| `summary_apps` | `string[]` | **Only present when `category == "all"`.** Composed from non-file, non-browser apps: communications (Outlook / Teams / Slack / Discord / WhatsApp / Signal / Telegram / Zoom / Webex), media players (Spotify / VLC), terminals (Windows Terminal / PowerShell / Command Prompt / Git Bash), remote desktop & VMs, version-control UIs (GitHub Desktop / Sourcetree). |
-| `activity_count` | `integer` | Total activities examined in the window. |
-| `focus_seconds` | `integer` | Total foreground dwell time accounted for in the window. |
-| `dominant_focus_pct` | `number` | Percentage of focus time held by the top app (0.0 – 100.0). |
-| `confidence` | `number` | Heuristic confidence in the summary (0.0 – 0.99). Combines focus volume, dominance, and signal-type breadth. |
-| `model` | `string` | `"granite-embedding-small-english-r2"` when the granite ModernBERT sentence-encoder is loaded; `"deterministic"` when no model file was found. Older BGE-small / MiniLM fallbacks were removed in v5.16. |
-| `model_polish` | `string` | `"qwen3-0.6b"` when the Qwen3 "brain" model is loaded -- as of v5.17 it acts as a *gated refiner* on top of the deterministic rich-listing summary (its prose replaces the listing only when it is at least as grounded in the window titles, measured by granite cosine). `"(not loaded)"` when the model isn't present; the rich-listing summary stands alone. Field name retained for backward compatibility. |
-| `summary_embedding` | `float[]` | 384-dim L2-normalized vector representation of the joined `summary` lines, produced by the granite sentence-encoder ("translator" role). Suitable for similarity search / clustering across snapshots. Empty array when no embedding model is loaded or `summary` is empty. |
-| `thread_count` | `integer` | Number of distinct *threads of work* the clusterer collapsed the activity into. ≥ 1; always reflects the **All** clustering regardless of `category`. |
-| `signal_types` | `string[]` | Which event categories contributed: any of `"focus"`, `"file"`, `"app"`, `"browsing"`. |
-| `items` | `object[]` | Up to 5 per-app breakdowns: `{ app, exe, title, raw_title, focus_seconds, pct, thread_id }`. `title` is the cleaned/de-suffixed form; `raw_title` is the **full** original window title before any cleaning, so callers can see the complete context. Items sharing a `thread_id` were merged by the sentence-encoder clusterer (cosine ≥ 0.65); the summary shows them as `(across X & Y …)`. Always reflects the **All** clustering. |
-| `history_count` | `integer` | Number of snapshots currently in the rolling history (max 1 440 ≈ 24 hours at 60-sec cadence). |
+- Matching uses the SQLite FTS5 index (best match first) or, when the SQLite build lacks
+  FTS5, a substring match on the first token.
+- `relevance` (0-1] is rank-based (1 for the best text match). Results are ordered by
+  `0.6 * relevance + 0.4 * score`, where `score` uses the `blend` horizon.
+- A query without any letter or digit returns no results.
 
-**Notes:**
-- If no activities occurred in the lookback window, `summary` will be an
-  array containing `"User appears to be idle"` and `items[]` will be empty.
-- The summarizer runs every 60 seconds. Calling `GetRecentContext` between
-  runs returns the result from the most recent completed cycle.
-- Snapshots are stored in memory (not persisted to disk). Restarting WARP
-  clears the history.
-- The composer uses the sentence-encoder for **dynamic clustering, not bucket matching** —
-  there is no fixed taxonomy of topics. Each cluster is induced from the
-  actual document, tab, and app titles in the window. If the granite model
-  files under `models/granite/` are missing the engine still runs and emits
-  `"model": "deterministic"`; consumers should treat both modes as a single
-  interface and just read `summary` / `items` / `thread_id` as documented.
+#### GetChanges
 
-### GetRecentContexts Response
+The entity change feed (activity scope): every entity created or updated, and every
+entity deleted, since a cursor. Use it to keep a local index in sync.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `since` (alias `since_seq`) | integer | 0 | Cursor from the previous `next`; 0 = full sync. Negative values count as 0. |
+| `limit` | integer | 1000 | Changes per call (upserts + deletes), clamped to 1-5000. |
+| `include_deletes` | bool | `true` | `false` skips tombstones (and the tombstone-retention part of the reset check). |
+
+```json
+{"op": "GetChanges", "since": 58000, "limit": 1000}
+```
+
+**Response:**
 
 ```json
 {
-  "recent_contexts": [
+  "api_version": 2,
+  "ok": true,
+  "now": 1760004000,
+  "reset": false,
+  "next": 58240,
+  "current": 58240,
+  "more": false,
+  "upserts": [
     {
-      "timestamp": 1750012345,
-      "window_start": 1750011445,
-      "window_end": 1750012345,
-      "summary": ["Working on Context Inference (across Visual Studio & Edge)", "Discussing Daily Standup in Teams & Outlook", "+ 2 other threads"],
-      "activity_count": 47,
-      "focus_seconds": 812,
-      "dominant_focus_pct": 61.4,
-      "confidence": 0.84,
-      "model": "granite-embedding-small-english-r2",
-      "thread_count": 3,
-      "signal_types": ["focus", "file", "browsing"],
-      "items": [ /* … same shape as GetRecentContext … */ ]
-    },
-    {
-      "timestamp": 1750012045,
-      "window_start": 1750011145,
-      "window_end": 1750012045,
-      "summary": ["Researching React Hooks", "Reading about API Reference"],
-      "activity_count": 31,
-      "focus_seconds": 712,
-      "dominant_focus_pct": 48.9,
-      "confidence": 0.71,
-      "model": "granite-embedding-small-english-r2",
-      "thread_count": 2,
-      "signal_types": ["focus", "browsing"],
-      "items": [ /* … */ ]
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "entity_type": "file",
+      "display_name": "C:\\Users\\Alice\\Documents\\report.docx",
+      "last_event_ts": 1760003990,
+      /* ... remaining entity record fields ... */
+      "change_seq": 58231
     }
   ],
-  "returned": 2,
-  "history_count": 12,
-  "requested": 10
+  "deletes": [
+    {
+      "entity_key": "c:\\users\\alice\\documents\\old.docx",
+      "entity_type": "file",
+      "change_seq": 58102,
+      "reason": "deleted",
+      "ts": 1760001200
+    }
+  ]
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `recent_contexts` | `object[]` | Snapshots ordered **newest first**. Each entry has the same shape as the `recent_context` object documented above. |
-| `returned` | `integer` | Actual number of snapshots in `recent_contexts` (≤ `requested`, ≤ `history_count`). |
-| `history_count` | `integer` | Total snapshots currently in the rolling history. |
-| `requested` | `integer` | The effective `count` after defaulting (10) and capping (200). |
-
-### Inference Record Fields
-
-| Field | Type | Description |
-|---|---|---|
-| `entity_key` | `string` | Lowercase entity identifier (file path, exe path, or URL). |
-| `entity_type` | `string` | One of `"file"`, `"app"`, or `"url"`. |
-| `last_event_ts` | `integer` | Unix epoch seconds of the most recent event of any kind for this entity. |
-| `last_open_ts` | `integer` | Unix epoch seconds of the most recent OPEN event (files) or launch/visit (apps/URLs). `0` if never opened. |
-| `last_edit_ts` | `integer` | Unix epoch seconds of the most recent MODIFY or CREATE event. Only meaningful for `"file"` entities. `0` if never edited. |
-| `open_count_7d` | `integer` | Rolling count of OPEN events in the last 7 days. |
-| `open_count_30d` | `integer` | Rolling count of OPEN events in the last 30 days. |
-| `open_count_total` | `integer` | Lifetime OPEN count since WARP started tracking this entity. |
-| `recency_score` | `number` | Composite score (0�255) combining exponential time-decay and 7-day frequency. Higher values indicate more recently and frequently accessed entities. Formula: `200 � e^(??t / 172800) + 5 � ln(1 + open_count_7d)`. |
-| `version` | `integer` | Monotonically increasing per-entity counter. Bumped on every event. Use as a watermark for `GetInferenceDeltas`. |
-| `updated_at` | `integer` | Unix epoch seconds of the last inference record update. |
-
----
-
-## Error Handling
-
-| Scenario | What Happens |
+| Field | Description |
 |---|---|
-| WARP is not running | `CreateFile` fails with `ERROR_FILE_NOT_FOUND` (error 2). Your app should retry or inform the user. |
-| Malformed JSON request | WARP treats it as a default query and returns the last 1 hour of all event types. |
-| Unknown `window` code | WARP falls back to `1h` (last 1 hour). |
-| Unknown value in `types` array | That value is silently ignored. If no valid types remain, all types are returned. |
-| Negative or zero `seconds` | The query returns empty result sets (`"count": 0`). |
-| No activity in the time range | Returns sections with `"count": 0` and empty `"events": []`. |
-| Response exceeds 64 KB | Very large result sets may be truncated at the pipe buffer boundary. Use a shorter time window, fewer event types, or custom seconds to reduce result size. |
-| `QueryInferences` returns `{}` for a path | The entity has never been seen by WARP. No inference record exists. |
-| `GetInferenceDeltas` returns empty `"deltas"` | No records have changed since the given `since_version`. |
-| `GetRecentContext` returns an empty `summary` array and zero counts | No activities occurred in the last 15 minutes, or WARP was just started and the first 60-second cycle hasn't completed yet. |
-| `GetRecentContexts` returns `"recent_contexts": []` | History is empty (just started, or `ClearAll` was called). `history_count` will also be `0`. |
-| Unknown `"op"` value | The request is treated as a default event query (last 1 hour, all types). |
+| `upserts[]` | Full current [entity records](#entity-record-fields) (no score fields) of entities created or changed after `since`. Replace your copy. |
+| `deletes[]` | Tombstones: `entity_key`, `entity_type`, `change_seq`, `reason` and `ts` (Unix seconds). `reason` is `deleted`, `renamed` (the entity continues under a new key, which arrives as an upsert), `purge` or `retention`. |
+| `next` | Cursor for the next call. When `more` is `false` it equals `current`. |
+| `current` | Highest change sequence handed out so far: the latest change in the store, or the persisted high-water mark (`meta` key `change_seq_hw`, written with every committed batch) if that is higher. |
+| `more` | `true` when more changes are immediately available: call again with `since` = `next`. |
+| `reset` | `true` when your cursor is no longer valid: it predates a clear-all, or deletes after it were pruned (tombstones are kept for 90 days). `next` is then 0 and both arrays are empty: drop your local copy and resync from `since: 0`. |
 
-### Checking if WARP is Available
+Changes come in ascending `change_seq` order, at most `limit` upserts and deletes
+combined. An entity deleted and re-created after `since` appears in both arrays: apply
+`deletes` before `upserts` (or merge by `change_seq`). The change sequence is shared with
+other derived data (e.g. work threads), and numbers consumed by writes that were rolled back
+never appear in any record; `next` still moves past them, so `next` can advance without any
+upsert and a caught-up cursor equals the `current` of `WaitForChanges`.
 
-```cpp
-// Quick availability check (C++)
-HANDLE hPipe = CreateFileW(L"\\\\.\\pipe\\WarpFileActivityAPI",
-    GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-bool available = (hPipe != INVALID_HANDLE_VALUE);
-if (available) CloseHandle(hPipe);
+**Sync loop:**
+
+```text
+since = load()                                  # 0 on the first run
+loop:
+    r = GetChanges(since, limit = 1000)
+    if r.reset: clear the local copy; since = 0; continue
+    remove r.deletes by entity_key; then upsert r.upserts by entity_key
+    since = r.next; save(since)
+    if not r.more: WaitForChanges(since)         # or sleep, then loop
 ```
 
-```python
-# Quick availability check (Python)
-import os
-available = os.path.exists(r"\\.\pipe\WarpFileActivityAPI")
+#### WaitForChanges
+
+Long-poll: returns as soon as the store's change sequence exceeds `since`, or after the
+timeout. No scope required (it only returns sequence numbers).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `since` (alias `since_seq`) | integer | 0 | Usually the `next` of your last `GetChanges`. |
+| `timeout_ms` | integer | 20000 | Clamped to 0-25000. |
+
+```json
+{"op": "WaitForChanges", "since": 58240, "timeout_ms": 20000}
 ```
 
-```csharp
-// Quick availability check (C#)
-bool available = System.IO.File.Exists(@"\\.\pipe\WarpFileActivityAPI");
+**Response:**
+
+```json
+{"api_version": 2, "ok": true, "changed": true, "current": 58251, "reset_seq": 0}
 ```
+
+| Field | Description |
+|---|---|
+| `changed` | `true` when `current` > `since`: call `GetChanges`. |
+| `current` | Latest committed change sequence. |
+| `reset_seq` | Change sequence of the last clear-all (0 if none). If it is greater than your cursor, the next `GetChanges` returns `reset`. |
+| `retry_after_ms` | Present (1000) when 4 long-polls were already pending server-wide: the call returned at once (`changed` reflects the current state); wait this long before polling again. |
+
+- The wait also ends when the store closes (WARP shutting down).
+- Use a client read timeout longer than `timeout_ms`. The 10 s idle limit applies only
+  between requests, not while a long-poll is pending.
+- The sequence also advances for changes that `GetChanges` does not return (e.g. work
+  threads), so `changed: true` can be followed by an empty `GetChanges`. Pass the `next`
+  of that `GetChanges` (not the `change_seq` of the last record) to the following
+  `WaitForChanges`; it then blocks until something new is committed.
+
+### 4. Timeline and History
+
+#### QueryTimeline
+
+Raw events, work sessions and work threads of an absolute time range, with per-type
+cursors (activity scope).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `start` | integer | `end` - 3600 | Unix seconds. |
+| `end` | integer | now | Unix seconds. `start` or `end` <= 0, or `end` < `start` -> `invalid_request`. |
+| `types` | string[] | everything | Any of `file`, `app_launch`, `app_focus`, `browsing`, `sessions`, `threads`. When present, only the listed sections are returned. Unknown names are ignored; an empty list, or one with only unknown names, means everything (including `sessions` and `threads`), as for the raw query. |
+| `limit` | integer | 1000 | Events per event type, clamped to 1-20000. |
+| `min_confidence` | number | 0.0 | Drops events whose `confidence` is lower. |
+| `cursor` | object | -- | `next_cursor` of the previous page: `{"file": id, "app_launch": id, "app_focus": id, "browsing": id}`. |
+
+```json
+{"op": "QueryTimeline", "start": 1760000400, "end": 1760004000, "types": ["file", "app_focus", "sessions"], "limit": 500}
+```
+
+**Response** (abbreviated):
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "start": 1760000400,
+  "end": 1760004000,
+  "files": [
+    { "id": 1042, "timestamp": 1760003990, "action": "MODIFY", "path": "C:\\Users\\Alice\\Documents\\report.docx",
+      "entity_key": "c:\\users\\alice\\documents\\report.docx", "source": "etw", "confidence": 1.0 }
+  ],
+  "focus": [
+    { "id": 881, "start_ts": 1760003100, "end_ts": 1760003950, "active_secs": 790, "exe_name": "WINWORD.EXE",
+      "window_title": "report.docx - Word", "doc_key": "c:\\users\\alice\\documents\\report.docx",
+      "doc_display": "C:\\Users\\Alice\\Documents\\report.docx", "doc_type": "file" }
+  ],
+  "sessions": [
+    { "id": 77, "start_ts": 1759998000, "end_ts": 1760004000, "active_secs": 4810, "passive_secs": 600 }
+  ],
+  "next_cursor": { "file": 1003 }
+}
+```
+
+| Section | Present when | Fields |
+|---|---|---|
+| `files` | `file` requested | `id`, `timestamp`, `action`, `path`, `old_path` (renames), `entity_key`, `source`, `confidence` |
+| `app_launches` | `app_launch` requested | `id`, `timestamp`, `exe_name`, `exe_path`, `aumid` (empty if none), `confidence` |
+| `focus` | `app_focus` requested | `id`, `start_ts`, `end_ts`, `active_secs`, `exe_name`, `window_title`, plus `doc_key` / `doc_display` / `doc_type` when resolved; sessions overlapping the range |
+| `browsing` | `browsing` requested | `id`, `timestamp`, `browser`, `title`, `url` (empty if none), `entity_key` |
+| `sessions` | `sessions` requested and the history engine runs | work sessions overlapping the range, newest first, at most 500: `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs` |
+| `threads` | `threads` requested and the history engine runs | work threads active in the range, most recent first, at most 50: `id`, `label`, `active_secs_in_range`, `spans` (`[start, end]` pairs) |
+| `next_cursor` | always | `null`, or an object naming each event type that has more rows |
+
+**Paging.** Event types page independently, newest first: by (`timestamp`, `id`), and
+focus sessions by (session end, `id`) -- stable keyset paging, so rows recorded while you
+page do not shift the pages. When a type has more rows than `limit`, `next_cursor` holds
+the `id` of its last (oldest) returned row. Repeat the request with the same `start` /
+`end`, `"cursor": next_cursor` and `types` reduced to the keys of `next_cursor`: a type
+requested without a cursor starts again from its newest row, and `sessions` / `threads`
+are not paged (they come complete with the first page). Stop when `next_cursor` is `null`.
+A cursor whose row has meanwhile been deleted (retention, purge) returns an empty page for
+that type.
+
+#### GetWorkThreads
+
+Work threads -- groups of entities used together, resumable across days -- that were
+active in a time range (activity scope).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `start` | integer | `end` - 7 days | Unix seconds. |
+| `end` | integer | now | `end` < `start` -> `invalid_request`. |
+| `limit` | integer | 20 | Clamped to 1-200. |
+| `members` | bool | `true` | Include the top 15 members of each thread. |
+
+```json
+{"op": "GetWorkThreads", "limit": 5}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "start": 1759399200,
+  "end": 1760004000,
+  "current_thread": 42,
+  "threads": [
+    {
+      "id": 42,
+      "label": "User is working on the quarterly report in Word and Excel",
+      "first_ts": 1759740000,
+      "last_ts": 1760003990,
+      "active_secs": 21840,
+      "active_secs_in_range": 9420,
+      "project": "od:c:\\users\\alice\\onedrive - contoso\\finance",
+      "current": true,
+      "change_seq": 58233,
+      "spans": [[1759912000, 1759919800], [1760001200, 1760003990]],
+      "members": [
+        { "entity_key": "c:\\users\\alice\\onedrive - contoso\\finance\\q3.xlsx", "entity_type": "file",
+          "display_name": "C:\\Users\\Alice\\OneDrive - Contoso\\Finance\\Q3.xlsx", "weight": 3.41 },
+        { "entity_key": "c:\\users\\alice\\documents\\report.docx", "entity_type": "file",
+          "display_name": "C:\\Users\\Alice\\Documents\\report.docx", "weight": 2.87 }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `current_thread` | Id of the thread the latest context snapshot was assigned to (0 if none). |
+| `threads[]` | Most recently active first. Threads without a span inside the range are skipped. |
+| `label` | Human-readable label taken from the context summary. |
+| `first_ts` / `last_ts` | First and last activity of the thread (all time). |
+| `active_secs` / `active_secs_in_range` | Active seconds over the thread's lifetime / in its spans that overlap the range. |
+| `project` | Project anchor: `git:<repo folder>`, `ws:<solution or workspace folder>`, `od:<OneDrive library folder>`, `sp:<host>/sites/<site>`, `repo:<host>/<owner>/<repo>` or `dir:<folder>`; empty if none. |
+| `current` | `true` for the current thread. |
+| `change_seq` | Change sequence of the thread's last update. |
+| `spans` | `[start, end]` periods of the thread that overlap the range (at most 200). |
+| `members[]` | `entity_key`, `entity_type`, `display_name`, `title` (when known) and `weight` (membership weight that decays with a ~2-day time constant). Deleted entities are omitted. |
+
+#### GetRelated
+
+Entities used together with an entity -- co-occurrence in the same context snapshots
+(activity scope).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `entity_key` | string | -- | An exact entity key, used verbatim. |
+| `key` | string | -- | A raw identifier, [normalized](#entity-keys-and-normalization); used when `entity_key` is absent or empty. One of the two is required (`invalid_request`). |
+| `limit` | integer | 20 | Clamped to 1-100. |
+
+```json
+{"op": "GetRelated", "key": "C:\\Users\\Alice\\Documents\\report.docx", "limit": 5}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "entity_key": "c:\\users\\alice\\documents\\report.docx",
+  "results": [
+    { "entity_key": "c:\\users\\alice\\onedrive - contoso\\finance\\q3.xlsx", "entity_type": "file",
+      "display_name": "C:\\Users\\Alice\\OneDrive - Contoso\\Finance\\Q3.xlsx", "weight": 6.12, "last_ts": 1760003990 },
+    { "entity_key": "gh:contoso/finance-tools#pr12", "entity_type": "url",
+      "display_name": "https://github.com/contoso/finance-tools/pull/12", "weight": 1.73, "last_ts": 1759919800 }
+  ]
+}
+```
+
+`weight` is the co-occurrence weight decayed to now (14-day time constant); results are
+strongest first; `last_ts` is the last time both were seen together. Deleted entities are
+omitted.
+
+### 5. Context
+
+WARP composes a context snapshot every `ContextCadenceSeconds` (default 60 s; only when new
+activity was committed or the foreground window changed, and at least every 5 minutes) from
+the last 15 minutes of activity: a 1-3 line summary of what the user is doing, per-facet
+summaries for files, websites and apps, the top apps and the entities behind it. Summaries
+are built from the actual window, tab and document titles (there is no fixed topic
+taxonomy). With the optional granite embedding model related activities are clustered into
+threads, and the optional Qwen LLM refiner (`LlmEnabled`, off by default) may rephrase the
+combined summary. All context operations need the activity scope and return `unavailable`
+when context inference is not running.
+
+#### GetRecentContext
+
+The latest snapshot for a look-back window (v1 shape: no `ok` member).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `category` | string | `all` | `all`, `files`, `websites` or `apps` (`documents` = `files`; any other value = `all`). Selects which summary becomes `summary` and whether the per-facet summaries are included (see [Context Snapshot Fields](#context-snapshot-fields)). |
+| `window_seconds` (alias `window_secs`) | integer | 900 | Look-back. Clamped to 0-2592000, then snapped to the nearest of 300, 900, 1800, 3600, 7200, 21600, 86400, 604800, 1296000, 2592000 (0 -> 900). |
+| `include_vector` | bool | `true` | Include `summary_embedding`. |
+
+```json
+{"op": "GetRecentContext", "category": "all", "window_seconds": 900, "include_vector": false}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "recent_context": { /* snapshot, see Context Snapshot Fields */ },
+  "category": "all",
+  "window_seconds": 900,
+  "history_count": 37
+}
+```
+
+- A 900-second window returns the snapshot of the last periodic compose (the only one the
+  LLM may have refined). Any other window is composed on demand without the LLM and cached
+  for 60 s (windows up to 2 h), 5 minutes (up to 24 h) or 15 minutes (longer).
+- `recent_context` is `null` until the first compose has finished.
+- `category` and `window_seconds` echo the normalized values; `history_count` is the
+  number of snapshots in the in-memory history.
+
+#### GetRecentContexts
+
+Recent snapshots, newest first -- for context drift, a "what was I doing" timeline or an
+agent's short-term memory (v1 shape: no `ok` member).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `count` | integer | 10 | Values <= 0 mean 10; at most 200. |
+| `category` | string | `all` | As for `GetRecentContext`, applied to every snapshot. |
+| `window_seconds` (alias `window_secs`) | integer | 900 | Only snapshots taken within the last `window_seconds` (same clamping and snapping as above). |
+| `include_vector` | bool | `true` | Include `summary_embedding` (in-memory snapshots only). |
+
+```json
+{"op": "GetRecentContexts", "count": 20, "window_seconds": 86400, "include_vector": false}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "recent_contexts": [ { /* newest snapshot */ }, { /* older snapshot */ } ],
+  "category": "all",
+  "window_seconds": 86400,
+  "returned": 2,
+  "from_persisted": 0,
+  "history_count": 37,
+  "requested": 20
+}
+```
+
+| Field | Description |
+|---|---|
+| `recent_contexts` | Snapshots, newest first. |
+| `category` / `window_seconds` | The normalized request values. |
+| `returned` | Number of snapshots returned. |
+| `from_persisted` | How many of them were read from the database (see below). |
+| `history_count` | Snapshots in the in-memory history (at most 1440). |
+| `requested` | The effective `count`. |
+
+- A snapshot enters the history only when its window had activity and it differs
+  materially from the previous entry (a summary line or the dominant app changed) or the
+  previous entry is 5 minutes old -- entries are context *transitions*, not polling ticks.
+- History entries are also persisted (table `context_snapshot`, kept for the raw-event
+  retention). For `category: "all"`, snapshots older than the in-memory history (e.g. from
+  before a restart) are filled in from the database; those are always the `all` view,
+  without `summary_embedding`, and carry their real work-thread id in `thread_id` and in
+  every `current_entities[].thread_id`.
+
+#### GetCurrentContext
+
+Presence, the live foreground window, the latest snapshot and the current work thread in
+one call.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `include_vector` | bool | **`false`** | Include `summary_embedding` in the snapshot. |
+
+```json
+{"op": "GetCurrentContext"}
+```
+
+**Response:**
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "context": {
+    "now": 1760004000,
+    "presence": "active",
+    "foreground": {
+      "exe_name": "WINWORD.EXE",
+      "exe_path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+      "window_title": "report.docx - Word",
+      "since": 1760003100,
+      "active_secs": 790,
+      "entity_key": "c:\\users\\alice\\documents\\report.docx",
+      "entity_type": "file",
+      "display": "C:\\Users\\Alice\\Documents\\report.docx"
+    },
+    "snapshot": { /* latest periodic snapshot, category "all", see Context Snapshot Fields */ }
+  },
+  "thread": { "id": 42, "label": "User is working on the quarterly report in Word and Excel" }
+}
+```
+
+| Field | Description |
+|---|---|
+| `context.now` | Server time. |
+| `context.presence` | `active`, `passive`, `away`, `locked` or `asleep` (empty if unknown). |
+| `context.foreground` | The current foreground session, or `null`: `exe_name`, `exe_path`, `window_title`, `since` (session start), `active_secs` so far; plus `entity_key`, `entity_type` (`file` or `url`) and `display` when the window shows a resolved document or page. |
+| `context.snapshot` | The latest periodic snapshot (`null` before the first compose). |
+| `thread` | Current work thread: `id` (0 if none) and `label`. Present while the history engine runs. |
+
+#### Context Snapshot Fields
+
+The snapshot object returned by `GetRecentContext` (`recent_context`), `GetRecentContexts`
+(`recent_contexts[]`) and `GetCurrentContext` (`context.snapshot`). Example for
+`category: "all"` with `include_vector: false`:
+
+```json
+{
+  "timestamp": 1760003960,
+  "window_start": 1760003060,
+  "window_end": 1760003960,
+  "window_seconds": 900,
+  "category": "all",
+  "summary": ["User is working on the quarterly report and Q3 budget in Word and Excel",
+              "Reviewing finance-tools pull request 12 in Microsoft Edge"],
+  "summary_files": ["User is working on the quarterly report and Q3 budget in Word and Excel"],
+  "summary_websites": ["Reviewing finance-tools pull request 12 in Microsoft Edge"],
+  "summary_apps": [],
+  "activity_count": 47,
+  "focus_seconds": 812,
+  "dominant_focus_pct": 61,
+  "confidence": 0.84,
+  "thread_count": 2,
+  "thread_id": 42,
+  "presence": "active",
+  "model": "granite-embedding-small-english-r2",
+  "model_polish": "(not loaded)",
+  "signal_types": ["app_focus", "file", "browsing"],
+  "items": [
+    { "app": "Word", "exe": "WINWORD.EXE", "title": "report.docx", "raw_title": "report.docx - Word",
+      "focus_seconds": 498, "pct": 61, "thread_id": 1, "entity_key": "c:\\users\\alice\\documents\\report.docx" },
+    { "app": "Microsoft Edge", "exe": "msedge.exe", "title": "Add Q3 export - Pull Request #12",
+      "raw_title": "Add Q3 export - Pull Request #12 - contoso/finance-tools - Microsoft Edge",
+      "focus_seconds": 184, "pct": 22, "thread_id": 2, "entity_key": "gh:contoso/finance-tools#pr12" }
+  ],
+  "current_entities": [
+    { "entity_key": "c:\\users\\alice\\documents\\report.docx", "entity_type": "file",
+      "display": "C:\\Users\\Alice\\Documents\\report.docx", "title": "report.docx", "app": "Word",
+      "role": "focus", "active_secs_in_window": 498, "last_active_ts": 1760003950, "score": 0.97, "thread_id": 42 },
+    { "entity_key": "gh:contoso/finance-tools#pr12", "entity_type": "url",
+      "display": "https://github.com/contoso/finance-tools/pull/12", "title": "Add Q3 export - Pull Request #12",
+      "app": "Microsoft Edge", "role": "reference", "active_secs_in_window": 184, "last_active_ts": 1760003600,
+      "score": 0.64, "thread_id": 42 }
+  ]
+}
+```
+
+With `category` `files`, `websites` or `apps`, `summary` holds that facet's summary and the
+`summary_files` / `summary_websites` / `summary_apps` members are omitted; everything else
+(including `items`, which always reflect the combined view) is unchanged.
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | integer | When the snapshot was composed (Unix seconds). |
+| `window_start` / `window_end` / `window_seconds` | integer | The look-back window. |
+| `category` | string | The view the snapshot was rendered for. |
+| `summary` | string[] | 1-3 lines describing what the user is doing -- the combined summary for `all`, otherwise the requested facet's summary. Empty when the window had no usable activity. Render one line per entry. |
+| `summary_files` | string[] | Only for `all`. Apps engaged with a file -- editors and IDEs, Office, note-taking apps, PDF and image viewers, design tools, any window whose title names a file -- plus recently opened files. |
+| `summary_websites` | string[] | Only for `all`. Browser tabs. |
+| `summary_apps` | string[] | Only for `all`. Everything else: communication, media, terminals, remote desktops, version-control UIs, ... |
+| `activity_count` | integer | Raw signals considered. |
+| `focus_seconds` | integer | Foreground seconds in the window. |
+| `dominant_focus_pct` | integer | Share of focus time in the top app, 0-100. |
+| `confidence` | number | 0-0.99 heuristic signal quality (focus volume, dominance, variety of signals) -- not a model probability. |
+| `thread_count` | integer | Activity clusters in the window (without the embedding model every app is its own cluster). |
+| `thread_id` | integer | Persistent work-thread id (see [`GetWorkThreads`](#getworkthreads)); 0 if none. |
+| `presence` | string | Presence when composed: `active`, `passive`, `away`, `locked`, `asleep` or empty. |
+| `model` | string | `granite-embedding-small-english-r2` when the embedding model is loaded, else `deterministic`. |
+| `model_polish` | string | `qwen3-0.6b` when the optional LLM refiner is loaded, else `(not loaded)`. |
+| `signal_types` | string[] | Contributing signals: `app_focus`, `browsing`, `app_launch`, `file`. |
+| `summary_embedding` | number[] | Only with `include_vector`: 384-dimension, L2-normalized embedding of the joined `summary` lines (6 decimals); empty without the embedding model. |
+| `items[]` | object[] | Top apps by focus time (at most 5): `app` (friendly name), `exe`, `title` (cleaned), `raw_title` (original window title), `focus_seconds`, `pct` (integer share of focus), `thread_id` (1-based cluster id **within this snapshot**, not a work-thread id) and `entity_key` (document / page when resolved, else the app; omitted when empty). |
+| `current_entities[]` | object[] | The entities behind the snapshot, joinable with the entity operations: `entity_key`, `entity_type` (`file`, `url` or `app`), `display` (path, URL or app), `title`, `app` (where it was used), `role` (`focus`, `reference` or `communication`), `active_secs_in_window`, `last_active_ts`, `score` (long-horizon engagement percentile, 0-1) and `thread_id` (the snapshot's work-thread id). |
+
+### 6. Status and Control
+
+#### Ping
+
+Liveness check. No parameters, no scope.
+
+```json
+{"op": "Ping"}
+```
+
+```json
+{"api_version": 2, "ok": true, "pong": true, "now": 1760004000, "version": "6.0.0", "store_open": true}
+```
+
+`version` is WARP's product version. `Ping` and `GetStatus` answer even when the activity
+store is not open -- then `store_open` is `false` and every other operation returns
+`unavailable`.
+
+**Checking availability.** `Ping` is the reliable check. To test only whether the pipe
+exists without connecting, call `WaitNamedPipeW(name, 1)`: it fails with
+`ERROR_FILE_NOT_FOUND` when WARP is not running in the session.
+
+#### GetStatus
+
+Health and statistics; for WARP's own executable (control scope) also paths, recent log
+messages, capture error texts, the media / microphone / camera flags and the effective
+settings. No parameters, no scope; answers even when the activity store is not open.
+
+```json
+{"op": "GetStatus"}
+```
+
+**Response** for a third-party client (abbreviated):
+
+```json
+{
+  "api_version": 2,
+  "ok": true,
+  "version": "6.0.0",
+  "pid": 9412,
+  "session_id": 1,
+  "started_utc": 1759990000,
+  "uptime_secs": 14000,
+  "paused": false,
+  "paused_until": 0,
+  "consent_acknowledged": true,
+  "store": {
+    "open": true, "schema_version": 2,
+    "integrity": "ok", "db_bytes": 73400320, "wal_bytes": 4194304, "queue_depth": 0,
+    "enqueued": 182311, "dropped": 0, "written": 182311, "batches": 9120, "write_errors": 0,
+    "last_commit_utc": 1760003995, "change_seq": 58251, "reset_seq": 0,
+    "raw_retention_days": 30, "entity_retention_days": 395
+  },
+  "api": {
+    "requests": 5120, "errors": 3, "rejected": 0, "busy": 0, "active_connections": 1,
+    "session_pipe": "\\\\.\\pipe\\WarpFileActivityAPI-1", "session_pipe_owned": true,
+    "legacy_pipe": "\\\\.\\pipe\\WarpFileActivityAPI", "legacy_pipe_owned": true
+  },
+  "capture": {
+    "files": { "enabled": true, "etw_running": true, "usn_running": true, "recent_running": true, "mru_running": true,
+               "emitted": 41022, "filtered": 380113, "queue_dropped": 0, "etw_events_lost": 0, "etw_buffers_lost": 0,
+               "last_event_ms": 1760003990120, "session": "WARP-KernelFile-1" },
+    "launches": { "enabled": true, "etw_running": true, "starts": 2210, "recorded": 312, "with_window": 280,
+                  "no_window": 1898, "helpers": 640, "system": 900, "other_session": 0, "exits": 2150,
+                  "events_lost": 0, "last_event_ms": 1760003001000 },
+    "web": { "enabled": true, "pages": 1830, "private_dropped": 12, "excluded_dropped": 40, "uia_requests": 2100,
+             "uia_timeouts": 3, "uia_failures": 1, "last_event_ms": 1760003600000 },
+    "focus_enabled": true
+  },
+  "presence": { "state": "active", "since": 1760001000, "ms_since_input": 1200, "fullscreen": false,
+                "locked": false, "on_battery": false },
+  "models": { "embedding_loaded": true, "llm_enabled": false, "llm_available": false, "llm_resident": false },
+  "elevated": true,
+  "headless": false,
+  "logon_task_installed": true,
+  "log": { "warnings": 4, "errors": 0 }
+}
+```
+
+For WARP's own executable (its command line, e.g. `WARP!.exe --status`, and the tray) the
+response also contains `store.path`, `capture.files.last_error`,
+`capture.launches.last_error`, `presence.media_playing` / `mic_in_use` / `camera_in_use`,
+`data_dir`, `log.path`, `log.recent_problems` and `settings` (excerpt; all other members
+as above):
+
+```json
+{
+  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 2 },
+  "capture": { "files": { "session": "WARP-KernelFile-1", "last_error": "" },
+               "launches": { "last_event_ms": 1760003001000, "last_error": "" } },
+  "presence": { "state": "active", "on_battery": false, "media_playing": false, "mic_in_use": false,
+                "camera_in_use": false },
+  "data_dir": "C:\\Users\\Alice\\AppData\\Local\\WARP",
+  "log": { "warnings": 4, "errors": 0, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\logs\\warp.log",
+           "recent_problems": [] },
+  "settings": { "CaptureFiles": "true", "RawRetentionDays": "30", "ApiAllowedClients": "", "PausedUntilUtc": "0" }
+}
+```
+
+| Member | Description |
+|---|---|
+| `version` | Product version. |
+| `pid` | WARP's process id -- compare it with `GetNamedPipeServerProcessId`. |
+| `session_id` | Windows session WARP runs in (its pipe is `WarpFileActivityAPI-<session_id>`). |
+| `started_utc` / `uptime_secs` | When the API started, and the seconds since. |
+| `paused` / `paused_until` | Capture pause state; `paused_until` is 0 (not paused), a Unix time, or INT64_MAX (until resumed). |
+| `consent_acknowledged` | Whether the user acknowledged WARP's consent notice. |
+| `store` | Database: `open`, `path` (WARP only), `schema_version` (the database's `PRAGMA user_version`, read when the store opened; 0 if it never opened), `integrity` (`ok`, `recovered ...` or an error text), `db_bytes`, `wal_bytes`; writer queue: `queue_depth`, `enqueued`, `dropped`, `written`, `batches`, `write_errors`, `last_commit_utc`; change feed: `change_seq`, `reset_seq`; retention: `raw_retention_days`, `entity_retention_days`. |
+| `api` | `requests`, `errors` (error responses), `rejected` (connections refused with `wrong_session` / `unauthorized`), `busy` (connections answered with `busy` because the queue was full), `active_connections`, and both pipe names with whether WARP owns them. |
+| `capture` | Per-source health: `files` (ETW, USN, Recent-items and Office-MRU producers, counters, ETW losses, ETW session name, last event; `last_error` WARP only), `launches` (counters, last event; `last_error` WARP only), `web`, `focus_enabled`. |
+| `presence` | `state`, `since`, `ms_since_input`, `fullscreen`, `locked`, `on_battery`; WARP only also `media_playing`, `mic_in_use`, `camera_in_use`. |
+| `models` | `embedding_loaded`, `llm_enabled`, `llm_available`, `llm_resident`. |
+| `data_dir` | WARP only: WARP's data folder. |
+| `elevated`, `headless`, `logon_task_installed` | Runtime facts. |
+| `log` | `warnings` and `errors` counts; for WARP only also the log file `path` and up to 10 `recent_problems`. |
+| `settings` | WARP only: every effective setting as a string (`"true"` / `"false"`, numbers, `;`-joined lists), with ` (policy)` appended when the value is set by policy. |
+
+`capture`, `presence`, `models`, `data_dir`, `elevated`, `headless` and
+`logon_task_installed` come from WARP's status provider and are absent when the API runs
+without one (e.g. in tests).
+
+#### Purge
+
+Deletes recorded data (control scope: WARP's command line and tray only).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `start` | integer | 0 | Unix seconds; 0 = from the beginning. |
+| `end` | integer | 0 | Unix seconds; 0 = no upper bound. `start` > `end` -> `invalid_request`. |
+| `entity_key` | string | -- | Purge one entity everywhere (exact key, used verbatim). |
+| `key` | string | -- | The same from a raw identifier ([normalized](#entity-keys-and-normalization)); used when `entity_key` is absent or empty. |
+| `domain` | string | -- | A web host; subdomains are included. |
+| `path_prefix` | string | -- | A folder (or file): everything at or below it. |
+
+Exactly **one** kind of criterion per request: a time range (`start` and/or `end`), an
+entity (`key` / `entity_key`), a `domain` or a `path_prefix`. No criterion, or more than
+one kind, -> `invalid_request` (the message names the accepted criteria).
+
+```json
+{"op": "Purge", "domain": "example.com"}
+```
+
+```json
+{"api_version": 2, "ok": true, "rows_deleted": 412}
+```
+
+| Criterion | What is deleted |
+|---|---|
+| time range | Raw events of every type, clipboard / print records, context snapshots whose summary window overlaps the range, and co-occurrence edges last updated inside it. Intervals that cross a range boundary -- focus sessions, presence intervals, work-thread spans, work sessions -- keep their parts outside the range (active / idle / passive seconds scaled to the kept share). Daily rollups: days the range covers completely are dropped (so are partly covered days older than the raw retention, where activity inside and outside the range can no longer be told apart); on the boundary days exactly what the purged rows had contributed is subtracted -- WARP replays each affected item's raw rows through the live crediting rules (de-duplication windows, safe-saves) with and without the purged rows -- so other items used that day are not re-scored. Entities left without evidence are tombstoned with `reason: "purge"`; every other affected entity keeps its live totals and engagement minus the purged share (`last_*_ts` timestamps fall back to the latest remaining evidence) and appears as an upsert in the change feed. |
+| `entity_key` / `key` | The entity's raw events (including focus sessions that showed it), daily rollups, co-occurrence edges, thread memberships and the context snapshots mentioning it; the entity is tombstoned. |
+| `domain` | Browsing events of the host and its subdomains; the URL entities on that host -- matched by key or display URL, so document-keyed pages (`gdoc:...`, `yt:...`) are included -- with their rollups, edges, memberships and focus sessions; context snapshots mentioning the host. |
+| `path_prefix` | File events at or below the folder (also matched by old path) and the focus sessions, rollups, edges and thread memberships of files there -- including files that are no longer ranked entities; its file entities are tombstoned; context snapshots mentioning it. |
+
+Every criterion also re-derives the [work threads](#getworkthreads) the purged items or time
+belonged to: a thread's label is a summary line written by a snapshot and may name what was
+purged, so it is rebuilt from the thread's strongest remaining members (e.g. `"spec.docx,
+model.xlsx"`) and its label embedding is reset; a thread left without members or spans is
+deleted. Changed threads carry a new `change_seq`.
+
+A purge also covers activity that is **reported after it**: an Office MRU or Recent-items poll,
+a held safe-save, or a focus session / presence interval that was still open. Records about a
+purged time range are not stored (intervals keep only their parts outside it), and work
+sessions are never joined across purged time; purged time ranges are remembered across
+restarts. Records about a purged item, web host or folder that happened before the purge are
+not stored either (until WARP restarts -- the purged names are not written to disk). Activity
+after the purge is recorded normally.
+
+Tombstoned entities appear in the change feed as deletes with `reason: "purge"`. After
+every purge WARP drops its write caches so nothing purged is written back from memory, and
+on success it also clears its in-memory context history. `rows_deleted` is approximate
+(every tombstoned entity counts as one row). When the purge does not complete (store busy
+or closed, 120 s timeout) the answer is an error and nothing is reported as deleted:
+
+```json
+{"api_version":2,"ok":false,"error":{"code":"internal_error","message":"the purge did not complete (store busy or closed); nothing was reported as deleted"}}
+```
+
+#### Pause and Resume
+
+Pause or resume capture (control scope: WARP's command line and tray only). While paused,
+the capture sources drop new events and the context is not recomposed; the API keeps
+serving the data recorded so far.
+
+| Param (`Pause`) | Type | Default | Notes |
+|---|---|---|---|
+| `indefinite` | bool | `false` | `true` = until `Resume`. Takes precedence over `until` and `minutes`. |
+| `until` | integer | -- | Unix seconds; must be in the future (`invalid_request`). Takes precedence over `minutes`. |
+| `minutes` | integer | 60 | Clamped to 1-10080 (7 days). |
+
+`Resume` takes no parameters.
+
+```json
+{"op": "Pause", "minutes": 30}
+```
+
+```json
+{"api_version": 2, "ok": true, "paused": true, "paused_until": 1760005800}
+```
+
+- `Resume` answers `{"api_version": 2, "ok": true, "paused": false, "paused_until": 0}`.
+- For `indefinite` pauses `paused_until` is `9223372036854775807` (INT64_MAX).
+- When the pause state cannot be changed (`PausedUntilUtc` is set by policy, or the
+  registry write failed), both operations answer
+  `{"api_version": 2, "ok": false, "paused": false, "paused_until": 0, "error": {"code": "locked", "message": "pause state is controlled by policy"}}`.
+- The pause state is stored as `PausedUntilUtc` under `HKCU\Software\WARP` and survives
+  restarts.
 
 ---
 
-## Data Retention & Limits
+## Entity Records and Scores
+
+### Entity Record Fields
+
+Returned by `ScoreEntities`, `TopEntities`, `SearchActivity` and `GetChanges` (upserts).
+`QueryInferences` and `GetInferenceDeltas` return a subset under the same names, plus
+`version` (= `change_seq`) and `updated_at` (when the record was last written).
+
+| Field | Type | Description |
+|---|---|---|
+| `entity_key` | string | [Entity key](#entity-keys-and-normalization). |
+| `entity_type` | string | `file`, `app` or `url`. |
+| `display_name` | string | Full path, exe path or AUMID, or canonical URL. Omitted by `ScoreEntities` for clients without the activity scope. |
+| `title` | string | Best human title (page title, app name). Omitted when empty or without the activity scope. |
+| `last_event_ts` | integer | Last event of any kind (Unix seconds; 0 = never). |
+| `last_open_ts` | integer | Last open, launch or visit. |
+| `last_edit_ts` | integer | Last save, modify or create (files). |
+| `last_active_ts` | integer | Last time the entity was in the foreground with the user present. |
+| `open_count_7d` / `open_count_30d` | integer | Opens, launches and visits during the last 7 / 30 local days (today included), confidence-weighted and rounded; computed at query time from the daily rollups. |
+| `open_count_total` | integer | Lifetime opens (confidence-weighted, rounded). |
+| `edit_count_total` | integer | Lifetime edits (confidence-weighted, rounded). |
+| `active_secs_7d` / `active_secs_total` | integer | Active foreground seconds during the last 7 local days / lifetime. |
+| `distinct_days` | integer | Number of different local days with engagement. |
+| `recency_score` | number | Legacy v1 score, 0-255, evaluated at query time: `200 * e^(-(now - last_open_ts) / 172800) + 5 * ln(1 + open_count_7d)` (0 if never opened). |
+| `change_seq` | integer | Global change sequence of the record's last update (the v1 `version`). |
+
+### Score Fields
+
+Returned by `ScoreEntities`, `TopEntities` and `SearchActivity`:
+
+| Field | Type | Description |
+|---|---|---|
+| `score` | number | 0-1: percentile of `prior` among all entities of the same `entity_type` for the requested horizon (0 without engagement). Comparable across types. |
+| `prior` | number | Raw engagement for the horizon: `short_term` (`short`), `long_term` (`long`) or `0.7 * short_term + 0.3 * long_term * 3 / 30` (`blend`). |
+| `short_term` | number | Engagement decayed with a 3-day time constant, evaluated now. |
+| `long_term` | number | Engagement decayed with a 30-day time constant, evaluated now. |
+| `reasons` | string[] | Human-readable explanations, e.g. `edited today`, `edited in the last 7 days`, `42 min active in the last 7 days`, `used on 3 of the last 7 days`, `opened 5 times in the last 7 days`, `recurring: used on 12 different days`, `last used 2 h ago`. |
+
+### How Scores Work
+
+1. **Engagement credit.** Every engagement adds a weight to two exponentially decayed
+   accumulators of the entity: kernel-observed open 0.3 x confidence; explicit open (shell,
+   Recent items, Office MRU, a user-visible launch) 1.5; edit (save / modify / create)
+   3.0 x confidence; web visit 0.5 x confidence; 1.0 per active foreground minute (at most
+   60 per session). The first engagement on a new local day adds a bonus of up to 2.0.
+   Repeated opens within 2 minutes and edit bursts within 1 minute count once.
+2. **Decay at read time.** An accumulator stores its value S at time t0; its value now is
+   `S * e^(-(now - t0) / tau)`, with tau = 3 days (`short_term`) or 30 days (`long_term`).
+   Nothing is frozen at write time, so a score falls while the entity goes unused.
+3. **Horizon.** `short` ranks by the last few days, `long` by the last weeks; `blend` (the
+   default) combines both, the long-term part rescaled by 3/30 to the short-term scale.
+4. **Percentile.** `score` is the rank of the entity's `prior` among all non-deleted
+   entities of its type (the distribution is rebuilt at most every 5 minutes), so scores of
+   files, apps and pages are comparable. `TopEntities` without `type` merges types by
+   `score`; `SearchActivity` orders by `0.6 * relevance + 0.4 * score`.
+
+---
+
+## Data Retention
+
+| Data | Kept | Setting |
+|---|---|---|
+| Raw events (file, app launch, browsing, app focus), presence, context snapshots, clipboard / print metadata | 30 days | `RawRetentionDays` (1-3650) |
+| Entities, daily rollups, co-occurrence edges, work sessions and threads | 395 days after their last activity | `EntityRetentionDays` (7-3650) |
+| Tombstones (deletes in the change feed) | 90 days; older cursors get `reset` | -- |
 
 | Property | Value |
 |---|---|
-| **Retention period** | 30 days (rolling). Records older than 30 days are evicted from all three tables on startup and every 6 hours. |
-| **Maximum queryable range** | 30 days (`"window":"30d"` or `"seconds":2592000`). |
-| **Database location** | `%LOCALAPPDATA%\WARP\activity.db` |
-| **Storage format** | SQLite 3 with WAL mode |
-| **Timestamp precision** | 1-second resolution (Unix epoch seconds, UTC) |
-| **OPEN event dedup window** | 2 seconds -- multiple kernel-level opens of the same file within 2 seconds are collapsed into one event. |
-| **Browsing dedup** | Same browser + same title is reported only once until the title changes. |
-| **App launch polling interval** | 2 seconds |
-| **Browsing polling interval** | 3 seconds |
+| **Database** | `%LOCALAPPDATA%\WARP\activity.db` (or `activity.db` in the `--data-dir` folder); SQLite in WAL mode, schema version 2. |
+| **Encryption** | The data folder is EFS-encrypted when `EncryptDataDir` = 1 (default). |
+| **Maintenance** | Retention runs at start-up and periodically; expired entities are tombstoned with `reason: "retention"`. |
+| **Clear-all** | Clearing all data in WARP's UI deletes everything and advances `reset_seq`; change-feed cursors then get `reset`. |
+| **Timestamps** | Unix seconds, UTC. |
 
 ---
 
 ## Integration Patterns
 
-### 1. Recent File Picker
+### 1. Recent Items Picker
 
-Show users the files they opened most recently:
-
-```json
-{"window":"15m","types":["file"]}
-```
-
-Filter the response `file_activities.events` for `action == "OPEN"` and display
-unique paths.
-
-### 2. Backup & Sync Engine
-
-Find all files created or modified since the last backup:
+Show the files (or apps, or pages) the user works with most right now:
 
 ```json
-{"seconds":3600,"types":["file"]}
+{"op": "TopEntities", "type": "file", "limit": 20, "horizon": "short"}
 ```
 
-Filter for `action == "CREATE"` or `action == "MODIFY"`. Use the `id` field to
-track the high-water mark.
+Display `display_name` / `title`, and show `reasons` as a tooltip ("edited today", "last
+used 5 min ago"). Use `"horizon": "long"` for "frequently used" lists.
 
-### 3. Security Auditing
+### 2. Context-Aware Ranking
 
-Generate a compliance report of all activity over the past week:
+Rank candidates your app already has (search results, launcher entries, attachments) by
+engagement and by relevance to the current task:
 
 ```json
-{"window":"7d"}
+{
+  "op": "ScoreEntities",
+  "keys": ["C:\\Users\\Alice\\Projects\\app\\main.cpp", "C:\\Users\\Alice\\Projects\\app\\utils.h",
+           "https://github.com/contoso/app/pull/12"],
+  "context": "current",
+  "reasons": false
+}
 ```
 
-Log every event across all three types. The `RENAME` action with `old_path` lets
-you track file provenance. App launch events show what was executed. Browsing
-events show what was accessed online.
+Blend your own relevance with `score` and `context_boost` (e.g.
+`0.6 * relevance + 0.25 * score + 0.15 * context_boost`). Unknown items come back with
+`found: false`. `ScoreEntities` needs no activity scope.
 
-### 4. Developer Tooling
+### 3. Local Index Sync
 
-Detect which source files changed during a build:
+Mirror WARP's entities into your own index (desktop search, IDE extension, launcher)
+without re-reading everything: run the [sync loop](#getchanges) -- `GetChanges` until
+`more` is `false`, then `WaitForChanges` with the returned `next`, then `GetChanges`
+again. Persist `next`; on `reset`, rebuild from `since: 0`. v1 clients can keep using
+`GetInferenceDeltas` with `next_version`.
+
+### 4. Backup & Sync Engine
+
+Find files created or modified in a time range, page by page:
+
+```json
+{"op": "QueryTimeline", "start": 1760000400, "end": 1760004000, "types": ["file"], "limit": 1000}
+```
+
+Keep the `CREATE`, `MODIFY` and `RENAME` actions (use `old_path`) and follow `next_cursor`
+until it is `null`. Remember the `end` of the last completed range as your high-water mark.
+
+### 5. Security Auditing
+
+Replay everything that happened in a period -- events, work sessions and threads:
+
+```json
+{"op": "QueryTimeline", "start": 1759399200, "end": 1760004000, "limit": 5000}
+```
+
+Page each event type with `next_cursor`, restricting `types` to the keys of
+`next_cursor`. `confidence` and `source` separate user actions from background activity;
+`RENAME` with `old_path` tracks provenance.
+
+### 6. Developer Tooling
+
+Detect which source files changed during a build (v1 raw query):
 
 ```json
 {"seconds":120,"types":["file"]}
 ```
 
-Filter for `action == "MODIFY"` and paths matching your project directory.
+Filter for `action == "MODIFY"` and paths under your project directory; compare
+`entity_key` values for case-insensitive matching.
 
-### 5. Smart Cleanup Utility
+### 7. Smart Cleanup Utility
 
-Find files that haven't been touched recently:
-
-```json
-{"window":"30d","types":["file"]}
-```
-
-Collect all unique `path` values with `action == "OPEN"` or `action == "MODIFY"`.
-
-### 6. App Usage Analytics
-
-Show which applications the user launched today:
+Find files that have not been used for a long time by scoring the candidates you found on
+disk with the long horizon:
 
 ```json
-{"window":"24h","types":["app_launch"]}
+{"op": "ScoreEntities", "keys": ["D:\\Archive\\old-report.docx", "D:\\Archive\\notes.txt"], "horizon": "long", "reasons": false}
 ```
 
-Group `app_launch_activities.events` by `exe_name` and count occurrences.
+Items with `found: false` or an old `last_event_ts` are candidates (entities are kept for
+395 days after their last activity).
 
-### 7. Browsing History Dashboard
+### 8. App Usage Analytics
+
+Show which applications the user spends time in:
+
+```json
+{"op": "TopEntities", "type": "app", "limit": 20, "horizon": "short"}
+```
+
+`active_secs_7d` gives the foreground time per app. For a per-day breakdown, sum the
+`active_secs` of `QueryTimeline` `focus` sessions by `exe_name`.
+
+### 9. Browsing History Dashboard
 
 Show pages visited in the last hour:
 
@@ -858,743 +1787,748 @@ Show pages visited in the last hour:
 {"window":"1h","types":["browsing"]}
 ```
 
-Display `browsing_activities.events` with `browser`, `title`, and `url` fields.
+Display `browsing_activities.events` with `browser`, `title` and `url`. For the most
+visited pages, use `TopEntities` with `"type": "url"`.
 
-### 8. Smart File Ranking
+### 10. Work Resumption
 
-Rank a set of known files by how recently and frequently the user has interacted
-with them, without scanning raw events:
-
-```json
-{
-  "op": "QueryInferences",
-  "paths": [
-    "C:\\Users\\Alice\\Projects\\app\\main.cpp",
-    "C:\\Users\\Alice\\Projects\\app\\utils.h",
-    "C:\\Users\\Alice\\Projects\\app\\README.md"
-  ],
-  "fields": ["recency_score", "open_count_7d", "last_open_ts"]
-}
-```
-
-Sort the results by `recency_score` descending to surface the most relevant files.
-
-### 9. Incremental Inference Sync
-
-Keep a local cache of inference data in your app and periodically pull only
-what has changed:
+Help the user pick up where they left off:
 
 ```json
-{"op": "GetInferenceDeltas", "since_version": 0}
+{"op": "GetWorkThreads", "start": 1759399200, "limit": 10}
 ```
 
-Store the highest `version` from the response. On the next sync call:
+Show each thread's `label`, `spans` and top `members`, and offer to reopen the members of a
+thread. For a single item, `GetRelated` lists what was used together with it:
 
 ```json
-{"op": "GetInferenceDeltas", "since_version": 1042}
+{"op": "GetRelated", "key": "C:\\Users\\Alice\\Documents\\report.docx", "limit": 10}
 ```
 
-Only records updated after version 1042 are returned. Repeat until `"deltas"` is
-empty. This is ideal for dashboard widgets or IDE extensions that need near-real-time
-insight without re-querying the full dataset.
+### 11. Semantic Context Awareness
 
-### 10. Dynamic Context Awareness
-
-Understand what the user is currently working on to provide contextually relevant
-suggestions, search results, or UI adaptations:
+Adapt suggestions, search results or UI to what the user is doing right now:
 
 ```json
-{"op": "GetRecentContext"}
+{"op": "GetCurrentContext"}
 ```
 
-The response gives you a single human-readable line that names the
-**semantic theme** of what the user is doing right now (e.g.
-*"Working on Context Inference (across Visual Studio & Edge) ·
-Discussing Daily Standup (across Outlook & Teams) · Researching React
-Hooks"*) — the cluster theme is distilled from the actual document/tab/
-app titles by tokenizing, stripping stop-words / brand names / file
-extensions, and ranking the remaining content tokens by frequency
-weighted by their cosine similarity to the cluster centroid. The
-response also includes a structured `items[]` breakdown (which **does**
-preserve the verbatim per-app titles for programmatic consumers) and a
-confidence score. Use this to:
+`context.snapshot.summary` names the documents, tabs and apps of the current activity
+(e.g. *"User is working on the quarterly report and Q3 budget in Word and Excel"*),
+`context.snapshot.current_entities` lists the entities behind it with their `role`, and
+`thread` identifies the work thread. Use them for:
 
-- **Search ranking** -- boost results related to the user's current
-  themes, docs, tabs, or app set.
-- **Smart suggestions** -- recommend tools, files, or actions relevant
-  to the detected activity.
+- **Search ranking** -- score results with `ScoreEntities` and `"context": "current"`, or
+  boost results related to the current entities.
+- **Smart suggestions** -- recommend files or actions related to the current entities
+  (`GetRelated`).
 - **Dashboard widgets** -- show a "Currently working on" summary.
 
-For short-term memory or context drift over time, call:
+For short-term memory or context drift over time:
 
 ```json
-{"op": "GetRecentContexts", "count": 20}
+{"op": "GetRecentContexts", "count": 20, "include_vector": false}
 ```
 
-Snapshots are returned newest-first with material-change dedup, so the list
-reflects context *transitions* rather than 60-second polling artifacts.
-
-The composer uses `ibm-granite/granite-embedding-small-english-r2`
-(ModernBERT byte-level BPE, COIR-trained for code retrieval, 384-dim)
-when its files are present. Older BGE-small / MiniLM fallbacks were
-removed in v5.16; if the granite files are missing the engine still
-runs and reports `"model": "deterministic"`. The encoder drives
-**dynamic semantic clustering** *and* **theme distillation** — *not*
-mapping to a fixed taxonomy. Two activities are merged into one
-*thread of work* iff their embeddings are similar to each other
-(cosine ≥ 0.65), and within each thread the dominant content tokens
-(after stripping stop-words, file extensions, and brand/app names) are
-scored by `frequency × (1 + cosine-to-cluster-centroid)` — the top 1-2
-are emitted as the theme phrase. The verb is selected from a small
-fixed set (`Working on`, `Reviewing`, `Researching`, `Reading about`,
-`Discussing`, …) based on the dominant app type and content keywords.
-The verbatim per-app titles remain available in `items[]` for
-consumers that want them. In deterministic mode themes are extracted
-by frequency alone, and clusters that yield no usable content tokens
-fall back to the prior verbatim format `<verb> "<title>" in <app>`.
+Snapshots are returned newest first and recorded only on material change, so the list
+reflects context *transitions* rather than polling ticks. With the granite model loaded,
+`summary_embedding` (requested with `include_vector`) lets you cluster or compare
+snapshots.
 
 ---
 
 ## Client Examples
+
+All examples open the per-session pipe, switch to message mode, read every response until
+the message is complete, reuse one connection for several requests and reconnect (once per
+request) when WARP has closed it.
 
 ### C++ (Win32)
 
 ```cpp
 #include <windows.h>
 #include <cstdio>
-#include <cstring>
+#include <string>
+
+// Opens WARP's pipe for this session in message mode (INVALID_HANDLE_VALUE on failure).
+HANDLE OpenWarp()
+{
+    DWORD session = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    const std::wstring names[] = {
+        L"\\\\.\\pipe\\WarpFileActivityAPI-" + std::to_wstring(session),
+        L"\\\\.\\pipe\\WarpFileActivityAPI",                  // only needed for pre-v2 WARP builds
+    };
+    for (const std::wstring& name : names)
+    {
+        for (int attempt = 0; attempt < 5; ++attempt)
+        {
+            HANDLE h = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                   OPEN_EXISTING, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                DWORD mode = PIPE_READMODE_MESSAGE;
+                if (SetNamedPipeHandleState(h, &mode, nullptr, nullptr)) return h;
+                CloseHandle(h);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (GetLastError() != ERROR_PIPE_BUSY) break;    // ERROR_FILE_NOT_FOUND: try the next name
+            WaitNamedPipeW(name.c_str(), 1000);
+        }
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+// One request -> the complete response message, or "" when the server has closed the
+// connection. A "busy" error written before the request is still read after a failed write.
+std::string Exchange(HANDLE h, const std::string& request)
+{
+    DWORD written = 0;
+    WriteFile(h, request.data(), (DWORD)request.size(), &written, nullptr);
+    std::string response;
+    char buf[65536];
+    for (;;)
+    {
+        DWORD n = 0;
+        BOOL ok = ReadFile(h, buf, sizeof(buf), &n, nullptr);
+        response.append(buf, n);
+        if (ok) return response;                             // message complete
+        if (GetLastError() != ERROR_MORE_DATA) return {};    // ERROR_MORE_DATA: read the rest
+    }
+}
+
+// Reuses the connection and reconnects once when WARP has closed it (other clients waiting,
+// 10 s idle, 256 requests). Returns "" when WARP cannot be reached.
+std::string CallWarp(HANDLE& h, const std::string& request)
+{
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        if (h == INVALID_HANDLE_VALUE) h = OpenWarp();
+        if (h == INVALID_HANDLE_VALUE) return {};
+        std::string response = Exchange(h, request);
+        if (!response.empty()) return response;
+        CloseHandle(h);
+        h = INVALID_HANDLE_VALUE;
+    }
+    return {};
+}
 
 int main()
 {
-    HANDLE hPipe = CreateFileW(
-        L"\\\\.\\pipe\\WarpFileActivityAPI",
-        GENERIC_READ | GENERIC_WRITE,
-        0, nullptr, OPEN_EXISTING, 0, nullptr);
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        printf("WARP is not running (error %lu)\n", GetLastError());
+    HANDLE h = OpenWarp();
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        printf("WARP is not running in this session (error %lu)\n", GetLastError());
         return 1;
     }
+    ULONG serverPid = 0;
+    GetNamedPipeServerProcessId(h, &serverPid);              // should be WARP's PID (GetStatus "pid")
 
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+    printf("%s\n\n", CallWarp(h, R"({"op":"Ping"})").c_str());
+    printf("%s\n\n", CallWarp(h, R"({"op":"TopEntities","type":"file","limit":10,"horizon":"short"})").c_str());
+    printf("%s\n\n", CallWarp(h, R"({"op":"GetChanges","since":0,"limit":100})").c_str());
+    printf("%s\n", CallWarp(h, R"({"window":"15m","types":["app_launch","browsing"]})").c_str());
 
-    // Request last 15 minutes of app launches and browsing
-    const char* request = R"({"window":"15m","types":["app_launch","browsing"]})";
-    DWORD written = 0;
-    WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
-
-    char buffer[65536] = {};
-    DWORD bytesRead = 0;
-    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
-
-    printf("Response (%lu bytes):\n%s\n", bytesRead, buffer);
-
-    CloseHandle(hPipe);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     return 0;
 }
 ```
 
-**GetRecentContext example (C++):**
-
-```cpp
-#include <windows.h>
-#include <cstdio>
-#include <cstring>
-
-int main()
-{
-    HANDLE hPipe = CreateFileW(
-        L"\\\\.\\pipe\\WarpFileActivityAPI",
-        GENERIC_READ | GENERIC_WRITE,
-        0, nullptr, OPEN_EXISTING, 0, nullptr);
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        printf("WARP is not running (error %lu)\n", GetLastError());
-        return 1;
-    }
-
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
-
-    // Latest context summary snapshot
-    const char* req1 = R"({"op":"GetRecentContext"})";
-    DWORD written = 0;
-    WriteFile(hPipe, req1, (DWORD)strlen(req1), &written, nullptr);
-
-    char buffer[65536] = {};
-    DWORD bytesRead = 0;
-    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
-    printf("Current context:\n%s\n\n", buffer);
-
-    // Last 20 snapshots (newest first)
-    const char* req2 = R"({"op":"GetRecentContexts","count":20})";
-    WriteFile(hPipe, req2, (DWORD)strlen(req2), &written, nullptr);
-    bytesRead = 0;
-    memset(buffer, 0, sizeof(buffer));
-    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
-    printf("Recent context history:\n%s\n", buffer);
-
-    CloseHandle(hPipe);
-    return 0;
-}
-```
-
-**Inference query example (C++):**
-
-```cpp
-#include <windows.h>
-#include <cstdio>
-#include <cstring>
-
-int main()
-{
-    HANDLE hPipe = CreateFileW(
-        L"\\\\.\\pipe\\WarpFileActivityAPI",
-        GENERIC_READ | GENERIC_WRITE,
-        0, nullptr, OPEN_EXISTING, 0, nullptr);
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        printf("WARP is not running (error %lu)\n", GetLastError());
-        return 1;
-    }
-
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
-
-    // QueryInferences: get recency scores for two files
-    const char* request = R"({
-        "op": "QueryInferences",
-        "paths": [
-            "C:\\Users\\Alice\\Documents\\report.docx",
-            "C:\\Windows\\System32\\notepad.exe"
-        ],
-        "fields": ["recency_score", "open_count_7d", "last_open_ts"]
-    })";
-    DWORD written = 0;
-    WriteFile(hPipe, request, (DWORD)strlen(request), &written, nullptr);
-
-    char buffer[65536] = {};
-    DWORD bytesRead = 0;
-    ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr);
-
-    printf("Inference results:\n%s\n", buffer);
-
-    CloseHandle(hPipe);
-    return 0;
-}
-```
+Parse the responses with any JSON library (e.g. nlohmann/json) and check for an `error`
+member (for example `busy`: back off and retry) before using the payload.
 
 ### C# (.NET)
 
 ```csharp
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 
-using var pipe = new NamedPipeClientStream(".", "WarpFileActivityAPI",
-    PipeDirection.InOut);
-pipe.Connect(5000);
-pipe.ReadMode = PipeTransmissionMode.Message;
+using var warp = new WarpClient();
 
-// Request all event types for the last 6 hours
-byte[] request = Encoding.UTF8.GetBytes("""{"window":"6h"}""");
-pipe.Write(request, 0, request.Length);
-
-byte[] buffer = new byte[65536];
-int bytesRead = pipe.Read(buffer, 0, buffer.Length);
-string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-using var doc = JsonDocument.Parse(json);
-
-// File activities
-if (doc.RootElement.TryGetProperty("file_activities", out var fa))
+// Most engaged files of the last few days
+using (var top = warp.Call("""{"op":"TopEntities","type":"file","limit":10,"horizon":"short"}"""))
 {
-    int count = fa.GetProperty("count").GetInt32();
-    Console.WriteLine($"File events: {count}");
+    foreach (var e in top.RootElement.GetProperty("results").EnumerateArray())
+        Console.WriteLine($"{e.GetProperty("score").GetDouble():F2}  {e.GetProperty("display_name").GetString()}");
+}
+
+// Incremental sync: GetChanges until "more" is false
+long since = 0;                                       // persist between runs
+while (true)
+{
+    using var ch = warp.Call($$"""{"op":"GetChanges","since":{{since}},"limit":1000}""");
+    var root = ch.RootElement;
+    if (root.GetProperty("reset").GetBoolean()) { since = 0; continue; }   // drop the local copy, resync
+    foreach (var d in root.GetProperty("deletes").EnumerateArray())
+        Console.WriteLine($"delete {d.GetProperty("entity_key").GetString()} ({d.GetProperty("reason").GetString()})");
+    foreach (var u in root.GetProperty("upserts").EnumerateArray())
+        Console.WriteLine($"upsert {u.GetProperty("entity_key").GetString()}");
+    since = root.GetProperty("next").GetInt64();
+    if (!root.GetProperty("more").GetBoolean()) break;
+}
+
+// v1 raw events still work
+using (var raw = warp.Call("""{"window":"6h","types":["file"]}"""))
+{
+    var fa = raw.RootElement.GetProperty("file_activities");
+    Console.WriteLine($"File events: {fa.GetProperty("count").GetInt32()}, truncated: {fa.GetProperty("truncated").GetBoolean()}");
     foreach (var e in fa.GetProperty("events").EnumerateArray())
         Console.WriteLine($"  [{e.GetProperty("action").GetString()}] {e.GetProperty("path").GetString()}");
 }
 
-// App launches
-if (doc.RootElement.TryGetProperty("app_launch_activities", out var al))
+sealed class WarpClient : IDisposable
 {
-    int count = al.GetProperty("count").GetInt32();
-    Console.WriteLine($"App launches: {count}");
-    foreach (var e in al.GetProperty("events").EnumerateArray())
-        Console.WriteLine($"  {e.GetProperty("exe_name").GetString()} (PID {e.GetProperty("pid").GetInt32()})");
-}
+    NamedPipeClientStream? pipe;
 
-// Browsing activities
-if (doc.RootElement.TryGetProperty("browsing_activities", out var ba))
-{
-    int count = ba.GetProperty("count").GetInt32();
-    Console.WriteLine($"Browsing events: {count}");
-    foreach (var e in ba.GetProperty("events").EnumerateArray())
-        Console.WriteLine($"  [{e.GetProperty("browser").GetString()}] {e.GetProperty("title").GetString()}");
-}
-```
+    // One request -> one response. Reuses the connection and reconnects once when WARP has
+    // closed it (other clients waiting, 10 s idle, 256 requests). Throws on WARP errors.
+    public JsonDocument Call(string request)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                pipe ??= Connect();
+                return Exchange(pipe, request);
+            }
+            catch (IOException) when (attempt == 0)
+            {
+                pipe?.Dispose();
+                pipe = null;
+            }
+        }
+    }
 
-**Inference query example (C#):**
+    public void Dispose() => pipe?.Dispose();
 
-```csharp
-using System;
-using System.IO.Pipes;
-using System.Text;
-using System.Text.Json;
+    // \\.\pipe\WarpFileActivityAPI-<SessionId>
+    static NamedPipeClientStream Connect()
+    {
+        var name = $"WarpFileActivityAPI-{Process.GetCurrentProcess().SessionId}";
+        var p = new NamedPipeClientStream(".", name, PipeDirection.InOut);   // GENERIC_READ | GENERIC_WRITE
+        p.Connect(5000);                              // TimeoutException: WARP is not running in this session
+        p.ReadMode = PipeTransmissionMode.Message;
+        return p;
+    }
 
-// QueryInferences
-using var pipe = new NamedPipeClientStream(".", "WarpFileActivityAPI",
-    PipeDirection.InOut);
-pipe.Connect(5000);
-pipe.ReadMode = PipeTransmissionMode.Message;
-
-byte[] request = Encoding.UTF8.GetBytes("""
-{
-  "op": "QueryInferences",
-  "paths": ["C:\\Users\\Alice\\Documents\\report.docx"],
-  "fields": ["recency_score", "open_count_7d"]
-}
-""");
-pipe.Write(request, 0, request.Length);
-
-byte[] buffer = new byte[65536];
-int bytesRead = pipe.Read(buffer, 0, buffer.Length);
-string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-using var doc = JsonDocument.Parse(json);
-var results = doc.RootElement.GetProperty("results");
-foreach (var prop in results.EnumerateObject())
-{
-    Console.Write($"{prop.Name}: ");
-    if (prop.Value.TryGetProperty("recency_score", out var score))
-        Console.Write($"score={score.GetDouble():F1} ");
-    if (prop.Value.TryGetProperty("open_count_7d", out var cnt))
-        Console.Write($"opens_7d={cnt.GetInt32()}");
-    Console.WriteLine();
-}
-```
-
-**GetInferenceDeltas example (C#):**
-
-```csharp
-using var pipe2 = new NamedPipeClientStream(".", "WarpFileActivityAPI",
-    PipeDirection.InOut);
-pipe2.Connect(5000);
-pipe2.ReadMode = PipeTransmissionMode.Message;
-
-byte[] deltaReq = Encoding.UTF8.GetBytes("""
-{"op": "GetInferenceDeltas", "since_version": 0}
-""");
-pipe2.Write(deltaReq, 0, deltaReq.Length);
-
-byte[] buf2 = new byte[65536];
-int read2 = pipe2.Read(buf2, 0, buf2.Length);
-string deltaJson = Encoding.UTF8.GetString(buf2, 0, read2);
-
-using var deltaDoc = JsonDocument.Parse(deltaJson);
-foreach (var delta in deltaDoc.RootElement.GetProperty("deltas").EnumerateArray())
-{
-    Console.WriteLine($"  [{delta.GetProperty("entity_type").GetString()}] " +
-        $"{delta.GetProperty("entity_key").GetString()} " +
-        $"score={delta.GetProperty("recency_score").GetDouble():F1} " +
-        $"v{delta.GetProperty("version").GetInt32()}");
+    static JsonDocument Exchange(NamedPipeClientStream p, string request)
+    {
+        byte[] req = Encoding.UTF8.GetBytes(request);
+        p.Write(req, 0, req.Length);
+        using var ms = new MemoryStream();
+        byte[] buf = new byte[65536];
+        do
+        {
+            int n = p.Read(buf, 0, buf.Length);
+            if (n == 0) throw new IOException("WARP closed the connection");
+            ms.Write(buf, 0, n);
+        } while (!p.IsMessageComplete);
+        var doc = JsonDocument.Parse(ms.ToArray());
+        if (doc.RootElement.TryGetProperty("error", out var err))
+        {
+            string message = $"{err.GetProperty("code").GetString()}: {err.GetProperty("message").GetString()}";
+            doc.Dispose();
+            throw new InvalidOperationException(message);   // e.g. "busy: ..." -> back off and retry
+        }
+        return doc;
+    }
 }
 ```
+
+The raw string literals need C# 11 (.NET 7) or later.
 
 ### Python
 
+Standard library only (`ctypes`); the repository's `tests/python/warp_pipe.py` is a fuller
+version of the same client.
+
 ```python
+from __future__ import annotations
+
+import ctypes
+import ctypes.wintypes as wt
 import json
-import win32file
-import win32pipe
+import os
 
-PIPE_NAME = r"\\.\pipe\WarpFileActivityAPI"
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateFileW.restype = wt.HANDLE
+kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE]
+kernel32.SetNamedPipeHandleState.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD), wt.LPVOID, wt.LPVOID]
+kernel32.WriteFile.argtypes = [wt.HANDLE, wt.LPCVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
+kernel32.ReadFile.argtypes = [wt.HANDLE, wt.LPVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.ProcessIdToSessionId.argtypes = [wt.DWORD, ctypes.POINTER(wt.DWORD)]
 
-def query_warp(request_obj: dict) -> dict:
-    """Connect to WARP and return the parsed JSON response."""
-    handle = win32file.CreateFile(
-        PIPE_NAME,
-        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-        0, None,
-        win32file.OPEN_EXISTING,
-        0, None,
-    )
-    win32pipe.SetNamedPipeHandleState(
-        handle, win32pipe.PIPE_READMODE_MESSAGE, None, None
-    )
-
-    request = json.dumps(request_obj).encode("utf-8")
-    win32file.WriteFile(handle, request)
-
-    _, response_bytes = win32file.ReadFile(handle, 65536)
-    handle.Close()
-
-    return json.loads(response_bytes.decode("utf-8"))
+GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING = 0x80000000, 0x40000000, 3
+PIPE_READMODE_MESSAGE, ERROR_MORE_DATA = 0x2, 234
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
-# --- Example: Get all activity for the last 15 minutes ---
-data = query_warp({"window": "15m"})
+def session_pipe_name() -> str:
+    sid = wt.DWORD(0)
+    kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+    return r"\\.\pipe\WarpFileActivityAPI-%d" % sid.value
 
-if "file_activities" in data:
-    fa = data["file_activities"]
-    print(f"File events: {fa['count']}")
-    for e in fa["events"][:5]:
+
+class WarpClient:
+    """Reuses one connection and reconnects once per request when WARP has closed it
+    (other clients waiting, 10 s idle, 256 requests)."""
+
+    def __init__(self, name: str | None = None):
+        self.name = name or session_pipe_name()
+        self.h = None
+
+    def _open(self):
+        h = kernel32.CreateFileW(self.name, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+        if not h or h == INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())      # 2: WARP not running in this session
+        mode = wt.DWORD(PIPE_READMODE_MESSAGE)
+        if not kernel32.SetNamedPipeHandleState(h, ctypes.byref(mode), None, None):
+            err = ctypes.get_last_error()
+            kernel32.CloseHandle(h)
+            raise ctypes.WinError(err)
+        self.h = h
+
+    def _exchange(self, data: bytes) -> bytes:
+        written = wt.DWORD(0)
+        kernel32.WriteFile(self.h, data, len(data), ctypes.byref(written), None)  # a pending "busy" stays readable
+        chunks, buf = [], ctypes.create_string_buffer(65536)
+        while True:
+            got = wt.DWORD(0)
+            ok = kernel32.ReadFile(self.h, buf, len(buf), ctypes.byref(got), None)
+            chunks.append(buf.raw[:got.value])
+            if ok:
+                return b"".join(chunks)                          # message complete
+            err = ctypes.get_last_error()
+            if err != ERROR_MORE_DATA:
+                raise ctypes.WinError(err)                       # closed by the server
+
+    def call(self, request: dict) -> dict:
+        data = json.dumps(request).encode("utf-8")
+        for attempt in range(2):
+            if self.h is None:
+                self._open()
+            try:
+                raw = self._exchange(data)
+                break
+            except OSError:
+                self.close()
+                if attempt:
+                    raise
+        resp = json.loads(raw.decode("utf-8"))
+        if "error" in resp:                                      # e.g. busy: back off and retry
+            raise RuntimeError("%s: %s" % (resp["error"]["code"], resp["error"]["message"]))
+        return resp
+
+    def close(self):
+        if self.h is not None:
+            kernel32.CloseHandle(self.h)
+            self.h = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+with WarpClient() as warp:
+    print(warp.call({"op": "Ping"}))
+
+    # Most engaged files of the last few days
+    for e in warp.call({"op": "TopEntities", "type": "file", "limit": 10, "horizon": "short"})["results"]:
+        print(f"{e['score']:.2f}  {e['display_name']}  ({'; '.join(e['reasons'])})")
+
+    # Rank your own candidates, boosted by what the user is doing now
+    ranked = warp.call({"op": "ScoreEntities", "context": "current", "reasons": False,
+                        "keys": [r"C:\Users\Alice\Documents\report.docx",
+                                 "https://github.com/contoso/app/pull/12"]})
+    for r in ranked["results"]:
+        print(r["key"], r["found"], r.get("score"), r.get("context_boost"))
+
+    # Incremental sync with the change feed
+    since = 0                                                    # persist between runs
+    while True:
+        ch = warp.call({"op": "GetChanges", "since": since, "limit": 1000})
+        if ch["reset"]:
+            since = 0                                            # drop the local copy, then resync
+            continue
+        for d in ch["deletes"]:
+            pass                                                 # remove d["entity_key"] from your index
+        for u in ch["upserts"]:
+            pass                                                 # upsert u["entity_key"] into your index
+        since = ch["next"]
+        if not ch["more"]:
+            break
+
+    # v1 raw events still work
+    raw = warp.call({"window": "15m", "types": ["file", "browsing"]})
+    for e in raw.get("file_activities", {}).get("events", [])[:5]:
         print(f"  [{e['action']}] {e['path']}")
 
-if "app_launch_activities" in data:
-    al = data["app_launch_activities"]
-    print(f"\nApp launches: {al['count']}")
-    for e in al["events"][:5]:
-        print(f"  {e['exe_name']} (PID {e['pid']})")
-
-if "browsing_activities" in data:
-    ba = data["browsing_activities"]
-    print(f"\nBrowsing events: {ba['count']}")
-    for e in ba["events"][:5]:
-        url_str = f" - {e['url']}" if 'url' in e else ""
-        print(f"  [{e['browser']}] {e['title']}{url_str}")
-
-# --- Example: Only browsing activity for the last 2 hours ---
-data = query_warp({"window": "2h", "types": ["browsing"]})
-for e in data.get("browsing_activities", {}).get("events", []):
-    print(f"  [{e['browser']}] {e['title']}")
-
-# --- Example: GetRecentContext (latest context summary) ---
-context = query_warp({"op": "GetRecentContext"})
-rc = context.get("recent_context", {})
-print(f"\nCurrent context (confidence {rc.get('confidence', 0):.2f}, "
-      f"{rc.get('activity_count', 0)} activities):")
-print('  ' + ' / '.join(rc.get('summary', []) or ['(none)']))
-for item in rc.get("items", []):
-    print(f"    - {item['app']}: {item['title']}  ({item['pct']:.0f}%)")
-
-# --- Example: GetRecentContexts (last 20 snapshots, newest first) ---
-hist = query_warp({"op": "GetRecentContexts", "count": 20})
-print(f"\nLast {hist.get('returned', 0)} context snapshots:")
-for snap in hist.get("recent_contexts", []):
-    print(f"  [{snap['timestamp']}] {' / '.join(snap.get('summary', []))}")
-
-# --- Example: QueryInferences for specific files ---
-inference = query_warp({
-    "op": "QueryInferences",
-    "paths": [
-        "C:\\Users\\Alice\\Documents\\report.docx",
-        "C:\\Windows\\System32\\notepad.exe",
-    ],
-    "fields": ["recency_score", "open_count_7d", "entity_type"],
-})
-for path, info in inference.get("results", {}).items():
-    if info:  # empty dict means entity not tracked
-        print(f"{path}: score={info.get('recency_score', 0):.1f}, "
-              f"opens_7d={info.get('open_count_7d', 0)}, "
-              f"type={info.get('entity_type', '?')}")
-    else:
-        print(f"{path}: not tracked by WARP")
-
-# --- Example: GetInferenceDeltas (incremental sync) ---
-deltas = query_warp({"op": "GetInferenceDeltas", "since_version": 0})
-for d in deltas.get("deltas", []):
-    print(f"  [{d['entity_type']}] {d['entity_key']} "
-          f"score={d['recency_score']:.1f} v{d['version']}")
-# Store max version for next call:
-if deltas.get("deltas"):
-    watermark = max(d["version"] for d in deltas["deltas"])
+    # What is the user doing right now?
+    ctx = warp.call({"op": "GetCurrentContext"})["context"]
+    snap = ctx.get("snapshot") or {}
+    print(ctx["presence"], " / ".join(snap.get("summary", [])))
 ```
 
 ### PowerShell
 
 ```powershell
-function Query-Warp {
-    param(
-        [string]$Request = '{}'
-    )
+$script:WarpPipe = $null
 
-    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(
-        ".", "WarpFileActivityAPI",
-        [System.IO.Pipes.PipeDirection]::InOut)
+function Connect-Warp {
+    $session = (Get-Process -Id $PID).SessionId
+    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+        ".", "WarpFileActivityAPI-$session", [System.IO.Pipes.PipeDirection]::InOut)
+    $pipe.Connect(5000)                      # TimeoutException: WARP is not running in this session
+    $pipe.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message
+    return $pipe
+}
 
-    try {
-        $pipe.Connect(5000)
-        $pipe.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message
-
-        $requestBytes = [Text.Encoding]::UTF8.GetBytes($Request)
-        $pipe.Write($requestBytes, 0, $requestBytes.Length)
-
-        $buffer = New-Object byte[] 65536
-        $bytesRead = $pipe.Read($buffer, 0, $buffer.Length)
-        $response = [Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)
-
-        return $response | ConvertFrom-Json
+# One request -> one response. Reuses the connection and reconnects once when WARP has
+# closed it (other clients waiting, 10 s idle, 256 requests).
+function Invoke-Warp([string]$Request) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Request)
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            if (-not $script:WarpPipe) { $script:WarpPipe = Connect-Warp }
+            $script:WarpPipe.Write($bytes, 0, $bytes.Length)
+            $ms = [System.IO.MemoryStream]::new()
+            $buffer = [byte[]]::new(65536)
+            do {                             # read until the response message is complete
+                $n = $script:WarpPipe.Read($buffer, 0, $buffer.Length)
+                if ($n -eq 0) { throw [System.IO.IOException]::new("WARP closed the connection") }
+                $ms.Write($buffer, 0, $n)
+            } while (-not $script:WarpPipe.IsMessageComplete)
+            break
+        }
+        catch [System.IO.IOException] {
+            if ($script:WarpPipe) { $script:WarpPipe.Dispose(); $script:WarpPipe = $null }
+            if ($attempt -ge 1) { throw }
+        }
     }
-    finally {
-        $pipe.Close()
+    $response = [Text.Encoding]::UTF8.GetString($ms.ToArray()) | ConvertFrom-Json
+    if ($response.error) { throw "WARP error $($response.error.code): $($response.error.message)" }
+    return $response
+}
+
+try {
+    Invoke-Warp '{"op":"Ping"}' | Format-List
+
+    # Apps the user spent most time in recently
+    (Invoke-Warp '{"op":"TopEntities","type":"app","limit":10,"horizon":"short"}').results |
+        Select-Object @{ n = 'score'; e = { [math]::Round($_.score, 2) } }, active_secs_7d, display_name |
+        Format-Table -AutoSize
+
+    # Change feed
+    $since = 0                               # persist between runs
+    while ($true) {
+        $ch = Invoke-Warp ('{"op":"GetChanges","since":' + $since + ',"limit":1000}')
+        if ($ch.reset) { $since = 0; continue }   # drop the local copy, resync from 0
+        $ch.deletes | ForEach-Object { "delete $($_.entity_key) ($($_.reason))" }
+        $ch.upserts | ForEach-Object { "upsert $($_.entity_key)" }
+        $since = $ch.next
+        if (-not $ch.more) { break }
     }
+
+    # v1 raw events still work
+    (Invoke-Warp '{"window":"1h","types":["app_launch"]}').app_launch_activities.events |
+        Select-Object timestamp, exe_name, pid |
+        Format-Table -AutoSize
+
+    # What is the user doing right now?
+    $ctx = (Invoke-Warp '{"op":"GetCurrentContext"}').context
+    Write-Host "$($ctx.presence): $($ctx.snapshot.summary -join ' / ')"
 }
-
-# Get last 1 hour of all activity
-$result = Query-Warp '{"window":"1h"}'
-Write-Host "File events: $($result.file_activities.count)"
-Write-Host "App launches: $($result.app_launch_activities.count)"
-Write-Host "Browsing events: $($result.browsing_activities.count)"
-
-# Show recent app launches
-$result.app_launch_activities.events |
-    Select-Object timestamp, exe_name, pid |
-    Format-Table -AutoSize
-
-# Only browsing activity for the last 24 hours
-$browse = Query-Warp '{"window":"24h","types":["browsing"]}'
-$browse.browsing_activities.events |
-    Select-Object timestamp, browser, title |
-    Format-Table -AutoSize
-
-# GetRecentContext -- what is the user working on right now?
-$context = Query-Warp '{"op":"GetRecentContext"}'
-$rc = $context.recent_context
-Write-Host "`nCurrent context (confidence $([math]::Round($rc.confidence,2)), $($rc.activity_count) activities):"
-Write-Host "  $(($rc.summary -join ' / '))"
-foreach ($item in $rc.items) {
-    Write-Host "    - $($item.app): $($item.title)  ($([math]::Round($item.pct,0))%)"
+finally {
+    if ($script:WarpPipe) { $script:WarpPipe.Dispose() }
 }
+```
 
-# GetRecentContexts -- short-term memory of recent contexts (newest first)
-$hist = Query-Warp '{"op":"GetRecentContexts","count":20}'
-Write-Host "`nLast $($hist.returned) context snapshots:"
-foreach ($snap in $hist.recent_contexts) {
-    Write-Host "  [$($snap.timestamp)] $(($snap.summary -join ' / '))"
-}
+Control operations are reserved for WARP's own executable; from a script, use its command
+line:
 
-# QueryInferences for specific files
-$inf = Query-Warp
-$inf.results.PSObject.Properties | ForEach-Object {
-    Write-Host "$($_.Name): score=$($_.Value.recency_score), opens_7d=$($_.Value.open_count_7d)"
-}
-
-# GetInferenceDeltas (incremental sync)
-$deltas = Query-Warp '{"op":"GetInferenceDeltas","since_version":0}'
-Write-Host "Received $($deltas.deltas.Count) delta records"
-$deltas.deltas | Select-Object entity_key, entity_type, recency_score, version |
-    Format-Table -AutoSize
+```powershell
+& "$env:ProgramFiles\WARP\WARP!.exe" --status          # GetStatus
+& "$env:ProgramFiles\WARP\WARP!.exe" --pause 30        # Pause for 30 minutes
+& "$env:ProgramFiles\WARP\WARP!.exe" --resume
+& "$env:ProgramFiles\WARP\WARP!.exe" --purge-domain example.com
 ```
 
 ### Rust
 
+No crates needed: the standard library opens the pipe with `GENERIC_READ | GENERIC_WRITE`;
+two kernel32 functions are declared directly. Add `serde_json` to parse the responses.
+
 ```rust
-use std::io::{Read, Write};
-use std::fs::OpenOptions;
+use std::ffi::c_void;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::windows::io::AsRawHandle;
 
-fn query_warp(request: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(r"\\.\pipe\WarpFileActivityAPI")?;
-
-    pipe.write_all(request.as_bytes())?;
-    pipe.flush()?;
-
-    let mut buf = [0u8; 65536];
-    let n = pipe.read(&mut buf)?;
-    Ok(std::str::from_utf8(&buf[..n])?.to_string())
+#[link(name = "kernel32")]
+unsafe extern "system" {          // Rust 1.82+; drop `unsafe` on older toolchains
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
+    fn SetNamedPipeHandleState(pipe: *mut c_void, mode: *mut u32, max: *mut u32, timeout: *mut u32) -> i32;
 }
 
-fn main() {
-    match query_warp(r#"{"window":"15m","types":["app_launch"]}"#) {
-        Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("Failed to query WARP: {}", e),
+const PIPE_READMODE_MESSAGE: u32 = 0x2;
+const ERROR_MORE_DATA: i32 = 234;
+
+fn open_warp() -> io::Result<File> {
+    let mut session = 0u32;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    let name = format!(r"\\.\pipe\WarpFileActivityAPI-{}", session);
+    let pipe = OpenOptions::new().read(true).write(true).open(name)?;   // NotFound: WARP not running in this session
+    let mut mode = PIPE_READMODE_MESSAGE;
+    let ok = unsafe {
+        SetNamedPipeHandleState(pipe.as_raw_handle() as *mut c_void, &mut mode,
+                                std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    if ok == 0 { return Err(io::Error::last_os_error()); }
+    Ok(pipe)
+}
+
+// One request -> one complete response message (Err when the server has closed the connection).
+fn exchange(pipe: &mut File, request: &str) -> io::Result<String> {
+    let _ = pipe.write_all(request.as_bytes());   // if this fails, a pending "busy" error is still readable
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) if out.is_empty() => return Err(io::ErrorKind::BrokenPipe.into()),   // closed by the server
+            Ok(n) => { out.extend_from_slice(&buf[..n]); break; }
+            // ERROR_MORE_DATA: the buffer was filled completely and the message continues.
+            Err(e) if e.raw_os_error() == Some(ERROR_MORE_DATA) => out.extend_from_slice(&buf),
+            Err(e) => return Err(e),
+        }
+    }
+    String::from_utf8(out).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+// Reuses one connection and reconnects once per request when WARP has closed it
+// (other clients waiting, 10 s idle, 256 requests).
+struct Warp { pipe: Option<File> }
+
+impl Warp {
+    fn call(&mut self, request: &str) -> io::Result<String> {
+        let mut attempt = 0;
+        loop {
+            if self.pipe.is_none() { self.pipe = Some(open_warp()?); }
+            match exchange(self.pipe.as_mut().unwrap(), request) {
+                Ok(response) => return Ok(response),
+                Err(_) if attempt == 0 => { self.pipe = None; attempt += 1; }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
-```
 
-> **Note:** For proper message-mode pipe handling in Rust, consider using the
-> `windows` or `winapi` crate to call `SetNamedPipeHandleState` with
-> `PIPE_READMODE_MESSAGE`.
+fn main() -> io::Result<()> {
+    let mut warp = Warp { pipe: None };
+    println!("{}", warp.call(r#"{"op":"Ping"}"#)?);
+    println!("{}", warp.call(r#"{"op":"TopEntities","type":"url","limit":10}"#)?);
+    println!("{}", warp.call(r#"{"op":"GetChanges","since":0,"limit":100}"#)?);
+    println!("{}", warp.call(r#"{"window":"15m","types":["app_launch"]}"#)?);
+    Ok(())
+}
+```
 
 ### Node.js
 
+Node opens pipes in byte mode, so message boundaries are not visible: since the server
+keeps the connection open (keep-alive), detect the end of a response by parsing -- every
+response is a single JSON object ending with `}`. Waiting for `'end'` would stall until the
+server closes the connection. Node has no API for the session id; this example reads it
+from `tasklist`.
+
 ```javascript
 const net = require('net');
+const { execFileSync } = require('child_process');
 
-function queryWarp(request) {
-    return new Promise((resolve, reject) => {
-        const client = net.connect('\\\\.\\pipe\\WarpFileActivityAPI', () => {
-            client.write(JSON.stringify(request));
-        });
-
-        let data = '';
-        client.on('data', (chunk) => { data += chunk.toString('utf8'); });
-        client.on('end', () => {
-            try { resolve(JSON.parse(data)); }
-            catch (e) { reject(e); }
-        });
-        client.on('error', reject);
-    });
+function sessionPipeName() {
+    // tasklist CSV row: "node.exe","1234","Console","1","45,000 K" -> session id is column 4
+    const row = execFileSync('tasklist', ['/FI', `PID eq ${process.pid}`, '/FO', 'CSV', '/NH'],
+                             { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+    return `\\\\.\\pipe\\WarpFileActivityAPI-${JSON.parse(`[${row}]`)[3]}`;
 }
 
-// Example: Get last 30 minutes of all activity
-(async () => {
-    try {
-        const result = await queryWarp({ window: '30m' });
+class WarpClient {
+    constructor(name = sessionPipeName()) { this.name = name; this.socket = null; }
 
-        // File activities
-        if (result.file_activities) {
-            console.log(`File events: ${result.file_activities.count}`);
-        }
-
-        // App launches
-        if (result.app_launch_activities) {
-            console.log(`App launches: ${result.app_launch_activities.count}`);
-            for (const e of result.app_launch_activities.events.slice(0, 5)) {
-                console.log(`  ${e.exe_name} (PID ${e.pid})`);
-            }
-        }
-
-        // Browsing activity
-        if (result.browsing_activities) {
-            console.log(`Browsing events: ${result.browsing_activities.count}`);
-            for (const e of result.browsing_activities.events.slice(0, 5)) {
-                console.log(`  [${e.browser}] ${e.title}`);
-            }
-        }
-
-        // GetRecentContext -- what is the user working on right now?
-        const context = await queryWarp({ op: 'GetRecentContext' });
-        const rc = context.recent_context || {};
-        console.log(`\nCurrent context (confidence ${(rc.confidence || 0).toFixed(2)}, ${rc.activity_count || 0} activities):`);
-        console.log(`  ${(rc.summary || []).join(' / ') || '(none)'}`);
-        for (const item of (rc.items || [])) {
-            console.log(`    - ${item.app}: ${item.title}  (${item.pct.toFixed(0)}%)`);
-        }
-
-        // GetRecentContexts -- short-term memory of recent contexts (newest first)
-        const hist = await queryWarp({ op: 'GetRecentContexts', count: 20 });
-        console.log(`\nLast ${hist.returned || 0} context snapshots:`);
-        for (const snap of (hist.recent_contexts || [])) {
-            console.log(`  [${snap.timestamp}] ${(snap.summary || []).join(' / ')}`);
-        }
-
-        // QueryInferences -- get recency scores for specific files
-        const inference = await queryWarp({
-            op: 'QueryInferences',
-            paths: [
-                'C:\\Users\\Alice\\Documents\\report.docx',
-                'C:\\Windows\\System32\\notepad.exe',
-            ],
-            fields: ['recency_score', 'open_count_7d'],
+    connect() {
+        return new Promise((resolve, reject) => {
+            this.socket = net.connect(this.name, resolve);
+            this.socket.on('error', () => {});                  // between calls: the next call reconnects
+            this.socket.once('error', reject);                  // ENOENT: WARP not running in this session
         });
-        console.log('\nInference results:');
-        for (const [path, info] of Object.entries(inference.results || {})) {
-            if (Object.keys(info).length > 0) {
-                console.log(`  ${path}: score=${info.recency_score}, opens_7d=${info.open_count_7d}`);
-            } else {
-                console.log(`  ${path}: not tracked`);
-            }
+    }
+
+    // One request -> one response; send the next request only after this one resolved.
+    // Reuses the connection and reconnects once when WARP has closed it (other clients
+    // waiting, 10 s idle, 256 requests).
+    async call(request, retry = true) {
+        if (!this.socket || this.socket.destroyed) await this.connect();
+        try {
+            return await this.exchange(request);
+        } catch (err) {
+            if (err.warpError || !retry) throw err;             // WARP's own errors (e.g. busy) are final
+            this.socket.destroy();
+            this.socket = null;
+            return this.call(request, false);
+        }
+    }
+
+    exchange(request) {
+        return new Promise((resolve, reject) => {
+            const socket = this.socket, chunks = [];
+            const done = (err, value) => {
+                socket.off('data', onData).off('end', onEnd).off('error', onError);
+                err ? reject(err) : resolve(value);
+            };
+            const onData = (chunk) => {
+                chunks.push(chunk);
+                if (chunk[chunk.length - 1] !== 0x7d) return;   // last byte not '}': more to come
+                let resp;
+                try { resp = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+                catch { return; }                               // incomplete: wait for more data
+                if (resp.error) done(Object.assign(new Error(`${resp.error.code}: ${resp.error.message}`),
+                                                   { warpError: resp.error.code }));
+                else done(null, resp);
+            };
+            const onEnd = () => done(new Error('WARP closed the connection'));
+            const onError = (e) => done(e);
+            socket.on('data', onData).once('end', onEnd).once('error', onError);
+            socket.write(JSON.stringify(request));
+        });
+    }
+
+    close() { if (this.socket) this.socket.end(); }
+}
+
+(async () => {
+    const warp = new WarpClient();
+    try {
+        console.log(await warp.call({ op: 'Ping' }));
+
+        // Most visited pages of the last few days
+        const top = await warp.call({ op: 'TopEntities', type: 'url', limit: 10, horizon: 'short' });
+        for (const e of top.results) console.log(e.score.toFixed(2), e.title || e.display_name);
+
+        // Change feed
+        let since = 0;                                          // persist between runs
+        for (;;) {
+            const ch = await warp.call({ op: 'GetChanges', since, limit: 1000 });
+            if (ch.reset) { since = 0; continue; }              // drop the local copy, resync
+            console.log(`${ch.deletes.length} deletes, ${ch.upserts.length} upserts`);
+            since = ch.next;
+            if (!ch.more) break;
         }
 
-        // GetInferenceDeltas -- incremental sync
-        const deltas = await queryWarp({ op: 'GetInferenceDeltas', since_version: 0 });
-        console.log(`\nInference deltas: ${deltas.deltas.length} records`);
-        for (const d of deltas.deltas.slice(0, 5)) {
-            console.log(`  [${d.entity_type}] ${d.entity_key} score=${d.recency_score} v${d.version}`);
-        }
+        // v1 raw events still work
+        const raw = await warp.call({ window: '30m', types: ['app_launch'] });
+        for (const e of raw.app_launch_activities.events.slice(0, 5)) console.log(`${e.exe_name} (PID ${e.pid})`);
+
+        // What is the user doing right now?
+        const { context } = await warp.call({ op: 'GetCurrentContext' });
+        console.log(context.presence, (context.snapshot?.summary || []).join(' / '));
     } catch (err) {
-        console.error('WARP is not available:', err.message);
+        console.error('WARP request failed:', err.message);
+    } finally {
+        warp.close();
     }
 })();
 ```
+
+`JSON.parse` turns 64-bit integers into doubles; `paused_until` = INT64_MAX (`GetStatus`,
+`Pause`) is not exact in JavaScript -- treat any value above `Number.MAX_SAFE_INTEGER` as
+"until resumed".
 
 ---
 
 ## Best Practices
 
-### 1. Use Short Time Windows
+### 1. Use the Per-Session Pipe and Verify the Server
 
-Prefer the shortest time window that meets your needs. Querying `15m` is
-significantly faster than `30d` when the database contains millions of records.
+Compute `\\.\pipe\WarpFileActivityAPI-<SessionId>` from your own session id; use the
+legacy name only as a fallback for WARP builds before API v2. Before sending sensitive
+requests, [verify the server](#verifying-the-server) with `GetNamedPipeServerProcessId`.
 
-### 2. Request Only the Types You Need
+### 2. Read Whole Messages and Check for Errors
 
-Use the `"types"` array to limit the response to the event categories your
-application actually uses. This reduces response size and database query time.
+Loop on `ERROR_MORE_DATA` (or `IsMessageComplete`) until the response is complete --
+never assume it fits a fixed buffer. Check for an `error` member before using a response
+and branch on `error.code`, not on `message`.
 
-```json
-{"window":"1h","types":["file"]}
-```
+### 3. Reuse Connections, but Be Ready to Reconnect
 
-### 3. Filter Client-Side
+Send bursts of requests over one connection (one at a time, up to 256). Every open
+connection holds one of the 8 server workers, so WARP closes it after 10 s without a
+request and right after a response whenever other clients are waiting. When a write or
+read fails because the connection was closed, reconnect and resend (all operations except
+`Purge`, `Pause` and `Resume` are read-only). A `busy` error means the server is
+saturated: back off and retry.
 
-Within each event type, WARP returns all events in the requested window. Filter by
-`action`, `path` prefix, `exe_name`, `browser`, etc. in your client code.
+### 4. Sync Incrementally with `GetChanges` and `WaitForChanges`
 
-### 4. Track High-Water Mark with `id`
+Do not poll raw events or re-read all entities. Persist the `next` cursor of
+[`GetChanges`](#getchanges), call again while `more` is `true`, then block in
+`WaitForChanges` (honouring `retry_after_ms`). When `reset` is `true`, discard your copy
+and resync from `since: 0`. Apply `deletes` before `upserts`.
 
-For incremental processing (e.g., backup sync), remember the highest `id` from
-your last query. On the next query, discard any events with `id` <= your
-high-water mark. Each event type has its own independent `id` sequence.
+### 5. Rank with Entities, Not Raw Events
 
-### 5. Handle Pipe Unavailability Gracefully
+For "recent", "frequent" or "relevant" lists use `TopEntities`, `ScoreEntities` (with
+`"context": "current"` for task relevance) or `SearchActivity`. Their scores are computed
+at query time from decayed engagement and are comparable across files, apps and pages.
+Aggregating raw events yourself is slower, limited to the 30-day raw retention and does
+not follow renames.
 
-WARP may not be running. Always handle `CreateFile` failure and implement a
-fallback path in your application.
+### 6. Request Only What You Need
 
-### 6. One Connection Per Query
+Use `types` to limit raw and timeline queries to the event types you use, keep time
+ranges short, set `limit`, and turn off `reasons`, `include_vector` and `members` when you
+do not need them. Filter by action, path, exe or browser on the client: the API has no
+server-side filters beyond event type, time and confidence.
 
-Open a fresh pipe connection for each query. Don't try to reuse the handle for
-multiple request/response cycles -- the pipe server expects one message per
-connection.
+### 7. Page with Cursors
 
-### 7. Parse Timestamps as UTC
+When a raw query reports `truncated: true`, pass its `next_before_id` back as `before_id`
+(per type, as an object, when several types are truncated). For a fixed time range use
+`QueryTimeline` and follow `next_cursor` (restricting `types` to its keys) until it is
+`null`.
 
-The `timestamp` field is Unix epoch seconds in **UTC**. Convert to local time
-in your application if needed for display.
+### 8. Join on Entity Keys
 
-### 8. Normalize Paths for Comparison
+Use `entity_key` (and `doc_key`) to join events, entities, threads and context snapshots
+and to compare paths case-insensitively. Keys WARP returns can be passed back as they are
+to `QueryInferences`, `ScoreEntities`, `GetRelated` and `Purge`; original paths, URLs and
+AUMIDs work too (see [Entity Keys and Normalization](#entity-keys-and-normalization)).
 
-Paths are returned with native Windows casing. When comparing paths from
-different queries or with your own file lists, use case-insensitive comparison.
+### 9. Treat Timestamps as UTC Seconds and Numbers as 64-bit
 
-### 9. Use Inference for Ranking, Not Raw Events
+All timestamps are Unix seconds in UTC; convert to local time only for display. Ids,
+sequence numbers and `paused_until` are 64-bit integers; in JavaScript only values up to
+2^53 are exact (in practice this affects `paused_until` = INT64_MAX).
 
-If you need to rank or sort entities by relevance (e.g., "most recently used
-files"), prefer `QueryInferences` over scanning raw events. The inference engine
-precomputes recency scores and access counts incrementally, making lookups
-instant regardless of how many raw events exist.
+### 10. Poll Context at Its Cadence
 
-### 10. Use `GetInferenceDeltas` for Incremental Sync
+The context is recomposed at most every `ContextCadenceSeconds` (default 60 s): polling
+`GetCurrentContext` or `GetRecentContext` faster returns the same snapshot. A
+`confidence` above ~0.7 indicates a clear focus pattern; lower values suggest the user is
+switching between many apps. Use `GetRecentContexts` to see how the context evolved.
 
-Rather than re-querying all inference data on every poll, track the highest
-`version` you have seen and pass it as `since_version`. This minimizes data
-transfer and parsing overhead.
+### 11. Handle Unavailability Gracefully
 
-```json
-{"op": "GetInferenceDeltas", "since_version": 1042}
-```
-
-### 10. Use `GetRecentContext` for Contextual Awareness
-
-Poll `GetRecentContext` periodically to adapt your application to what the user
-is currently working on. The summarizer runs every 60 seconds, so polling more
-frequently than that will return the same result.
-
-```json
-{"op": "GetRecentContext"}
-```
-
-The `confidence` field (0.0 – 0.99) indicates how strongly the snapshot
-represents recent activity — values above ~0.7 mean a clear focus pattern, while
-lower values suggest the user is context-switching across many apps. The
-`dominant_focus_pct` field tells you how concentrated the user is on the top app.
-
-For short-term memory of *how* context evolved (newest first), use:
-
-```json
-{"op": "GetRecentContexts", "count": 20}
-```
-
-The returned snapshots are de-duplicated on append (material-change + 5-minute
-heartbeat), so each entry represents an actual context transition rather than a
-60-second polling tick.
+WARP may not run in the user's session, capture may be paused (`GetStatus.paused`), and
+policy may restrict your client (`unauthorized`, `forbidden`). Degrade gracefully instead
+of failing.
 
 ---
 
@@ -1602,114 +2536,133 @@ heartbeat), so each entry represents an actual context transition rather than a
 
 | Problem | Cause | Solution |
 |---|---|---|
-| `CreateFile` returns `INVALID_HANDLE_VALUE` with error 2 | WARP is not running | Start WARP. It requires Administrator privileges. |
-| `CreateFile` returns `INVALID_HANDLE_VALUE` with error 231 | All pipe instances are busy | Retry after a short delay (100-500 ms). |
-| Response is empty or all counts are 0 | No activity in the requested time range, or WARP was recently started | Try a wider time window. WARP only records events while it's running. |
-| `OPEN` events are missing | WARP's ETW trace may have failed to start | Ensure WARP is running with Administrator privileges. |
-| App launch events missing for a known app | The app may be in the system process blocklist | Only interactive user-session processes not in the blocklist are captured. |
-| Browsing events missing | The browser may not be in the foreground, or is not a recognized browser | Events are only captured while a supported browser window is the foreground window. |
-| Duplicate file events for the same file | Normal -- a single user action can trigger multiple kernel events | Deduplicate by path + action within a short time window in your client. |
-| `ReadFile` returns partial data | Response exceeded the 64 KB pipe buffer | Use a shorter time window or fewer event types to reduce result size. |
+| `CreateFile` fails with error 2 (`ERROR_FILE_NOT_FOUND`) | WARP is not running in **this** session, or the pipe name uses the wrong session id | Start WARP; build the name from `ProcessIdToSessionId` of your own process. Services in session 0 have no WARP. |
+| Error 231 (`ERROR_PIPE_BUSY`) | All instances are momentarily in use | `WaitNamedPipeW`, then retry. |
+| Error 5 (`ERROR_ACCESS_DENIED`) | The client runs as another user, at low integrity or in an AppContainer (sandboxed / packaged app), or connects remotely | Run as the interactive user at medium integrity. For AppContainer or low-integrity clients an administrator must set the policy `ApiAllowAppContainerClients` = 1 and restart WARP. |
+| `wrong_session` | The legacy pipe name was used from another Windows session | Connect to the per-session name given in the error message. |
+| `unauthorized` | The policy `ApiAllowedClients` is set and does not list your exe | Ask the administrator to add your exe file name. |
+| `forbidden` on activity operations | `ApiRestrictActivityScope` = 1 and your exe is not in `ApiActivityClients` | Ask for your exe to be added, or use `Ping`, `GetStatus`, `QueryInferences`, `ScoreEntities` and `WaitForChanges`, which need no scope. |
+| `forbidden` on `Purge` / `Pause` / `Resume` | Control operations are reserved for WARP's own executable | Use WARP's tray or command line (`WARP!.exe --pause`, `--resume`, `--purge-hours`, `--purge-domain`, `--purge-path`). |
+| `unavailable` for every operation except `Ping` / `GetStatus` (`Ping` reports `store_open: false`) | WARP's activity store did not open | Check `GetStatus` (`store.open`, `store.integrity`) and `%LOCALAPPDATA%\WARP\logs\warp.log`, then restart WARP. |
+| `unavailable` for context or history operations | Context inference or the history engine is not running | Check `GetStatus`; retry shortly after WARP starts. |
+| `busy` | Server saturated: 8 busy workers and 64 queued connections | Back off (e.g. 100 ms, doubling) and retry on a new connection. |
+| A write or read fails with error 232, 233 or 109 after earlier requests succeeded | WARP closed the kept-alive connection: other clients were waiting, more than 10 s idle, or 256 requests on the connection | Reconnect and resend the request. |
+| Connection closed before the first response | The first request was not sent within 5 s | Send the request right after connecting. |
+| `ReadFile` fails with error 234 (`ERROR_MORE_DATA`) | Normal: the response is larger than your buffer | Keep reading until `ReadFile` succeeds. |
+| A byte-mode client (e.g. Node.js) stalls on a request | It waits for the connection to end instead of the end of the JSON message | Detect the end of the response by parsing (see [Node.js](#nodejs)). |
+| `truncated: true` | More events than `limit` | Pass `next_before_id` back as `before_id`, raise `limit`, or page a fixed range with `QueryTimeline` cursors. |
+| `reset: true` from `GetChanges` / `GetInferenceDeltas` | Your cursor predates a clear-all or pruned deletes | Drop the local copy and resync from 0. |
+| `WaitForChanges` returns at once with `retry_after_ms` | 4 long-polls are already pending | Wait `retry_after_ms`, then poll again. |
+| Events are missing | The capture source is disabled or not running, capture is paused, or the app, title, domain or folder is excluded | Check `GetStatus` (`capture`, `paused`); the effective settings, including exclusions, are shown by `WARP!.exe --status`. Private browsing windows are never recorded. |
+| Empty context `summary` | No usable activity in the window, or the first compose has not finished | Wait for the next cadence (default 60 s). |
+| Several file events for one save | A single user action can produce events from several sources (`source`) | Group by `entity_key` + `action` within a short time window, or rank with entities instead. |
 
 ---
 
 ## Limitations
 
-1. **Local only** -- The named pipe is not accessible from remote machines.
-2. **No server-side filtering by path or action** -- You cannot filter by action
-   type, path, exe_name, or browser in the request. All matching events for the
-   requested types are returned; filter in your client.
-3. **No streaming / subscription** -- The API is request/response only. There is no
-   push notification or event stream. Poll periodically if you need near-real-time
-   updates.
-4. **30-day maximum** -- Events older than 30 days are automatically evicted.
-5. **No authentication** -- Any local process can connect to the pipe. The data
-   may contain sensitive information (file paths, browsing titles, URLs).
-6. **64 KB response limit** -- Very large result sets may be truncated. Use shorter
-   time windows or specific event types for busy systems.
-7. **1-second timestamp granularity** -- Events within the same second have the
-   same `timestamp` value. Use `id` for precise ordering within a type.
-8. **Excluded paths** -- File activity in system directories (Windows, Program Files,
-   AppData, ProgramData, etc.), hidden dot-folders, and common build/cache
-   artifacts is excluded by design.
-9. **App launch detection latency** -- The process table is polled every 2 seconds,
-   so very short-lived processes may be missed.
-10. **Browsing detection** -- Only works when the browser is the foreground window.
-    Background tab changes are not captured. URL extraction depends on the browser
-    showing it in the title bar.
+1. **Local, per user, per session** -- only processes of the interactive user (plus
+   SYSTEM and elevated administrators) on the same machine can connect, and every Windows
+   session has its own WARP instance and data.
+2. **No server-side filtering by path, action, app or browser** -- requests filter by
+   event type, time and confidence only; filter on the client, or rank with entities.
+3. **No push notifications** -- `WaitForChanges` long-polls for at most 25 s, with at most
+   4 concurrent long-polls server-wide.
+4. **Retention** -- raw events are kept for 30 days and entities / history for 395 days by
+   default; deletes stay in the change feed for 90 days.
+5. **Response size** -- the transport does not cap responses, but row limits do (up to
+   50000 events per type for raw queries and 20000 per type and page for
+   `QueryTimeline`); large responses cost memory and time on both sides.
+6. **Sliding raw window** -- the v1 raw query's window is relative to the time of each call,
+   so `before_id` pages of a long listing see a slightly later window; page a fixed range
+   with `QueryTimeline`.
+7. **1-second timestamp granularity** -- events within the same second share a
+   `timestamp`; order by `id` within a type.
+8. **Coarse scopes** -- the activity scope is all-or-nothing. `GetStatus` reserves paths,
+   log messages, capture error texts, media / microphone / camera flags and settings for
+   WARP itself; its health summary goes to every client that may connect.
+9. **Heuristic context** -- summaries, roles and work threads are inferred from window
+   titles and usage patterns and can be wrong.
+10. **Capture coverage** -- browsing is captured from supported browsers through UI
+    Automation; private windows and excluded apps, titles, domains and folders are not
+    recorded; temporary, lock and partial-download files never become entities.
 
 ---
 
 ## Schema Reference
 
-For advanced users who want to query the SQLite database directly (e.g., for
-complex joins or aggregations), here are the schemas:
+The API is the supported interface; the database schema may change between versions. For
+read-only analysis, the database (`%LOCALAPPDATA%\WARP\activity.db`,
+`PRAGMA user_version` = 2) contains the tables below. Every activity table also carries
+the event-context columns `source_pid`, `source_exe`, `foreground_pid`, `foreground_exe`,
+`ms_since_input`, `parent_pid`, `parent_exe`, `created_window_ms` and `confidence`
+(REAL, default 1.0).
 
-```sql
--- File/folder activity
-CREATE TABLE file_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    action    TEXT    NOT NULL,        -- CREATE | OPEN | MODIFY | DELETE | RENAME
-    path      TEXT    NOT NULL,        -- Full path (UTF-8)
-    old_path  TEXT                     -- Previous path (RENAME only; NULL otherwise)
-);
+| Table | Purpose | Columns |
+|---|---|---|
+| `file_activity` | File events | `id`, `timestamp`, `action`, `path`, `old_path`, `entity_key`, `event_ms`, `source`, `presence`, `is_dir`, `origin_url` |
+| `app_launch_activity` | Process starts | `id`, `timestamp`, `exe_name`, `exe_path`, `pid`, `entity_key`, `event_ms`, `source`, `creator_pid`, `creator_exe`, `aumid`, `session_id`, `exit_ts`, `lifetime_secs` |
+| `browsing_activity` | Pages shown | `id`, `timestamp`, `browser`, `title`, `url`, `entity_key`, `event_ms`, `source`, `host`, `doc_id`, `doc_kind`, `dwell_secs`, `presence`, `window_id` |
+| `app_focus_activity` | Foreground sessions | `id`, `timestamp` (session end), `exe_name`, `exe_path`, `window_title`, `duration_secs`, `entity_key`, `event_ms`, `source`, `start_ts`, `end_ts`, `active_secs`, `idle_secs`, `doc_key`, `doc_display`, `doc_type`, `window_class`, `desktop_id`, `aumid`, `presence` |
+| `inference` | One row per entity | `entity_key` (primary key), `entity_type`, `display_name`, `title`, `doc_kind`, `file_id`, `last_event_ts`, `last_open_ts`, `last_edit_ts`, `last_active_ts`, `open_count_total`, `edit_count_total`, `active_secs_total`, `distinct_days`, `last_day`, `eng_s`, `eng_s_ts`, `eng_s_key`, `eng_l`, `eng_l_ts`, `eng_l_key`, `change_seq`, `deleted`, `updated_at`, and the v1 columns `open_count_7d`, `open_count_30d`, `recency_score`, `version` |
+| `entity_day` | Daily rollups per entity and local day | `entity_key`, `day`, `opens`, `edits`, `active_secs`, `sessions` |
+| `tombstone` | Deletes in the change feed | `change_seq` (primary key), `entity_key`, `entity_type`, `ts`, `reason` |
+| `meta` | Key / value state | `key`, `value` (e.g. `reset_seq`, `change_seq_hw`, `tombstone_floor_seq`, `purged_ranges`, `fts_available`, `schema_v2_migrated_at`) |
+| `presence_interval` | Presence history | `id`, `start_ts`, `end_ts`, `state` |
+| `context_snapshot` | Persisted context snapshots | `id`, `ts`, `window_secs`, `json`, `thread_id`, `embedding`, `model` |
+| `edge` | Entity co-occurrence | `a`, `b`, `weight`, `last_ts` |
+| `work_session` | Work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs` |
+| `work_thread` | Work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid`, `change_seq` |
+| `thread_member` | Members of a thread | `thread_id`, `entity_key`, `weight`, `last_ts` |
+| `thread_span` | Activity periods of a thread | `thread_id`, `start_ts`, `end_ts`, `active_secs` |
+| `clipboard_activity` | Clipboard metadata (never content; off by default) | `id`, `timestamp`, `event_ms`, `owner_exe`, `formats` |
+| `print_activity` | Print jobs | `id`, `timestamp`, `event_ms`, `document`, `printer`, `pages` |
+| `activity_fts` | Optional FTS5 index of entity names and titles (`rowid` = `inference.rowid`) | `kind`, `ref`, `ts`, `text` |
 
-CREATE INDEX idx_activity_ts     ON file_activity(timestamp);
-CREATE INDEX idx_activity_action ON file_activity(action, timestamp);
+- In `inference`, `version` equals `change_seq`; `open_count_7d` and `open_count_30d` are
+  no longer maintained and `recency_score` is a snapshot taken at write time -- the API
+  computes all three at query time from `entity_day`. `eng_s` / `eng_l` are the decayed
+  accumulators at `eng_s_ts` / `eng_l_ts` (see [How Scores Work](#how-scores-work)) and
+  `eng_*_key` their time-independent ranking keys. Tombstoned entities are removed.
+- `entity_day.day` is the local day index (days since 1970-01-01 in local time).
 
--- Application launches
-CREATE TABLE app_launch_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    exe_name  TEXT    NOT NULL,        -- Executable filename
-    exe_path  TEXT    NOT NULL,        -- Full path to executable
-    pid       INTEGER NOT NULL        -- Process ID at launch time
-);
+**Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`, `secure_delete=ON`.
 
-CREATE INDEX idx_app_ts ON app_launch_activity(timestamp);
-
--- Browsing activity
-CREATE TABLE browsing_activity (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,       -- Unix epoch seconds (UTC)
-    browser   TEXT    NOT NULL,        -- Browser identifier
-    title     TEXT    NOT NULL,        -- Page title (suffix stripped)
-    url       TEXT                     -- URL if extractable; NULL otherwise
-);
-
-CREATE INDEX idx_browse_ts ON browsing_activity(timestamp);
-
--- Inference table (precomputed per-entity analytics)
-CREATE TABLE inference (
-    entity_key        TEXT PRIMARY KEY,   -- lowercase file path / exe path / URL
-    entity_type       TEXT,               -- 'file', 'app', or 'url'
-    last_event_ts     INTEGER,            -- last event of any kind
-    last_open_ts      INTEGER,            -- last OPEN / launch / visit
-    last_edit_ts      INTEGER,            -- last MODIFY/CREATE (files only)
-    open_count_7d     INTEGER,            -- rolling 7-day open count
-    open_count_30d    INTEGER,            -- rolling 30-day open count
-    open_count_total  INTEGER,            -- lifetime open count
-    recency_score     REAL,               -- 0-255 composite score
-    version           INTEGER,            -- monotonic per-entity version
-    updated_at        INTEGER             -- last inference update timestamp
-);
-
-CREATE INDEX idx_inference_updated_at ON inference(updated_at);
-CREATE INDEX idx_inference_version    ON inference(version);
-```
-
-**Database location:** `%LOCALAPPDATA%\WARP\activity.db`
-**Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`
-
-> **Warning:** The database is actively written to by WARP. If you open it
-> directly, use `PRAGMA query_only=ON` or open in read-only mode to avoid
-> interfering with WARP's WAL writer. The named-pipe API is the recommended
-> access method.
+> **Warning:** The database is actively written to by WARP. If you open it directly,
+> open it read-only (or with `PRAGMA query_only=ON`) to avoid interfering with WARP's
+> writer. The named-pipe API is the recommended access method.
 
 ---
 
-*This documentation describes WARP API version 5.17.*
+*This documentation describes API version 2 (`"api_version": 2`), served by WARP 6.0. The
+change notes below for v5.17 and earlier refer to the context summarizer and the v1 API
+of those releases.*
+
+*Changes for API v2 (WARP 6.0, `ApiServer` replaces `QueryApi`):*
+- ***Transport and security.*** Per-session pipe `\\.\pipe\WarpFileActivityAPI-<SessionId>`;
+  the legacy name is served to same-session clients only (others get `wrong_session`).
+  Explicit pipe DACL with a medium integrity label, remote clients rejected, caller
+  identification with the `ApiAllowedClients`, `ApiRestrictActivityScope` /
+  `ApiActivityClients` and `ApiAllowAppContainerClients` policies; control operations are
+  reserved for WARP itself.
+- ***Protocol.*** `api_version` on every response; structured errors instead of silent
+  fallbacks (malformed JSON, unknown ops and unknown windows no longer return raw events);
+  requests up to 1 MiB; responses of any size (clients must loop on `ERROR_MORE_DATA`);
+  keep-alive connections that the server closes after a response when other clients wait
+  (clients reconnect); bounded worker pool and queue (`busy` when full) and deadlines.
+  `Ping` (with `store_open`) and `GetStatus` answer even when the store is not open.
+- ***New operations.*** `ScoreEntities`, `TopEntities`, `SearchActivity`, `GetChanges`,
+  `WaitForChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetCurrentContext`,
+  `Ping`, `GetStatus`, `Purge`, `Pause` and `Resume`.
+- ***v1 operations.*** Same request and response shapes, plus: raw queries gain
+  `app_focus`, `limit`, `min_confidence`, `truncated` / `next_before_id` with `before_id`
+  paging, and per-event `confidence`, `source` and `entity_key`; `QueryInferences` accepts
+  `keys` and the fields `entity_key`, `score`, `last_active_ts` and `active_secs_7d`;
+  `GetInferenceDeltas` takes `limit` and returns `deleted`, `next_version`,
+  `current_version`, `more` and `reset`; the inference `version` is now the global
+  `change_seq`. Context snapshots gain `thread_id`, `presence`, `current_entities[]` and
+  `items[].entity_key`; `GetRecentContexts` also returns persisted history
+  (`from_persisted`), and `include_vector` (default `true`) controls `summary_embedding`.
 
 *Changes from v5.16:*
 - ***Canonical summary is now a rich deterministic listing, not the
@@ -2392,5 +3345,5 @@ CREATE INDEX idx_inference_version    ON inference(version);
 - *The `"types"` request field was introduced. Requests without `"types"` return
   all event types (backward compatible).*
 
-*New fields may be added to response objects in future versions, but existing
-fields will not be removed or change meaning.*
+*New fields may be added to response objects in future versions; ignore members you do not
+know. Existing fields keep their meaning within an `api_version`.*

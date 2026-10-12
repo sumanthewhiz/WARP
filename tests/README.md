@@ -27,6 +27,22 @@ python -m pip install -r tests/requirements.txt
 python tests/run_tests.py --layer l1
 ```
 
+C++ unit tests (storage, API, canonicalizers, capture rules — gap analysis ENG-1):
+
+```powershell
+msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64
+build\tests\x64\Release\WarpTests.exe                 # all tests
+build\tests\x64\Release\WarpTests.exe /filter Store.  # one suite
+build\tests\x64\Release\WarpTests.exe /list           # list tests
+```
+
+Live API integration test (ENG-3; needs a running WARP in this session):
+
+```powershell
+$env:WARP_LIVE_API = "1"
+python -m pytest tests/python/test_live_api.py -m live -v
+```
+
 You can also drive `pytest` directly:
 
 ```bash
@@ -40,8 +56,8 @@ python -m pytest -c pytest.ini eval/
 
 | TEST_PLAN.md section | Status | Notes |
 |---|---|---|
-| §2.4 InferenceEngine math | ✅ via `python/property/test_inference_engine_props.py` | Hypothesis-fuzzed against a Python port pinned to C++ via `test_recency_constants_sync.py`. |
-| §2.8 Property-based tests | ✅ partial | InferenceEngine math + grounding gate covered; JSON shape + pipeline state machine still stubbed. |
+| §2.4 Engagement / ranking math (EntityStore) | ✅ via `python/property/test_inference_engine_props.py` + `WarpTests.Store.cpp` | Decay accumulators, bounded boost and legacy recency score fuzzed against a Python port pinned to C++ by `test_recency_constants_sync.py`; ranking, read-time decay and percentiles exercised on a real store in C++. |
+| §2.8 Property-based tests | ✅ partial | Engagement math + grounding gate covered; JSON shape + pipeline state machine still stubbed. |
 | §3.3.5 Hallucination guard | ✅ via `python/test_hallucination_guard.py` | 15 example cases + Hypothesis fuzz. |
 | §3.3.4 Near-copy gate | ✅ via `python/test_near_copy.py` | 9 cases including all known regressions. |
 | §3.3.1 Post-processing sanitizer | ✅ via `python/adversarial/test_prompt_markers.py` | All `<think>` / `<\|im_*\|>` variants covered. |
@@ -51,8 +67,10 @@ python -m pytest -c pytest.ini eval/
 | §4.2.2 Programmatic token metrics | ✅ via `eval/metrics.py` | must_contain recall, must_not_contain hits, token recall. |
 | §4.2.1a Granite cosine | ⏳ TODO | Needs `tests/eval/run_eval.py` that loads the granite ONNX. Deferred to P4 of phased rollout. |
 | §4.1 Eval corpus | ✅ seed (5 scenarios) | `eval/corpus.jsonl` + `eval/test_corpus_integrity.py` validate schema + reference satisfies its own assertions. Expand to 50+ in P5. |
-| §2.1 Capture layer | ⏳ TODO | Needs `IRawSource` injection seam refactor (§2.1.0 + §6 Q6). Deferred to P3. |
-| §2.3 ActivityDatabase | ⏳ TODO | Needs a C++ test framework (doctest/gtest). Deferred to P1. |
+| §2.1 Capture layer | ✅ partial | Pure capture rules in C++ (`WarpTests.Canon.cpp`: transient/download names, anchored exclusions, rename decisions, title grammars, URL canonicalization and document ids); end-to-end capture against a live headless WARP in CI (`python/test_live_api.py`). ⏳ ETW replay fixtures (`.etl` recorded with WPR) still to be recorded. |
+| §2.3 Storage (ActivityStore / EntityStore / HistoryEngine) | ✅ via `WarpTests.Store.cpp` | Safe-save, rename/folder-rename migration, delete tombstones, change feed paging + reset, scoped and time-range purge (other same-day items untouched; threads, sessions and labels scrubbed; late records refused), FTS search, v1 → v2 migration, work threads/sessions, and a writer/reader concurrency stress test (BUG-1). |
+| Consumer API (ApiServer) | ✅ via `WarpTests.Api.cpp` + `python/test_live_api.py` | Structured errors, escaped/Unicode keys, scopes, ranking/search/feed/purge/timeline cursors, long-poll; live: per-session pipe, standard-user (medium IL) client, server PID check. |
+| JSON protocol (WarpJson) | ✅ via `WarpTests.Json.cpp` | Strict parsing, exact int64, surrogates, invalid UTF-8, depth limits, writer never emits invalid JSON (BUG-7). |
 | §3.1 Tokenizer bit-exactness | ⏳ TODO | Existing `scripts/modernbert_tokenizer_ref.py` is a starting point; needs pytest wrapper. |
 | §4.6 Chaos / fault injection | ⏳ TODO | Needs fault-injection harness. Deferred to P4.5. |
 | §4.7 Local scorecard anomaly detection | ⏳ TODO | Needs ≥ 30 scorecards in `eval/results/` first. |
@@ -63,18 +81,29 @@ python -m pytest -c pytest.ini eval/
 
 ```
 tests/
-  pytest.ini                   # pytest config + markers
+  pytest.ini                   # pytest config + markers (l1, l1_property, l2, l3, live)
   requirements.txt             # pytest, hypothesis
   run_tests.py                 # cross-platform driver
   run_tests.ps1                # Windows wrapper
 
+  WarpTests.vcxproj            # C++ unit tests (not in WARP!.sln; built by CI)
+  WarpTests.h                  # minimal TEST/CHECK/REQUIRE harness + temp dirs
+  WarpTests.Main.cpp           # runner (/filter, /timeout watchdog, /list)
+  WarpTests.Stubs.cpp          # ContextInference link stubs (no ONNX Runtime)
+  WarpTests.Json.cpp           # WarpJson parser / writer
+  WarpTests.Canon.cpp          # UrlCanon, EntityKey (+ SQL), DocResolver, FileCapture path rules
+  WarpTests.Store.cpp          # ActivityStore + EntityStore + HistoryEngine on a real SQLite file
+  WarpTests.Api.cpp            # ApiServer::Handle against a real store
+
   python/                      # all pytest-driven tests
     _warp_guards.py            # pure-Python ports of C++ guards (shared)
     conftest.py                # fixtures (repo_root, cpp_source, etc.)
+    warp_pipe.py               # ctypes named-pipe client (also a CLI)
+    test_live_api.py           # live API integration (marker: live; CI only)
     test_hallucination_guard.py
     test_near_copy.py
     test_discourse_stops_sync.py     # pins C++ DISCOURSE_STOPS ↔ Python set
-    test_recency_constants_sync.py   # pins TAU_SECONDS / MAX_SCORE / SCORE_CAP
+    test_recency_constants_sync.py   # pins EntityStore / StoreUtil constants
 
     property/                  # Hypothesis-based fuzz tests
       test_inference_engine_props.py
@@ -101,22 +130,23 @@ tests/
 
 ## Drift-prevention design
 
-The Python tests exist for tractability — running a full C++ test
-harness against the InferenceEngine math + LlmSummarizer guards
-would need doctest/gtest infrastructure we don't yet have. The
-risk that Python ports diverge from C++ over time is real, and is
-mitigated by **two source-of-truth pinning tests**:
+The Python tests exist for tractability — fuzzing the engagement math
+and the LlmSummarizer guards is far cheaper in Python. The risk that
+Python ports diverge from C++ over time is real, and is mitigated by
+**two source-of-truth pinning tests**:
 
 * `test_discourse_stops_sync.py` parses `LlmSummarizer.cpp`,
   extracts the literal `DiscourseStops()` set, and asserts it
   equals the Python `DISCOURSE_STOPS`. Any edit on either side
   forces an explicit re-sync.
-* `test_recency_constants_sync.py` parses `InferenceEngine.cpp`
-  for `TAU_SECONDS` / `MAX_SCORE` / `SCORE_CAP` and asserts the
-  Python module mirrors them exactly.
+* `test_recency_constants_sync.py` parses `EntityStore.cpp`
+  (`TAU_SECONDS` / `MAX_SCORE` / `SCORE_CAP` of the legacy recency
+  score) and `ActivityStore.h` (engagement time constants and
+  weights) and asserts the Python module mirrors them exactly.
 
 These sync tests are the contract that lets the property-based
-tests in `property/` remain meaningful as the codebase evolves.
+tests in `property/` remain meaningful as the codebase evolves. The
+C++ unit tests then check the same behaviour on the real code.
 
 ## Writing new tests
 
@@ -134,10 +164,16 @@ tests in `property/` remain meaningful as the codebase evolves.
 
 ## CI integration
 
-The `tests` job in `.github/workflows/build.yml` runs the L1 + L1
-property + L2 layers on every push. The L3 eval (which requires the
-granite ONNX session and a full WARP build) runs in a separate
-follow-up job once the granite-cosine eval driver lands (P4).
+`.github/workflows/build.yml`:
+
+* The `tests` job runs the Python L1 + L1 property + L2 + L3 layers on
+  every push (no models, no build).
+* The `build` job builds and runs `tests\WarpTests.vcxproj` (x64, with
+  a 15-minute watchdog so a deadlock fails instead of hanging), then
+  starts the freshly built `WARP!.exe --headless --data-dir <temp>`,
+  runs `python/test_live_api.py` against its pipe (including as a
+  filtered medium-integrity client), calls `WARP!.exe --status`, stops
+  it through its shutdown event and prints its log.
 
 Everything is local-only — no cloud LLM, no API key, no telemetry.
 See [`TEST_PLAN.md §4.0`](../TEST_PLAN.md) for the privacy boundary.

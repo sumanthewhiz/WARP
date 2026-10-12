@@ -1,6 +1,6 @@
 # Testing Non-Deterministic Software — One-Page Strategy
 
-*Case study: **WARP**, an on-device Windows activity-reasoning platform running two ONNX models (granite embeddings + Qwen3-0.6B "brain") fully offline. Same input never quite produces the same output.*
+*Case study: **WARP**, an on-device Windows activity-reasoning platform running ONNX models fully offline (granite embeddings, plus an optional Qwen3-0.6B refiner that is off by default). Same input never quite produces the same output.*
 
 ---
 

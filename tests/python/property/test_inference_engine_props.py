@@ -1,9 +1,10 @@
 """
-Property-based tests for the recency-score formula and
-ApplyInferenceBoost weighting.  These exercise the §2.8.1 / §2.8.2
-invariants from TEST_PLAN.md against the Python ports of the C++
-logic; the `test_recency_constants_sync.py` test guarantees the
-ports stay in lockstep with the C++ source.
+Property-based tests for the engagement model and the ApplyInferenceBoost
+weighting.  These exercise the §2.8.1 / §2.8.2 invariants from
+TEST_PLAN.md (plus the v6 decayed-engagement invariants for RANK-1 /
+RANK-2 / INTEL-4) against the Python ports of the C++ logic; the
+`test_recency_constants_sync.py` test keeps the ports in lockstep with
+the C++ source.
 """
 
 import math
@@ -14,10 +15,17 @@ from hypothesis import given, settings, strategies as st
 from _warp_guards import (
     MAX_SCORE,
     SCORE_CAP,
+    TAU_LONG_SECONDS,
     TAU_SECONDS,
+    TAU_SHORT_SECONDS,
     apply_inference_boost,
+    blended_prior,
     compute_boost,
     compute_recency_score,
+    decay_add,
+    decay_at,
+    decay_key,
+    percentile,
 )
 
 
@@ -107,42 +115,46 @@ def test_recency_score_known_values():
 
 
 # =====================================================================
-# §2.8.2 — ApplyInferenceBoost invariants
+# §2.8.2 — ApplyInferenceBoost invariants (bounded tie-breaker, INTEL-4)
 # =====================================================================
 
 @settings(max_examples=200, deadline=None)
-@given(
-    recency=st.floats(min_value=0.0, max_value=SCORE_CAP, allow_nan=False),
-    count=st.floats(min_value=0.0, max_value=10_000.0, allow_nan=False),
-)
-def test_boost_lower_bound(recency, count):
-    """Boost is always >= 1.0 (multiplicative, never *reduces* weight)."""
-    b = compute_boost(recency, count)
-    assert b >= 1.0
+@given(score=st.floats(min_value=-10.0, max_value=10.0, allow_nan=False))
+def test_boost_bounds(score):
+    """History can never more than 1.5x what happened in the window."""
+    b = compute_boost(score)
+    assert 1.0 <= b <= 1.5
+
+
+def test_boost_baseline_is_one():
+    """Unknown / never-engaged entity -> boost = 1.0."""
+    assert compute_boost(0.0) == 1.0
 
 
 @settings(max_examples=200, deadline=None)
 @given(
-    recency=st.floats(min_value=0.0, max_value=SCORE_CAP, allow_nan=False),
-    count=st.floats(min_value=0.0, max_value=10_000.0, allow_nan=False),
+    a=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+    b=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
 )
-def test_boost_upper_bound(recency, count):
-    """Boost saturates well below 10x for any plausible store state.
-    Documented range: 1.0x -> ~5.3x for production-realistic inputs."""
-    b = compute_boost(recency, count)
-    # The largest possible boost happens at recency=SCORE_CAP (255),
-    # count=10000.  Compute the exact upper bound to pin it.
-    max_boost = 1.0 + math.log1p(SCORE_CAP / 50.0) + math.log1p(10_000.0 / 5.0)
-    assert b <= max_boost + 1e-9, f"boost {b} > expected max {max_boost}"
-    # Realistic-bound sanity: even at SCORE_CAP recency + 10 events/week
-    # in count, boost stays under 6x.
-    realistic = compute_boost(SCORE_CAP, 10.0)
-    assert realistic < 6.0
+def test_boost_monotonic_in_score(a, b):
+    lo, hi = min(a, b), max(a, b)
+    assert compute_boost(hi) >= compute_boost(lo)
 
 
-def test_boost_baseline_is_one():
-    """Engine-unknown entity (recency=0, count=0) -> boost = 1.0."""
-    assert compute_boost(0.0, 0.0) == 1.0
+@settings(max_examples=200, deadline=None)
+@given(
+    focus_now=st.integers(min_value=1, max_value=3600),
+    score_now=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+    score_habit=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+)
+def test_boost_cannot_override_current_task(focus_now, score_now, score_habit):
+    """INTEL-4: an entry with >= 1.5x the in-window focus always ranks first,
+    however habitual the other one is."""
+    focus_habit = focus_now
+    focus_task = int(math.ceil(focus_now * 1.5)) + 1
+    task = focus_task * compute_boost(score_now)
+    habit = focus_habit * compute_boost(score_habit)
+    assert task > habit
 
 
 @settings(max_examples=100, deadline=None)
@@ -170,50 +182,109 @@ def test_apply_boost_null_engine_is_noop(raw_focus):
     ),
 )
 def test_apply_boost_unknown_entities_unchanged(raw_focus):
-    """Entries unknown to the engine keep weighted == raw."""
+    """Entries unknown to the store keep weighted == raw."""
     bag = [{"totalFocusSecs": x, "exePath": f"app{i}.exe"}
            for i, x in enumerate(raw_focus)]
     apply_inference_boost(
         bag,
-        lookup=lambda k: None,  # engine knows nobody
+        lookup=lambda k: None,
         key_of=lambda e: e["exePath"],
     )
     for entry in bag:
         assert entry["weightedFocusSecs"] == float(entry["totalFocusSecs"])
 
 
-@settings(max_examples=100, deadline=None)
-@given(
-    raw=st.integers(min_value=0, max_value=3600),
-)
-def test_apply_boost_no_invention(raw):
-    """totalFocusSecs == 0 → weightedFocusSecs == 0 even with a
-    fully-warm InferenceEngine record."""
-    bag = [{"totalFocusSecs": raw, "exePath": "x.exe"}]
-    if raw == 0:
-        apply_inference_boost(
-            bag,
-            lookup=lambda k: {"entityKey": "x.exe",
-                              "recencyScore": SCORE_CAP,
-                              "openCount7d": 100.0},
-            key_of=lambda e: e["exePath"],
-        )
-        assert bag[0]["weightedFocusSecs"] == 0.0
+def test_apply_boost_no_invention():
+    """totalFocusSecs == 0 -> weightedFocusSecs == 0 even for a top entity."""
+    bag = [{"totalFocusSecs": 0, "exePath": "x.exe"}]
+    apply_inference_boost(bag, lookup=lambda k: {"found": True, "score": 1.0},
+                          key_of=lambda e: e["exePath"])
+    assert bag[0]["weightedFocusSecs"] == 0.0
 
 
 @settings(max_examples=100, deadline=None)
-@given(
-    raw=st.integers(min_value=1, max_value=3600),
-)
+@given(raw=st.integers(min_value=1, max_value=3600))
 def test_apply_boost_preserves_raw_field(raw):
     """totalFocusSecs is never mutated; only weightedFocusSecs is written."""
     bag = [{"totalFocusSecs": raw, "exePath": "x.exe"}]
-    apply_inference_boost(
-        bag,
-        lookup=lambda k: {"entityKey": "x.exe",
-                          "recencyScore": 150.0,
-                          "openCount7d": 8.0},
-        key_of=lambda e: e["exePath"],
-    )
-    assert bag[0]["totalFocusSecs"] == raw  # unchanged
-    assert bag[0]["weightedFocusSecs"] > raw  # boosted
+    apply_inference_boost(bag, lookup=lambda k: {"found": True, "score": 0.8},
+                          key_of=lambda e: e["exePath"])
+    assert bag[0]["totalFocusSecs"] == raw
+    assert raw < bag[0]["weightedFocusSecs"] <= raw * 1.5
+
+
+# =====================================================================
+# Decayed engagement accumulators (RANK-1 / RANK-2)
+# =====================================================================
+
+_events = st.lists(
+    st.tuples(st.integers(min_value=1_600_000_000, max_value=1_700_000_000),
+              st.floats(min_value=0.01, max_value=10.0, allow_nan=False)),
+    min_size=1, max_size=25,
+)
+
+
+def _accumulate(events, tau):
+    s, t0 = 0.0, 0
+    for t, w in events:
+        s, t0 = decay_add(s, t0, w, t, tau)
+    return s, t0
+
+
+@settings(max_examples=200, deadline=None)
+@given(events=_events, tau=st.sampled_from([TAU_SHORT_SECONDS, TAU_LONG_SECONDS]))
+def test_decay_is_order_independent(events, tau):
+    """Late / backfilled events (USN downtime backfill) give the same value as in-order ones."""
+    now = 1_700_000_100
+    s1, t1 = _accumulate(sorted(events), tau)
+    s2, t2 = _accumulate(list(reversed(sorted(events))), tau)
+    v1, v2 = decay_at(s1, t1, now, tau), decay_at(s2, t2, now, tau)
+    assert math.isclose(v1, v2, rel_tol=1e-9, abs_tol=1e-12)
+    exact = sum(w * math.exp(-(now - t) / tau) for t, w in events)
+    assert math.isclose(v1, exact, rel_tol=1e-9, abs_tol=1e-12)
+
+
+@settings(max_examples=200, deadline=None)
+@given(a=_events, b=_events, tau=st.sampled_from([TAU_SHORT_SECONDS, TAU_LONG_SECONDS]),
+       later=st.integers(min_value=0, max_value=400 * 86400))
+def test_decay_key_orders_like_value_at_any_time(a, b, tau, later):
+    """RANK-1: ranking by the stored key equals ranking by the decayed value at ANY query time."""
+    sa, ta = _accumulate(sorted(a), tau)
+    sb, tb = _accumulate(sorted(b), tau)
+    now = max(ta, tb) + later
+    va, vb = decay_at(sa, ta, now, tau), decay_at(sb, tb, now, tau)
+    ka, kb = decay_key(sa, ta, tau), decay_key(sb, tb, tau)
+    if abs(ka - kb) > 1e-9 and va > 0 and vb > 0 and abs(math.log(va) - math.log(vb)) > 1e-9:
+        assert (ka > kb) == (va > vb)
+
+
+@settings(max_examples=200, deadline=None)
+@given(s=st.floats(min_value=0.001, max_value=1e6, allow_nan=False),
+       t0=st.integers(min_value=1_600_000_000, max_value=1_700_000_000),
+       d1=st.integers(min_value=0, max_value=200 * 86400),
+       d2=st.integers(min_value=0, max_value=200 * 86400))
+def test_decay_is_monotonically_non_increasing(s, t0, d1, d2):
+    lo, hi = min(d1, d2), max(d1, d2)
+    assert decay_at(s, t0, t0 + hi, TAU_SHORT_SECONDS) <= decay_at(s, t0, t0 + lo, TAU_SHORT_SECONDS) + 1e-12
+
+
+def test_short_horizon_forgets_faster_than_long():
+    s, t0 = decay_add(0.0, 0, 10.0, 1_000_000, TAU_SHORT_SECONDS)
+    ls, lt0 = decay_add(0.0, 0, 10.0, 1_000_000, TAU_LONG_SECONDS)
+    week_later = 1_000_000 + 7 * 86400
+    assert decay_at(s, t0, week_later, TAU_SHORT_SECONDS) < decay_at(ls, lt0, week_later, TAU_LONG_SECONDS)
+
+
+@settings(max_examples=200, deadline=None)
+@given(priors=st.lists(st.floats(min_value=0.0, max_value=100.0, allow_nan=False), min_size=1, max_size=50),
+       x=st.floats(min_value=0.0, max_value=100.0, allow_nan=False))
+def test_percentile_bounded_and_monotonic(priors, x):
+    sp = sorted(priors)
+    p = percentile(sp, x)
+    assert 0.0 <= p <= 1.0
+    assert percentile(sp, x + 1.0) >= p
+
+
+def test_blended_prior_weights():
+    assert math.isclose(blended_prior(1.0, 0.0), 0.7)
+    assert math.isclose(blended_prior(0.0, 1.0), 0.3 * TAU_SHORT_SECONDS / TAU_LONG_SECONDS)

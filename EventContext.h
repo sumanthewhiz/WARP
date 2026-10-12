@@ -14,21 +14,20 @@
 //   * The exe path of that PID (resolved once via QueryFullProcessImageName).
 //   * The PID currently in the foreground at event time, plus its exe path.
 //   * Milliseconds since the last user input (GetLastInputInfo).
-//   * Optional parent-PID/exe (filled by AppLaunchMonitor when source is a
-//     process-start event; left zero otherwise).
+//   * Optional parent-PID/exe (filled by LaunchCapture for process-start
+//     events; left zero otherwise).
 //   * `confidence` -- a [0,1] float indicating how likely this event is
-//     user-initiated. Producers populate it from per-PID-path scoring, ETW
-//     IRP class, foreground correlation, and rate-limit state. Consumers
-//     (InferenceEngine) weight roll-up counters by this value rather than
-//     treating every row as a unit count.
+//     user-initiated. Producers start from CaptureContext() and multiply in
+//     ScoreEvent() (source class, action, foreground match, input recency,
+//     wake boundary). Consumers (EntityStore engagement, ContextInference)
+//     weight evidence by this value rather than treating every row as a unit.
 //   * `createdWindowMs` -- elapsed ms between a process-start event and the
-//     first top-level window we observed for that PID. Populated by
-//     AppLaunchMonitor's window-correlation hook; 0 means "no window yet".
+//     first user-facing top-level window observed for that PID. Populated by
+//     LaunchCapture's window correlation; 0 means "no window yet".
 //
-// Producers (FileMonitor, AppLaunchMonitor, BrowsingMonitor, ForegroundMonitor)
-// populate the struct via CaptureContext() and pass it to the user callback.
-// All fields default to "unknown / neutral" so that callers that have not been
-// updated yet still produce valid records.
+// Producers (FileCapture, LaunchCapture, WebCapture, FocusTracker) populate the
+// struct via CaptureContext() and attach it to the record they hand to the store.
+// All fields default to "unknown / neutral".
 // -----------------------------------------------------------------------------
 
 #include <windows.h>
@@ -51,33 +50,71 @@ struct EventContext
 namespace EventContextUtil
 {
     // Resolve a PID's full image path. Returns empty wstring on failure.
-    // Cached internally with a bounded LRU so repeated calls are cheap.
+    // Cached internally with a bounded LRU so repeated calls are cheap. Failed
+    // lookups are cached only briefly (exited / protected processes, FILE-9).
     std::wstring GetExePathByPid(DWORD pid);
 
-    // Drop a cached entry (call from AppLaunchMonitor on ProcessStop so we
+    // Drop a cached entry (LaunchCapture calls this on process stop so we
     // don't return stale paths after a PID is recycled).
     void ForgetPid(DWORD pid);
 
-    // Look up the process that created `pid`. Returns 0 on failure. Uses
-    // NtQueryInformationProcess(ProcessBasicInformation) under the hood and
-    // is O(1) -- prefer this over Toolhelp32 snapshots.
+    // Look up the process that created `pid`. Returns 0 on failure. Uses the
+    // process table first, then NtQueryInformationProcess(ProcessBasicInformation).
     DWORD GetParentPid(DWORD pid);
 
     // Build an EventContext for a freshly-observed event whose source PID is
     // `sourcePid`. If `sourcePid == 0` or unresolvable, the source* fields are
-    // left empty. Always populates foreground* and msSinceInput.
+    // left empty. Always populates foreground* and msSinceInput. `confidence` starts
+    // at 1.0 and is multiplied by 0.2 inside a wake boundary; producers then call
+    // ScoreEvent() which MULTIPLIES into it (SIG-4: never assign).
     EventContext CaptureContext(DWORD sourcePid);
 
-    // Record the current foreground HWND/PID. The ForegroundChangeBroker
-    // (added in a later commit) will call this on every WinEvent foreground
-    // change so CaptureContext() doesn't have to call GetForegroundWindow()
-    // itself (which is allowed only from the calling thread's desktop).
+    // Record the current foreground HWND/PID (called by ForegroundChangeBroker).
     void NotifyForegroundChanged(HWND hwnd, DWORD pid);
 
-    // IdleDetector calls this on resume from sleep / long-idle wake. All
-    // events captured before `untilTickMs` will have their confidence
-    // multiplied by 0.2 to absorb the burst of system-housekeeping
-    // activity that fires in the seconds after wake (SuperFetch,
-    // Defender, indexer, sync clients, etc).
+    // PresenceMonitor calls this on resume from sleep. All events captured
+    // before `untilTickMs` (GetTickCount64 units) get their confidence multiplied
+    // by 0.2 to absorb the burst of system housekeeping after wake.
     void SetWakeBoundary(ULONGLONG untilTickMs);
+
+    // Milliseconds since the last keyboard/mouse input (0xFFFFFFFF if unknown).
+    DWORD MsSinceInput();
+
+    // ---- Process table (FILE-9, SIG-6, RUN-3) ------------------------------
+    // Maintained from Kernel-Process start/stop events (LaunchCapture) so that
+    // attribution survives process exit and PID reuse is detected via the start key.
+    struct ProcessInfo
+    {
+        DWORD        pid = 0;
+        DWORD        parentPid = 0;
+        DWORD        sessionId = 0xFFFFFFFFu;
+        ULONGLONG    startKey = 0;        // ETW process start key / creation time
+        int64_t      startMs = 0;         // UTC ms
+        int64_t      exitMs = 0;          // 0 while running
+        std::wstring imagePath;           // DOS path
+    };
+    void RegisterProcess(const ProcessInfo& info);
+    void MarkProcessExited(DWORD pid, int64_t exitMs);
+    bool LookupProcess(DWORD pid, ProcessInfo& out);
+
+    // The Windows session WARP runs in; events from other sessions belong to other
+    // users / desktops and must be dropped (RUN-3, SIG-5).
+    DWORD OwnSessionId();
+    bool  IsOwnSession(DWORD sessionId);
+    bool  IsOwnSessionPid(DWORD pid);        // resolves the PID's session (table, then ProcessIdToSessionId)
+
+    // ---- Confidence model (SIG-3) -------------------------------------------
+    enum class EventKind   { FileOpen, FileEdit, FileCreate, FileDelete, FileRename, Download, AppLaunch, Browse, Focus };
+    enum class SourceClass { Etw, Usn, Rdcw, Shell, Recent, Mru, Uia, Focus };
+    struct ScoreHints
+    {
+        bool sourceIsSystem = false;      // SystemProcessClassifier verdict for the source process
+        bool sourceIsSyncClient = false;  // OneDrive / Dropbox / Google Drive / Box ... ("external change")
+        bool sourceIsShellInfra = false;  // Explorer thumbnailing / indexer / preview handlers / AV
+        bool userVisibleWindow = false;   // AppLaunch: a visible top-level window appeared for the process
+    };
+    // Returns ctx.confidence * score, where score reflects: source class, foreground
+    // match (source app == foreground app), input recency, attribution, process role
+    // and event kind. Result clamped to [0.02, 1].
+    double ScoreEvent(const EventContext& ctx, EventKind kind, SourceClass source, const ScoreHints& hints = ScoreHints());
 }

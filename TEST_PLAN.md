@@ -1,9 +1,33 @@
 # WARP Test Plan
 
-> **Status:** *Draft v0.1 — for review.* This document lays out the structure,
-> coverage targets, and tooling for a comprehensive test suite for WARP.
-> No tests are implemented yet. Once reviewed and refined, it will be
-> executed phase-by-phase (see [§9 Phased rollout](#9-phased-rollout)).
+> **Status:** *v0.2 — partially implemented.* This document lays out the structure,
+> coverage targets, and tooling for a comprehensive test suite for WARP. It was
+> drafted against the v5.x architecture; see **Status update — v6.0.0** below for
+> what changed and what is implemented (see [`tests/README.md`](tests/README.md)
+> for the live inventory).
+
+### Status update — v6.0.0 (architecture rewrite)
+
+v6.0.0 replaced several modules this plan was written against. Read the sections
+below with this mapping in mind:
+
+| v5.x module named in this plan | v6.0.0 replacement | Tests today |
+|---|---|---|
+| `FileMonitor` | `FileCapture` (+ `UsnJournalReader`, `RecentItemsWatcher`, `OfficeMruReader`, `ZoneIdentifier`, `OneDriveMapper`) | Path rules / rename decisions in `tests/WarpTests.Canon.cpp`; live capture in `tests/python/test_live_api.py` (CI) |
+| `AppLaunchMonitor` + `LaunchCorrelator` | `LaunchCapture` (Kernel-Process ETW, window correlation) | Live timeline check in `test_live_api.py` |
+| `ForegroundMonitor` + `IdleDetector` | `FocusTracker` + `PresenceMonitor` (presence never pauses capture) | — (needs ETW/WinEvent replay seams) |
+| `BrowsingMonitor` + `UrlExtractor` | `WebCapture` + `AddressBarReader` + `UrlCanonicalizer` | URL canonicalization / document ids in `WarpTests.Canon.cpp` |
+| `ActivityDatabase` | `ActivityStore` (single writer, schema v2) | `tests/WarpTests.Store.cpp` |
+| `InferenceEngine` | `EntityStore` (decayed engagement, read-time scores, change feed) + `HistoryEngine` | `WarpTests.Store.cpp`, Python property tests |
+| `QueryApi` | `ApiServer` (API v2) | `tests/WarpTests.Api.cpp`, `test_live_api.py` |
+
+Obsolete mechanisms referenced below no longer exist: the per-PID token bucket,
+the fixed 1.0 / 0.3 launch-correlation confidences, monitor pause on idle, and
+`InferenceEngine::RefreshRollingCounts` (rolling counts are derived at read time from
+daily rollups). The C++ framework decision (§8 Q1) was a dependency-free harness
+(`tests/WarpTests.h`) built by an MSBuild project (`tests/WarpTests.vcxproj`)
+instead of doctest + CMake; the remaining open item from §2.1 is ETW/WinEvent
+replay fixtures for the capture modules.
 
 ---
 
@@ -60,7 +84,7 @@ The three layers run on different cadences:
 
 | Layer | Location | Language | Run cmd |
 |---|---|---|---|
-| L1 | `tests/cpp/` | C++14 (catch2 or gtest, picked in §8) | `ctest -L l1` |
+| L1 | `tests/WarpTests.*` (MSBuild `tests/WarpTests.vcxproj`) | C++17, dependency-free harness | `build\tests\x64\Release\WarpTests.exe` |
 | L1 (script-side) | `tests/python/` | Python 3.10+ | `pytest tests/python -m l1` |
 | L2 | `tests/cpp/contract/` + `tests/python/contract/` | mixed | `ctest -L l2` + `pytest -m l2` |
 | L3 | `tests/eval/` | Python + JSON corpus | `python tests/eval/run_eval.py` |

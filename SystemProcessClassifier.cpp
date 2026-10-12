@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "SystemProcessClassifier.h"
+#include "EventContext.h"
 
 #include <wintrust.h>
 #include <Softpub.h>
@@ -51,7 +52,7 @@ namespace WARP
                 L"wmiprvse.exe", L"wmiapsrv.exe", L"dwm.exe",
                 L"audiodg.exe", L"fontdrvhost.exe", L"conhost.exe",
                 L"sihost.exe", L"ctfmon.exe", L"settingsynchost.exe",
-                L"runtimebroker.exe", L"backgroundtaskhost.exe",
+                L"backgroundtaskhost.exe",
                 L"applicationframehost.exe", L"textinputhost.exe",
                 // Windows Defender real-time engine -- famously high-volume
                 L"msmpeng.exe", L"mpcmdrun.exe", L"nissrv.exe",
@@ -59,7 +60,8 @@ namespace WARP
                 L"smartscreen.exe", L"sgrmbroker.exe",
                 // Windows Update / Servicing
                 L"trustedinstaller.exe", L"tiworker.exe", L"musnotifybroker.exe",
-                L"usoclient.exe", L"usocoreworker.exe", L"wuauclt.exe",
+                L"usoclient.exe", L"usocoreworker.exe", L"mousocoreworker.exe", L"wuauclt.exe",
+                L"sihclient.exe",
                 // Telemetry / compat
                 L"compattelrunner.exe", L"devicecensus.exe", L"diagtrack.exe",
                 // Search indexer
@@ -86,6 +88,7 @@ namespace WARP
                 L"\\windows\\temp\\",
                 L"\\windows\\softwaredistribution\\",
                 L"\\windows\\windowsupdate\\",
+                L"\\windows\\explorer.exe",
                 L"\\programdata\\microsoft\\windows defender\\",
             };
             for (const auto* d : kDirs)
@@ -243,34 +246,19 @@ namespace WARP
         }
 
         // -------------------------------------------------------------------
-        // Per-PID signals
+        // Per-PID signals (SIG-6): parent from the process table (O(1), no
+        // snapshot), cached per (pid, start key) so a recycled PID is
+        // re-evaluated.
         // -------------------------------------------------------------------
         bool IsParentSystem(DWORD pid)
         {
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (snap == INVALID_HANDLE_VALUE) return false;
+            DWORD parentPid = EventContextUtil::GetParentPid(pid);
+            if (parentPid == 4) return true;                 // created by the kernel
+            if (parentPid == 0) return false;                // unknown / already exited: no evidence either way
 
-            DWORD parentPid = 0;
-            PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
-            if (Process32FirstW(snap, &pe))
-            {
-                do {
-                    if (pe.th32ProcessID == pid) { parentPid = pe.th32ParentProcessID; break; }
-                } while (Process32NextW(snap, &pe));
-            }
-
-            if (parentPid == 0 || parentPid == 4) { CloseHandle(snap); return true; }
-
-            std::wstring parentExe;
-            pe = {}; pe.dwSize = sizeof(pe);
-            if (Process32FirstW(snap, &pe))
-            {
-                do {
-                    if (pe.th32ProcessID == parentPid) { parentExe = pe.szExeFile; break; }
-                } while (Process32NextW(snap, &pe));
-            }
-            CloseHandle(snap);
-
+            std::wstring parentExe = EventContextUtil::GetExePathByPid(parentPid);
+            size_t bs = parentExe.find_last_of(L"\\/");
+            if (bs != std::wstring::npos) parentExe = parentExe.substr(bs + 1);
             std::transform(parentExe.begin(), parentExe.end(), parentExe.begin(), ::towlower);
             return parentExe == L"services.exe" ||
                    parentExe == L"svchost.exe"  ||
@@ -279,6 +267,17 @@ namespace WARP
                    parentExe == L"csrss.exe"    ||
                    parentExe == L"winlogon.exe";
         }
+
+        struct PidSignals
+        {
+            ULONGLONG startKey = 0;
+            ULONGLONG atTick = 0;
+            bool parentSystem = false;
+            bool sessionZero = false;
+            bool highIntegrity = false;
+        };
+        std::mutex g_pidMtx;
+        std::unordered_map<DWORD, PidSignals> g_pidSignals;
 
         bool IsSessionZero(DWORD pid)
         {
@@ -353,14 +352,39 @@ namespace WARP
 
         if (pid != 0 && pid != 4)
         {
-            if (IsParentSystem(pid))   { r.signals |= SIG_PARENT_IS_SYSTEM; r.voteCount++; }
-            if (IsSessionZero(pid))    { r.signals |= SIG_SESSION_ZERO;     r.voteCount++; }
-            if (IsHighIntegrity(pid))  { r.signals |= SIG_INTEGRITY_HIGH;   r.voteCount++; }
+            EventContextUtil::ProcessInfo pi;
+            ULONGLONG startKey = EventContextUtil::LookupProcess(pid, pi) ? pi.startKey : 0;
+            PidSignals ps;
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lk(g_pidMtx);
+                auto it = g_pidSignals.find(pid);
+                if (it != g_pidSignals.end() && it->second.startKey == startKey && GetTickCount64() - it->second.atTick < 600000)
+                {
+                    ps = it->second;
+                    cached = true;
+                }
+            }
+            if (!cached)
+            {
+                ps.startKey = startKey;
+                ps.atTick = GetTickCount64();
+                ps.parentSystem = IsParentSystem(pid);
+                ps.sessionZero = IsSessionZero(pid);
+                ps.highIntegrity = IsHighIntegrity(pid);
+                std::lock_guard<std::mutex> lk(g_pidMtx);
+                if (g_pidSignals.size() > 8192) g_pidSignals.clear();
+                g_pidSignals[pid] = ps;
+            }
+            if (ps.parentSystem) { r.signals |= SIG_PARENT_IS_SYSTEM; r.voteCount++; }
+            if (ps.sessionZero)  { r.signals |= SIG_SESSION_ZERO;     r.voteCount++; }
+            // Elevation alone is not evidence of a system process (an elevated terminal is
+            // user work); it only counts together with a system parent (installers, services).
+            if (ps.highIntegrity && ps.parentSystem) { r.signals |= SIG_INTEGRITY_HIGH; r.voteCount++; }
         }
 
-        // SIG_NO_USER_WINDOW is set externally by the LaunchCorrelator on timeout
-        // and OR-ed into a subsequent classification. We don't compute it here
-        // because we don't have the correlation deadline at this point.
+        // SIG_NO_USER_WINDOW: the window evidence is applied when the launch is finalized
+        // (EventContextUtil::ScoreEvent with ScoreHints::userVisibleWindow), not here.
 
         r.isSystem   = (r.voteCount >= kSystemThreshold);
         r.confidence = static_cast<double>(r.voteCount) / kMaxVotes;

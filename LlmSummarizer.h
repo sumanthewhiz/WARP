@@ -5,6 +5,7 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <cstdint>
 
 // =====================================================================
 //  LlmSummarizer
@@ -73,9 +74,12 @@
 //
 //  Cost
 //  ====
-//  ~250 MB on disk (Q4 quantization).  Per-snapshot CPU cost
-//  ~500 ms - 2 s for 50 generated tokens, with a hard 3 s timeout.
-//  The 60-sec refresh interval has plenty of headroom.
+//  Several hundred MB resident while loaded; ~1-5 s of CPU per call
+//  (hard 5 s generation timeout).  Off by default (Settings
+//  LlmEnabled); when enabled it runs only for the combined summary,
+//  on material change, on AC power and while the user is present,
+//  is loaded lazily and unloaded after 10 idle minutes (PERF-1).
+//  The CI build caps its intra-op threads in genai_config.json.
 // =====================================================================
 
 // Activity items the polisher needs in order to ground its output.
@@ -95,18 +99,21 @@ public:
     LlmSummarizer();
     ~LlmSummarizer();
 
-    // Load the model from `<modelsDir>/qwen/`.  Returns true on
-    // success; false (with side-effect cleanup) when files are
-    // missing or initialization fails.  Safe to call once at
-    // startup; calling again rebuilds the session.  Pass an empty
-    // string to skip initialization entirely.
+    // Checks `<modelsDir>/qwen/` and the (delay-loaded) ORT-GenAI runtime and remembers the
+    // directory. The model itself is loaded lazily by the first Polish() and released again by
+    // UnloadIfIdle() (PERF-1), so an enabled-but-unused refiner costs no memory. Returns false
+    // when files or the runtime are missing. Pass an empty string to skip initialization.
     bool Init(const std::wstring& modelsDir = L"");
 
     // Tear down the underlying session.  Safe to call multiple
     // times.  Destructor calls this automatically.
     void Stop();
 
-    bool IsLoaded() const { return m_ready.load(); }
+    bool IsAvailable() const { return m_available.load(); }   // Init succeeded; Polish() may run
+    bool IsLoaded() const { return m_ready.load(); }           // model currently resident
+
+    // Releases the model when Polish() has not run for `idleMs` (no-op while generating).
+    void UnloadIfIdle(unsigned long idleMs);
 
     // Name reported in the JSON snapshot, e.g.
     // "qwen3-0.6b" or "(not loaded)".
@@ -140,7 +147,14 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 
-    std::atomic<bool>     m_ready{ false };
-    mutable std::mutex    m_genMutex;   // serialize Polish() calls
-    std::string           m_modelName;
+    bool LoadLocked() const;      // requires m_genMutex; backs off after a failed load
+    void UnloadLocked() const;    // requires m_genMutex
+
+    std::atomic<bool>             m_available{ false };
+    mutable std::atomic<bool>     m_ready{ false };
+    mutable std::atomic<uint64_t> m_lastUseTick{ 0 };
+    mutable std::mutex            m_genMutex;   // serialize Polish() / load / unload
+    mutable uint64_t              m_loadRetryTick = 0;   // requires m_genMutex: no load attempt before this tick
+    mutable unsigned              m_loadFailures = 0;    // requires m_genMutex: consecutive failed loads
+    std::string                   m_modelName;
 };

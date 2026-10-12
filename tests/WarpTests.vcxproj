@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WarpTests: C++ unit tests for WARP's storage, API, canonicalization and capture rules
+  (gap analysis ENG-1). Not part of WARP!.sln on purpose; build and run it with
+      msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64
+      build\tests\x64\Release\WarpTests.exe   (options: /filter Store. /timeout 600 /list)
+  The product sources are compiled directly (no ONNX Runtime: WarpTests.Stubs.cpp stands in
+  for the ContextInference members ApiServer references).
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6e3f2b71-94c8-4d0b-b1a5-2f7c90d84e16}</ProjectGuid>
+    <RootNamespace>WarpTests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\build\tests\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\build\tests\obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <PreprocessorDefinitions>WARP_UNIT_TESTS;SQLITE_ENABLE_FTS5;SQLITE_ENABLE_MATH_FUNCTIONS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="WarpTests.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- tests -->
+    <ClCompile Include="WarpTests.Main.cpp" />
+    <ClCompile Include="WarpTests.Stubs.cpp" />
+    <ClCompile Include="WarpTests.Json.cpp" />
+    <ClCompile Include="WarpTests.Canon.cpp" />
+    <ClCompile Include="WarpTests.Store.cpp" />
+    <ClCompile Include="WarpTests.Api.cpp" />
+    <!-- product code under test -->
+    <ClCompile Include="..\ActivityStore.cpp" />
+    <ClCompile Include="..\ApiServer.cpp" />
+    <ClCompile Include="..\DocResolver.cpp" />
+    <ClCompile Include="..\EntityKey.cpp" />
+    <ClCompile Include="..\EntityStore.cpp" />
+    <ClCompile Include="..\EventContext.cpp" />
+    <ClCompile Include="..\FileCapture.cpp" />
+    <ClCompile Include="..\HistoryEngine.cpp" />
+    <ClCompile Include="..\Json.cpp" />
+    <ClCompile Include="..\Logger.cpp" />
+    <ClCompile Include="..\OfficeMruReader.cpp" />
+    <ClCompile Include="..\OneDriveMapper.cpp" />
+    <ClCompile Include="..\RecentItemsWatcher.cpp" />
+    <ClCompile Include="..\Settings.cpp" />
+    <ClCompile Include="..\SystemProcessClassifier.cpp" />
+    <ClCompile Include="..\UrlCanonicalizer.cpp" />
+    <ClCompile Include="..\UsnJournalReader.cpp" />
+    <ClCompile Include="..\ZoneIdentifier.cpp" />
+    <ClCompile Include="..\sqlite3.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

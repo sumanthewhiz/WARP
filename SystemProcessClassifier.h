@@ -61,8 +61,10 @@ namespace WARP
         //
         // Cached by lowercase(exePath). The cache holds the static signals
         // (path, signature, name); per-PID signals (parent, session,
-        // integrity, no-window) are evaluated every call because they
-        // depend on the process instance.
+        // integrity) are cached per (pid, process start key) for 10 minutes,
+        // so a recycled PID is always re-evaluated. Elevation counts only
+        // together with a system parent; window evidence is applied by the
+        // caller through EventContextUtil::ScoreEvent.
         ClassificationResult Classify(const std::wstring& exePath, DWORD pid);
 
         // Cheap pre-filter: returns true for hard-coded definite system

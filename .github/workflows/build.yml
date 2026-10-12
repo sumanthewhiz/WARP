@@ -10,10 +10,18 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Code signing runs only when a certificate is configured (ENG-5); unsigned otherwise.
+      HAS_SIGNING_CERT: ${{ secrets.WARP_SIGN_CERT_PFX_B64 != '' }}
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
     - name: Determine branch label
       id: branch
@@ -50,70 +58,25 @@ jobs:
         # `nuget restore` (1.23.0).
         nuget install Microsoft.ML.OnnxRuntime -Version 1.22.0 -OutputDirectory ../packages -DependencyVersion Ignore
 
-    - name: Download sentence-encoder model (granite-embedding-small-english-r2)
+    - name: Download and verify model inputs (pinned, SEC-2)
       shell: pwsh
       run: |
-        # ibm-granite/granite-embedding-small-english-r2 (ModernBERT,
-        # byte-level BPE, 384-dim, COIR code-retrieval trained, Apache
-        # 2.0).  We pull the INT8-quantized ONNX from the community
-        # `onnx-community/granite-embedding-small-english-r2-ONNX`
-        # mirror (~52 MB weights + ~600 KB wrapper) plus the original
-        # HF tokenizer.json from the upstream repo so we can deterministically
-        # extract the flat tokenizer artefacts the C++ runtime consumes
-        # (vocab.txt / merges.txt / special_tokens.txt).
-        $graniteDir = "models/granite"
-        New-Item -ItemType Directory -Path $graniteDir -Force | Out-Null
+        # granite-embedding-small-english-r2 (ModernBERT INT8 ONNX + the upstream tokenizer.json)
+        # and the optional Qwen3-0.6B ORT-GenAI bundle. scripts/fetch_models.ps1 downloads from
+        # immutable resolve/<commit> URLs and verifies every file (pinned SHA-256 in
+        # scripts/models.lock.json, else the hashes Hugging Face publishes). Release branches
+        # require full pins. It also writes the refiner's thread cap into genai_config.json (PERF-1).
+        $release = '${{ github.ref_name }}' -in @('main', 'master')
+        ./scripts/fetch_models.ps1 -RequirePinned:$release
 
-        $onnxRepo = "https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main"
-        Invoke-WebRequest -Uri "$onnxRepo/onnx/model_quantized.onnx"      -OutFile "$graniteDir/model_quantized.onnx"
-        Invoke-WebRequest -Uri "$onnxRepo/onnx/model_quantized.onnx_data" -OutFile "$graniteDir/model_quantized.onnx_data"
-
-        $hfRepo = "https://huggingface.co/ibm-granite/granite-embedding-small-english-r2/resolve/main"
-        Invoke-WebRequest -Uri "$hfRepo/tokenizer.json" -OutFile "$graniteDir/tokenizer.json"
-
-        # Extract the flat vocab.txt + merges.txt + special_tokens.txt
-        # the C++ ModernBertTokenizer consumes (it deliberately has no
-        # JSON parser dependency).  The python reference in
-        # `scripts/modernbert_tokenizer_ref.py` is verified bit-exact
-        # against transformers.AutoTokenizer for the C++ port.
+        # Extract the flat vocab.txt + merges.txt + special_tokens.txt the C++
+        # ModernBertTokenizer consumes (it deliberately has no JSON parser dependency);
+        # scripts/modernbert_tokenizer_ref.py is verified bit-exact against transformers.
         python -m pip install --quiet --upgrade pip
         python -m pip install --quiet regex
-        python scripts/extract_modernbert_tokenizer.py "$graniteDir/tokenizer.json" "$graniteDir"
-        # tokenizer.json (~3.5 MB) is consumed only by the extractor; drop
-        # it from the staged model directory so the shipped artefact only
-        # carries the flat files the C++ runtime actually loads.
-        Remove-Item "$graniteDir/tokenizer.json" -Force
-
-    - name: Download LLM polishing model (Qwen3-0.6B, CPU INT4)
-      shell: pwsh
-      run: |
-        # ORT-GenAI-compatible Qwen3-0.6B bundle from the
-        # community-maintained `xiaoyao9184/Qwen3-0.6B-onnx-genai`
-        # repo on HuggingFace.  We pull the CPU INT4 variant (~430 MB)
-        # under the `cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/`
-        # subdirectory, which ships the genai_config.json that
-        # onnxruntime-genai requires plus the model + tokenizer files.
-        # All listed files are required for the polishing layer to
-        # load; any download failure aborts the build so we never ship
-        # a half-populated artifact.  The x64 / ARM64 staging step
-        # below bundles this directory verbatim into the release zip;
-        # x86 builds skip the polishing layer at link time and don't
-        # ship these files.
-        $qwenDir = "models/qwen"
-        New-Item -ItemType Directory -Path $qwenDir -Force | Out-Null
-        $repo = "https://huggingface.co/xiaoyao9184/Qwen3-0.6B-onnx-genai/resolve/main/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
-        $files = @(
-          "chat_template.jinja",
-          "genai_config.json",
-          "model.onnx",
-          "model.onnx.data",
-          "tokenizer.json",
-          "tokenizer_config.json"
-        )
-        foreach ($f in $files) {
-          Invoke-WebRequest -Uri "$repo/$f" -OutFile "$qwenDir/$f"
-          Write-Host "Downloaded $f"
-        }
+        python scripts/extract_modernbert_tokenizer.py "models/granite/tokenizer.json" "models/granite"
+        if ($LASTEXITCODE -ne 0) { throw "tokenizer extraction failed" }
+        Remove-Item "models/granite/tokenizer.json" -Force
 
     - name: Detect available VC toolset
       id: toolset
@@ -122,13 +85,18 @@ jobs:
         $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
         $installPath = & $vsWhere -latest -property installationPath
         $vcToolsDir = Join-Path $installPath "VC\Tools\MSVC"
-        $versions = Get-ChildItem $vcToolsDir -Directory | Sort-Object Name -Descending
+        $versions = Get-ChildItem $vcToolsDir -Directory | Sort-Object { [version]$_.Name } -Descending
         $latestVersion = $versions[0].Name
-        # Derive platform toolset: 14.43.x -> v143, 14.50.x -> v145
-        $parts = $latestVersion.Split('.')
-        $major = $parts[0]
-        $minor = $parts[1]
-        $toolset = "v${major}$($minor[0])"
+        # ENG-2: the platform toolset is not "v1" + the first minor digit. MSVC 14.30-14.49 are
+        # all v143 (VS 2022); 14.50+ is v145 (VS 2026); 14.20-14.29 is v142 (VS 2019).
+        $v = [version]$latestVersion
+        if ($v.Major -ne 14) { throw "Unexpected MSVC tools version $latestVersion" }
+        $toolset = switch ($v.Minor) {
+          { $_ -ge 50 } { 'v145'; break }
+          { $_ -ge 30 } { 'v143'; break }
+          { $_ -ge 20 } { 'v142'; break }
+          default       { throw "MSVC $latestVersion is too old (VS 2019 or newer is required)" }
+        }
         Write-Host "Detected VC tools version: $latestVersion -> PlatformToolset=$toolset"
         echo "value=$toolset" >> $env:GITHUB_OUTPUT
 
@@ -137,6 +105,61 @@ jobs:
 
     - name: Build x64
       run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
+
+    # ENG-1: C++ unit tests (store, API, canonicalizers, capture rules, concurrency stress).
+    - name: Build C++ unit tests (x64)
+      run: msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
+
+    - name: Run C++ unit tests (x64)
+      timeout-minutes: 20
+      run: build\tests\x64\Release\WarpTests.exe /timeout 900
+
+    # ENG-3: start the real binary headless against a temp data directory, query the live pipe
+    # (including as a filtered, medium-integrity "standard user" client), drive scripted activity,
+    # then stop it through its shutdown event.
+    - name: Integration test - headless WARP + live API (x64)
+      timeout-minutes: 15
+      shell: pwsh
+      run: |
+        python -m pip install --quiet --disable-pip-version-check -r tests/requirements.txt
+        # The first-run consent dialog would block a headless start; acknowledge it for the CI user.
+        New-Item -Path 'HKCU:\Software\WARP' -Force | Out-Null
+        New-ItemProperty -Path 'HKCU:\Software\WARP' -Name ConsentAcknowledged -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path 'HKCU:\Software\WARP' -Name EncryptDataDir -Value 0 -PropertyType DWord -Force | Out-Null
+        $data = Join-Path $env:RUNNER_TEMP 'warp-data'
+        $exe = (Resolve-Path 'x64/Release/WARP!.exe').Path
+        $proc = Start-Process -FilePath $exe -ArgumentList @('--headless', '--data-dir', "`"$data`"") -PassThru
+        $env:WARP_LIVE_API = '1'
+        $env:WARP_PID = "$($proc.Id)"
+        $rc = 1
+        try {
+          python -m pytest tests/python/test_live_api.py -m live -v -rA --tb=short
+          $rc = $LASTEXITCODE
+          Write-Host '----- WARP!.exe --status (CLI against the running instance)'
+          $statusOut = Join-Path $env:RUNNER_TEMP 'warp-status.json'
+          $cli = Start-Process -FilePath $exe -ArgumentList '--status' -RedirectStandardOutput $statusOut -PassThru -NoNewWindow
+          if ($cli.WaitForExit(20000)) { Get-Content -LiteralPath $statusOut | Out-Host }
+          else { Stop-Process -Id $cli.Id -Force; Write-Host '::warning::WARP!.exe --status did not return within 20 s' }
+        }
+        finally {
+          try {
+            $evt = [System.Threading.EventWaitHandle]::OpenExisting('Local\WARP-ShutdownRequest')
+            [void]$evt.Set()
+            $evt.Dispose()
+          }
+          catch { Write-Host "shutdown event not available: $($_.Exception.Message)" }
+          if (-not $proc.WaitForExit(30000)) {
+            Write-Host '::error::WARP did not exit within 30 s of the shutdown request'
+            Stop-Process -Id $proc.Id -Force
+            if ($rc -eq 0) { $rc = 1 }
+          }
+          else { Write-Host "WARP exited with code $($proc.ExitCode)" }
+          Get-ChildItem -Path (Join-Path $data 'logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "----- $($_.Name)"
+            Get-Content -LiteralPath $_.FullName -Tail 300
+          }
+        }
+        exit $rc
 
     - name: Build x86
       run: msbuild "WARP!.sln" /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
@@ -154,6 +177,11 @@ jobs:
           @{ arch = "x64";   src = "x64/Release";   hasLlm = $true  },
           @{ arch = "x86";   src = "Release";       hasLlm = $false }
         )
+
+        # Apache-2.0 text for the bundled models' license (best effort; NOTICE.md links it too).
+        $apacheText = Join-Path $env:RUNNER_TEMP 'Apache-2.0.txt'
+        try { Invoke-WebRequest -Uri 'https://www.apache.org/licenses/LICENSE-2.0.txt' -OutFile $apacheText -TimeoutSec 60 }
+        catch { Write-Host "::warning::Apache-2.0 license text could not be downloaded: $($_.Exception.Message)"; $apacheText = $null }
 
         foreach ($p in $platforms) {
           $staging = "artifacts/$($p.arch)/WARP"
@@ -195,7 +223,64 @@ jobs:
           }
 
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
+          Copy-Item "NOTICE.md" "$staging/NOTICE.md" -Force
+          Copy-Item "API.md" "$staging/API.md" -Force
+
+          # Upstream license files (ENG-5 / SEC-2): ONNX Runtime packages, Apache-2.0 for the models.
+          $lic = "$staging/licenses"
+          New-Item -ItemType Directory -Path $lic -Force | Out-Null
+          $ortVersion = if ($p.arch -eq 'x86') { '1.22.0' } else { '1.23.0' }
+          $pkgs = @(@{ dir = "../packages/Microsoft.ML.OnnxRuntime.$ortVersion"; prefix = 'onnxruntime' })
+          if ($p.hasLlm) { $pkgs += @{ dir = '../packages/Microsoft.ML.OnnxRuntimeGenAI.0.14.1'; prefix = 'onnxruntime-genai' } }
+          foreach ($pkg in $pkgs) {
+            if (!(Test-Path $pkg.dir)) { Write-Host "::warning::$($pkg.dir) not found; its license files are not bundled"; continue }
+            Get-ChildItem $pkg.dir -File | Where-Object { $_.Name -match '^(LICENSE|ThirdPartyNotices)' } | ForEach-Object {
+              Copy-Item $_.FullName (Join-Path $lic "$($pkg.prefix)-$($_.Name)") -Force
+            }
+          }
+          if ($apacheText) { Copy-Item $apacheText "$lic/Apache-2.0.txt" -Force }
           Write-Host "Staged $($p.arch): $staging"
+        }
+
+    - name: Sign WARP binaries (only when a signing certificate is configured)
+      if: env.HAS_SIGNING_CERT == 'true'
+      shell: pwsh
+      env:
+        CERT_B64: ${{ secrets.WARP_SIGN_CERT_PFX_B64 }}
+        CERT_PASSWORD: ${{ secrets.WARP_SIGN_CERT_PASSWORD }}
+      run: |
+        $pfx = Join-Path $env:RUNNER_TEMP 'warp-sign.pfx'
+        [System.IO.File]::WriteAllBytes($pfx, [System.Convert]::FromBase64String($env:CERT_B64))
+        try {
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter 'signtool.exe' |
+                      Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          foreach ($f in Get-ChildItem artifacts -Recurse -Filter 'WARP!.exe') {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d WARP $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($f.FullName)" }
+          }
+        }
+        finally { Remove-Item $pfx -Force -ErrorAction SilentlyContinue }
+
+    - name: Note unsigned build
+      if: env.HAS_SIGNING_CERT != 'true'
+      shell: pwsh
+      run: |
+        "> **Unsigned build** - configure the WARP_SIGN_CERT_PFX_B64 / WARP_SIGN_CERT_PASSWORD secrets to Authenticode-sign WARP!.exe." |
+          Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Write SHA256SUMS
+      shell: pwsh
+      run: |
+        foreach ($arch in 'ARM64', 'x64', 'x86') {
+          $root = (Resolve-Path "artifacts/$arch/WARP").Path
+          $lines = Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+                   Sort-Object FullName | ForEach-Object {
+                     $rel = [System.IO.Path]::GetRelativePath($root, $_.FullName)
+                     '{0} *{1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $rel
+                   }
+          Set-Content -LiteralPath (Join-Path $root 'SHA256SUMS.txt') -Value $lines -Encoding utf8
+          Write-Host "${arch}: $($lines.Count) files hashed"
         }
 
     - name: Upload ARM64 zip

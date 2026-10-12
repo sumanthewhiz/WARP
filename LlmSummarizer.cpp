@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "LlmSummarizer.h"
+#include "Logger.h"
 
 #include <sstream>
 #include <string>
@@ -11,6 +12,19 @@
 
 #ifdef WARP_HAS_ORT_GENAI
 #include <ort_genai_c.h>
+#include <delayimp.h>
+
+namespace
+{
+    // onnxruntime-genai.dll is delay-loaded (SEC-1 / PERF-1): it is mapped only when the
+    // refiner is enabled, and a missing or broken DLL disables the refiner instead of
+    // keeping WARP from starting. The delay-load helper reports failures as exceptions.
+    bool GenAiRuntimeAvailable()
+    {
+        __try { return SUCCEEDED(__HrLoadAllImportsForDll("onnxruntime-genai.dll")); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+}
 #endif
 
 // =====================================================================
@@ -67,15 +81,14 @@ LlmSummarizer::~LlmSummarizer()
 
 std::string LlmSummarizer::ModelName() const
 {
-    return m_ready.load() ? std::string(kModelName)
-                          : std::string("(not loaded)");
+    return m_available.load() ? std::string(kModelName)
+                              : std::string("(not loaded)");
 }
 
 // ---------------------------------------------------------------------
-//  Init -- looks for `<modelsDir>\qwen\genai_config.json` and loads
-//  the model + tokenizer through onnxruntime-genai.  Best effort:
-//  any failure (missing files, ORT-GenAI absent at build time, init
-//  exception) results in a clean return-false with no side effects.
+//  Init -- checks `<modelsDir>\qwen\genai_config.json` and the GenAI
+//  runtime; the model is loaded lazily by Polish() (LoadLocked).
+//  Any failure results in a clean return-false with no side effects.
 // ---------------------------------------------------------------------
 bool LlmSummarizer::Init(const std::wstring& modelsDir)
 {
@@ -89,39 +102,13 @@ bool LlmSummarizer::Init(const std::wstring& modelsDir)
         return false;   // model not present; quietly stay disabled
 
 #ifdef WARP_HAS_ORT_GENAI
-    try
+    if (!GenAiRuntimeAvailable()) return false;
     {
-        int len = WideCharToMultiByte(CP_UTF8, 0, qwenDir.c_str(), -1,
-                                      nullptr, 0, nullptr, nullptr);
-        if (len <= 0) return false;
-        std::string narrow(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, qwenDir.c_str(), -1,
-                            &narrow[0], len, nullptr, nullptr);
-
-        OgaResult* res = OgaCreateModel(narrow.c_str(), &m_impl->model);
-        if (res || !m_impl->model)
-        {
-            if (res) OgaDestroyResult(res);
-            return false;
-        }
-        res = OgaCreateTokenizer(m_impl->model, &m_impl->tokenizer);
-        if (res || !m_impl->tokenizer)
-        {
-            if (res) OgaDestroyResult(res);
-            OgaDestroyModel(m_impl->model);
-            m_impl->model = nullptr;
-            return false;
-        }
+        std::lock_guard<std::mutex> lk(m_genMutex);
         m_impl->modelDir = std::move(qwenDir);
-        m_ready.store(true);
-        return true;
     }
-    catch (...)
-    {
-        if (m_impl->tokenizer) { OgaDestroyTokenizer(m_impl->tokenizer); m_impl->tokenizer = nullptr; }
-        if (m_impl->model)     { OgaDestroyModel(m_impl->model);         m_impl->model     = nullptr; }
-        return false;
-    }
+    m_available.store(true);
+    return true;
 #else
     // Built without ORT-GenAI -- LLM polishing not available.
     (void)cfgPath;
@@ -129,14 +116,92 @@ bool LlmSummarizer::Init(const std::wstring& modelsDir)
 #endif
 }
 
-void LlmSummarizer::Stop()
+bool LlmSummarizer::LoadLocked() const
+{
+#ifdef WARP_HAS_ORT_GENAI
+    if (m_ready.load()) return true;
+    if (m_impl->modelDir.empty()) return false;
+    // A failed load (corrupt or missing model files, out of memory) costs seconds: retry after 5 min,
+    // doubling up to 160 min, instead of on every Polish().
+    const uint64_t nowTick = GetTickCount64();
+    if (nowTick < m_loadRetryTick) return false;
+    auto attempt = [this]() -> bool
+    {
+        try
+        {
+            int len = WideCharToMultiByte(CP_UTF8, 0, m_impl->modelDir.c_str(), -1,
+                                          nullptr, 0, nullptr, nullptr);
+            if (len <= 0) return false;
+            std::string narrow(len - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, m_impl->modelDir.c_str(), -1,
+                                &narrow[0], len, nullptr, nullptr);
+
+            OgaResult* res = OgaCreateModel(narrow.c_str(), &m_impl->model);
+            if (res || !m_impl->model)
+            {
+                if (res) OgaDestroyResult(res);
+                m_impl->model = nullptr;
+                return false;
+            }
+            res = OgaCreateTokenizer(m_impl->model, &m_impl->tokenizer);
+            if (res || !m_impl->tokenizer)
+            {
+                if (res) OgaDestroyResult(res);
+                OgaDestroyModel(m_impl->model);
+                m_impl->model = nullptr;
+                m_impl->tokenizer = nullptr;
+                return false;
+            }
+            m_ready.store(true);
+            return true;
+        }
+        catch (...)
+        {
+            UnloadLocked();
+            return false;
+        }
+    };
+    if (attempt())
+    {
+        m_loadFailures = 0;
+        m_loadRetryTick = 0;
+        return true;
+    }
+    m_loadFailures = (std::min)(m_loadFailures + 1u, 6u);
+    const unsigned waitMin = 5u << (m_loadFailures - 1);
+    m_loadRetryTick = nowTick + (uint64_t)waitMin * 60u * 1000u;
+    WARP_LOG_WARN("llm", "summary model failed to load; next attempt in %u min", waitMin);
+    return false;
+#else
+    return false;
+#endif
+}
+
+void LlmSummarizer::UnloadLocked() const
 {
     m_ready.store(false);
 #ifdef WARP_HAS_ORT_GENAI
     if (m_impl->tokenizer) { OgaDestroyTokenizer(m_impl->tokenizer); m_impl->tokenizer = nullptr; }
     if (m_impl->model)     { OgaDestroyModel(m_impl->model);         m_impl->model     = nullptr; }
 #endif
+}
+
+void LlmSummarizer::UnloadIfIdle(unsigned long idleMs)
+{
+    if (!m_ready.load()) return;
+    std::unique_lock<std::mutex> lk(m_genMutex, std::try_to_lock);
+    if (!lk.owns_lock()) return;                 // generating right now
+    if (GetTickCount64() - m_lastUseTick.load() >= idleMs) UnloadLocked();
+}
+
+void LlmSummarizer::Stop()
+{
+    m_available.store(false);
+    std::lock_guard<std::mutex> lk(m_genMutex);
+    UnloadLocked();
     m_impl->modelDir.clear();
+    m_loadFailures = 0;
+    m_loadRetryTick = 0;
 }
 
 // =====================================================================
@@ -611,11 +676,17 @@ LlmSummarizer::Polish(const std::vector<std::string>& existing,
                       const std::vector<LlmActivityItem>& items,
                       const std::string& category) const
 {
-    if (!m_ready.load()) return {};
+    if (!m_available.load()) return {};
     if (items.empty() && existing.empty()) return {};
 
 #ifdef WARP_HAS_ORT_GENAI
     std::lock_guard<std::mutex> lk(m_genMutex);
+    if (!LoadLocked()) return {};
+    struct TouchOnExit
+    {
+        std::atomic<uint64_t>& t;
+        ~TouchOnExit() { t.store(GetTickCount64()); }
+    } touch{ m_lastUseTick };
 
     // RAII helpers for the C API objects we'll allocate.
     OgaSequences*        promptSeqs = nullptr;

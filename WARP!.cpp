@@ -1,30 +1,54 @@
 // WARP!.cpp : Defines the entry point for the application.
-// WARP!.cpp : Defines the entry point for the application.
 //
+// Process model (interim always-on runtime, gap-analysis RUN-1..RUN-7):
+//   * Started at logon by a per-user scheduled task ("--headless"); restarted by the task and
+//     by Windows Error Reporting after a crash (CrashHandler); one instance per user (mutex).
+//   * The message pump starts first; storage, models and capture start on a worker thread;
+//     only the WinEvent hooks live on the UI thread. All DB writes go through the
+//     ActivityStore writer thread.
+//   * Session/power lifecycle: WM_ENDSESSION flushes and stops; presence (lock, sleep, away,
+//     passive) comes from PresenceMonitor and never pauses capture.
 
 #include "framework.h"
 #include "WARP!.h"
-#include "ActivityDatabase.h"
-#include "FileMonitor.h"
-#include "AppLaunchMonitor.h"
-#include "BrowsingMonitor.h"
-#include "ForegroundMonitor.h"
-#include "IdleDetector.h"
-#include "QueryApi.h"
-#include "InferenceEngine.h"
+#include "ActivityStore.h"
+#include "EntityStore.h"
+#include "HistoryEngine.h"
+#include "ApiServer.h"
+#include "FileCapture.h"
+#include "LaunchCapture.h"
+#include "WebCapture.h"
+#include "FocusTracker.h"
+#include "DocResolver.h"
+#include "PresenceMonitor.h"
+#include "ClipboardMonitor.h"
+#include "PrintMonitor.h"
 #include "ContextInference.h"
 #include "LlmSummarizer.h"
-#include "LaunchCorrelator.h"
 #include "ForegroundChangeBroker.h"
+#include "EventContext.h"
+#include "EntityKey.h"
+#include "Settings.h"
+#include "Logger.h"
+#include "CrashHandler.h"
+#include "Installer.h"
+#include "Json.h"
 
 #include <string>
 #include <shlobj.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <atomic>
 #include <thread>
 #include <vector>
 #include <ctime>
 #include <algorithm>
+#include <cstdio>
+
+#pragma comment(lib, "advapi32.lib")
 
 #define MAX_LOADSTRING 100
+#define WARP_PRODUCT_VERSION "6.0.0"
 
 // ---------- Theme system ----------
 struct Theme
@@ -103,16 +127,35 @@ NOTIFYICONDATAW nid = {};
 HWND g_hWnd = nullptr;
 
 // Subsystems
-ActivityDatabase   g_db;
-FileMonitor         g_fileMonitor;
-AppLaunchMonitor    g_appLaunchMonitor;
-BrowsingMonitor     g_browsingMonitor;
-ForegroundMonitor   g_foregroundMonitor;
-IdleDetector        g_idleDetector;
-QueryApi            g_queryApi;
-InferenceEngine     g_inference;
+ActivityStore       g_store;
+EntityStore         g_entities(&g_store);
+HistoryEngine       g_history(&g_store);
+ApiServer           g_api;
+FileCapture         g_files;
+LaunchCapture       g_launch;
+WebCapture          g_web;
+FocusTracker        g_focus;
+ClipboardMonitor    g_clipboard;
+PrintMonitor        g_print;
 ContextInference    g_contextInference;
 LlmSummarizer       g_llmSummarizer;
+
+// Runtime state
+static std::wstring       g_dataDir;
+static bool               g_headless = false;
+static HANDLE             g_instanceMutex = nullptr;
+static HANDLE             g_shutdownEvent = nullptr;
+static std::thread        g_shutdownWatcher;
+static std::thread        g_startThread;
+static std::thread        g_supervisorThread;             // capture heartbeats, off the UI thread
+static HANDLE             g_supervisorStop = nullptr;     // manual-reset
+static std::atomic<bool>  g_subsystemsUp{ false };
+static std::atomic<bool>  g_stopping{ false };
+static std::atomic<int>   g_presenceState{ 0 };        // PresenceState as int
+static std::atomic<int64_t> g_presenceSinceMs{ 0 };
+static bool               g_capturePausedApplied = false;
+static UINT               g_wmTaskbarCreated = 0;
+static int64_t            g_startedUtc = 0;
 
 // Child window handles for repositioning on resize
 static HWND g_hStatusLabel  = nullptr;
@@ -156,12 +199,14 @@ ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 void                AddTrayIcon(HWND hWnd);
+void                UpdateTrayTip();
 void                RemoveTrayIcon();
 void                ShowTrayMenu(HWND hWnd);
 void                MinimizeToTray(HWND hWnd);
 void                RestoreFromTray(HWND hWnd);
 std::wstring        GetDatabasePath();
-void                StartSubsystems();
+void                StartSubsystems();          // worker thread: storage, models, API, capture
+void                StartUiSubsystems();        // UI thread: hooks
 void                StopSubsystems();
 void                CreateUIControls(HWND hWnd, HINSTANCE hInstance);
 void                LayoutControls(HWND hWnd);
@@ -170,6 +215,10 @@ void                OnQueryButton(HWND hWnd, int id);
 void                ToggleTheme(HWND hWnd);
 void                ClearHistory(HWND hWnd);
 void                OnInferenceButton(HWND hWnd, int id);
+void                ApplyPauseState();
+bool                SetCapturePaused(int64_t untilUtc);
+void                PurgeRecent(HWND hWnd, int64_t seconds, const wchar_t* label);
+static int          RunCli(int argc, wchar_t** argv, bool& handled);
 
 // ---------- Owner-draw button helper ----------
 static void DrawModernButton(LPDRAWITEMSTRUCT dis)
@@ -205,6 +254,226 @@ static void DrawModernButton(LPDRAWITEMSTRUCT dis)
 }
 
 // =================================================================
+namespace
+{
+    std::wstring UserSidString()
+    {
+        std::wstring out;
+        HANDLE tok = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return out;
+        DWORD len = 0;
+        GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
+        std::vector<BYTE> buf(len ? len : 1);
+        if (len && GetTokenInformation(tok, TokenUser, buf.data(), len, &len))
+        {
+            LPWSTR s = nullptr;
+            if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &s))
+            {
+                out = s;
+                LocalFree(s);
+            }
+        }
+        CloseHandle(tok);
+        return out;
+    }
+
+    bool IsElevated()
+    {
+        HANDLE tok = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+        TOKEN_ELEVATION te = {};
+        DWORD len = 0;
+        bool e = GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &len) && te.TokenIsElevated;
+        CloseHandle(tok);
+        return e;
+    }
+
+    // PRIV-2: the data directory (DB, logs, dumps) is readable only by the user, SYSTEM and
+    // Administrators (protected DACL, no inherited "Users" access) and EFS-encrypted when the
+    // edition supports it.
+    bool PrepareSecureDirectory(const std::wstring& dir, bool encrypt)
+    {
+        std::wstring sid = UserSidString();
+        std::wstring sddl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+        if (!sid.empty()) sddl += L"(A;OICI;FA;;;" + sid + L")";
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
+            return CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
+        bool ok = CreateDirectoryW(dir.c_str(), &sa) != FALSE;
+        if (!ok && GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            BOOL present = FALSE, defaulted = FALSE;
+            PACL dacl = nullptr;
+            if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present)
+                SetNamedSecurityInfoW(const_cast<LPWSTR>(dir.c_str()), SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                      nullptr, nullptr, dacl, nullptr);
+            ok = true;
+        }
+        LocalFree(sd);
+        if (ok && encrypt)
+        {
+            DWORD attrs = GetFileAttributesW(dir.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_ENCRYPTED))
+                EncryptFileW(dir.c_str());                  // best effort (EFS needs Pro/Enterprise)
+        }
+        return ok;
+    }
+
+    std::wstring ExeDir()
+    {
+        wchar_t buf[MAX_PATH * 2] = {};
+        DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+        std::wstring p(buf, n);
+        size_t s = p.find_last_of(L"\\/");
+        return s == std::wstring::npos ? p : p.substr(0, s);
+    }
+
+    std::wstring ArgValue(int argc, wchar_t** argv, const wchar_t* name)
+    {
+        for (int i = 1; i + 1 < argc; ++i)
+            if (_wcsicmp(argv[i], name) == 0) return argv[i + 1];
+        return std::wstring();
+    }
+
+    bool HasArg(int argc, wchar_t** argv, const wchar_t* name)
+    {
+        for (int i = 1; i < argc; ++i)
+            if (_wcsicmp(argv[i], name) == 0) return true;
+        return false;
+    }
+
+    // Writes CLI output to redirected stdout (scripts, CI), else the parent console, else a message box.
+    void CliPrint(const std::wstring& text)
+    {
+        const std::wstring line = text + L"\r\n";
+        auto writeTo = [&line](HANDLE out) -> bool
+        {
+            if (out == nullptr || out == INVALID_HANDLE_VALUE) return false;
+            DWORD w = 0, mode = 0;
+            if (GetConsoleMode(out, &mode))       // a console: UTF-16 keeps non-ASCII paths and titles readable
+                return WriteConsoleW(out, line.c_str(), (DWORD)line.size(), &w, nullptr) != FALSE;
+            if (GetFileType(out) == FILE_TYPE_UNKNOWN) return false;
+            const std::string u = WarpJson::WideToUtf8(line);   // file, pipe or NUL: UTF-8
+            return WriteFile(out, u.data(), (DWORD)u.size(), &w, nullptr) != FALSE;
+        };
+        if (writeTo(GetStdHandle(STD_OUTPUT_HANDLE))) return;
+        if (AttachConsole(ATTACH_PARENT_PROCESS) || GetConsoleWindow())
+        {
+            if (writeTo(GetStdHandle(STD_OUTPUT_HANDLE))) return;
+            HANDLE con = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            const bool ok = writeTo(con);
+            if (con != INVALID_HANDLE_VALUE) CloseHandle(con);
+            if (ok) return;
+        }
+        MessageBoxW(nullptr, text.c_str(), L"WARP", MB_OK | MB_ICONINFORMATION);
+    }
+
+    // Sends one request to the running instance in this session (same exe => control scope).
+    std::string PipeRequest(const std::string& req)
+    {
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        std::wstring name = ApiServer::SessionPipeName(session);
+        HANDLE h = CreateFileW(name.c_str(), GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return std::string();
+        DWORD mode = PIPE_READMODE_MESSAGE;
+        SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
+        DWORD n = 0;
+        WriteFile(h, req.data(), (DWORD)req.size(), &n, nullptr);
+        std::string resp;
+        std::vector<char> buf(65536);
+        for (;;)
+        {
+            if (ReadFile(h, buf.data(), (DWORD)buf.size(), &n, nullptr)) { resp.append(buf.data(), n); break; }
+            if (GetLastError() != ERROR_MORE_DATA) break;
+            resp.append(buf.data(), n);
+        }
+        CloseHandle(h);
+        return resp;
+    }
+}
+
+// CLI verbs: --install, --uninstall [--remove-data], --start, --status, --pause <minutes>, --resume,
+// --purge-hours <n>, --purge-domain <host>, --purge-path <folder>.
+static int RunCli(int argc, wchar_t** argv, bool& handled)
+{
+    handled = true;
+    const bool install = HasArg(argc, argv, L"--install");
+    const bool uninstall = HasArg(argc, argv, L"--uninstall");
+    if ((install || uninstall) && !IsElevated())
+    {
+        // Installing a highest-privilege logon task and writing Program Files needs elevation.
+        wchar_t exe[MAX_PATH * 2] = {};
+        GetModuleFileNameW(nullptr, exe, (DWORD)(sizeof(exe) / sizeof(exe[0])));
+        std::wstring params = install ? L"--install" : (HasArg(argc, argv, L"--remove-data") ? L"--uninstall --remove-data" : L"--uninstall");
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exe;
+        sei.lpParameters = params.c_str();
+        sei.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&sei)) { CliPrint(L"Administrator approval is required."); return 1; }
+        DWORD code = 1;
+        if (sei.hProcess)
+        {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            GetExitCodeProcess(sei.hProcess, &code);
+            CloseHandle(sei.hProcess);
+        }
+        return (int)code;
+    }
+    if (install)
+    {
+        Installer::Result r = Installer::Install(true);
+        CliPrint(r.ok ? L"WARP installed and started: " + r.message : L"Install failed: " + r.message);
+        return r.ok ? 0 : 1;
+    }
+    if (uninstall)
+    {
+        Installer::Result r = Installer::Uninstall(true, HasArg(argc, argv, L"--remove-data"));
+        CliPrint(r.ok ? L"WARP uninstalled. " + r.message : L"Uninstall failed: " + r.message);
+        return r.ok ? 0 : 1;
+    }
+    if (HasArg(argc, argv, L"--start"))
+    {
+        // Starts the installed logon task now (elevated agent, no UAC prompt).
+        Installer::Result r = Installer::StartTask();
+        CliPrint(r.ok ? L"WARP started." : L"Start failed: " + r.message);
+        return r.ok ? 0 : 1;
+    }
+    std::string req;
+    if (HasArg(argc, argv, L"--status")) req = "{\"op\":\"GetStatus\"}";
+    else if (HasArg(argc, argv, L"--resume")) req = "{\"op\":\"Resume\"}";
+    else if (HasArg(argc, argv, L"--pause"))
+        req = "{\"op\":\"Pause\",\"minutes\":" + std::to_string(_wtoi(ArgValue(argc, argv, L"--pause").c_str()) > 0 ? _wtoi(ArgValue(argc, argv, L"--pause").c_str()) : 60) + "}";
+    else if (HasArg(argc, argv, L"--purge-hours"))
+    {
+        int64_t now = (int64_t)time(nullptr);
+        req = "{\"op\":\"Purge\",\"start\":" + std::to_string(now - (int64_t)_wtoi(ArgValue(argc, argv, L"--purge-hours").c_str()) * 3600) +
+              ",\"end\":" + std::to_string(now + 60) + "}";
+    }
+    else if (HasArg(argc, argv, L"--purge-domain") || HasArg(argc, argv, L"--purge-path"))
+    {
+        std::string out;
+        WarpJson::Writer w(out);
+        w.BeginObject().KV("op", "Purge");
+        if (HasArg(argc, argv, L"--purge-domain")) w.KV("domain", ArgValue(argc, argv, L"--purge-domain"));
+        if (HasArg(argc, argv, L"--purge-path")) w.KV("path_prefix", ArgValue(argc, argv, L"--purge-path"));
+        w.EndObject();
+        req = out;
+    }
+    else
+    {
+        handled = false;
+        return 0;
+    }
+    std::string resp = PipeRequest(req);
+    CliPrint(resp.empty() ? L"WARP is not running in this session." : WarpJson::Utf8ToWide(resp));
+    return resp.empty() ? 2 : 0;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -214,23 +483,138 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(lpCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
 
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    // SEC-1: never resolve DLLs from the current directory or PATH.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
 
-    // Enable visual styles
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
-    InitCommonControlsEx(&icc);
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    {
+        bool handled = false;
+        int rc = argv ? RunCli(argc, argv, handled) : 0;
+        if (handled)
+        {
+            LocalFree(argv);
+            return rc;
+        }
+    }
+    g_headless = argv && HasArg(argc, argv, L"--headless") && !HasArg(argc, argv, L"--show");
+    std::wstring dataDirArg = argv ? ArgValue(argc, argv, L"--data-dir") : std::wstring();
+    bool restarted = argv && HasArg(argc, argv, L"--restarted");
+    if (argv) LocalFree(argv);
 
+    // RUN-3: one instance per user. A second launch just surfaces the first one's window.
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_WARP, szWindowClass, MAX_LOADSTRING);
+    std::wstring mutexName = L"Local\\WARP-" + UserSidString();
+    g_instanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+    const DWORD mutexErr = GetLastError();
+    // ERROR_ACCESS_DENIED: the running instance is elevated (logon task) and this one is not.
+    if ((g_instanceMutex && mutexErr == ERROR_ALREADY_EXISTS) || (!g_instanceMutex && mutexErr == ERROR_ACCESS_DENIED))
+    {
+        HWND existing = FindWindowW(szWindowClass, nullptr);
+        if (existing && !g_headless) PostMessageW(existing, WM_APP_SHOW, 0, 0);
+        if (g_instanceMutex) CloseHandle(g_instanceMutex);
+        return 0;
+    }
+
+    // Manual, unelevated launch: kernel ETW capture needs the elevated logon task. Start the
+    // installed task (no UAC prompt), or offer the one-time install; otherwise run degraded.
+    if (!g_headless && !IsElevated())
+    {
+        if (Installer::IsTaskInstalled())
+        {
+            if (g_instanceMutex) { CloseHandle(g_instanceMutex); g_instanceMutex = nullptr; }
+            Installer::Result r = Installer::StartTask();
+            if (r.ok) return 0;
+            g_instanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+        }
+        else if (MessageBoxW(nullptr,
+                     L"WARP needs a one-time installation (administrator approval) to run at every sign-in and "
+                     L"to capture file and app activity.\n\nInstall now? Choose No to run without file/app capture.",
+                     L"WARP", MB_YESNO | MB_ICONQUESTION) == IDYES)
+        {
+            wchar_t exe[MAX_PATH * 2] = {};
+            GetModuleFileNameW(nullptr, exe, (DWORD)(sizeof(exe) / sizeof(exe[0])));
+            SHELLEXECUTEINFOW sei = { sizeof(sei) };
+            sei.lpVerb = L"runas";
+            sei.lpFile = exe;
+            sei.lpParameters = L"--install";
+            sei.nShow = SW_HIDE;
+            if (g_instanceMutex) { CloseHandle(g_instanceMutex); g_instanceMutex = nullptr; }
+            if (ShellExecuteExW(&sei)) return 0;
+            g_instanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+        }
+    }
+
+    Settings::Instance().Load();
+    WarpSettings cfg = Settings::Instance().Get();
+
+    if (!dataDirArg.empty()) g_dataDir = dataDirArg;
+    else
+    {
+        wchar_t appData[MAX_PATH] = {};
+        SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appData);
+        g_dataDir = std::wstring(appData) + L"\\WARP";
+    }
+    PrepareSecureDirectory(g_dataDir, cfg.encryptDataDir);
+    PrepareSecureDirectory(g_dataDir + L"\\logs", false);
+    PrepareSecureDirectory(g_dataDir + L"\\dumps", false);
+
+    Log::Init(g_dataDir + L"\\logs", (Log::Level)(std::max)(0, (std::min)(3, cfg.logLevel)));
+    CrashHandler::Install(g_dataDir + L"\\dumps", L"--headless --restarted");
+    g_startedUtc = (int64_t)time(nullptr);
+    WARP_LOG_INFO("main", "WARP %s starting (pid=%lu, session=%lu, headless=%d, restarted=%d, elevated=%d)",
+                  WARP_PRODUCT_VERSION, GetCurrentProcessId(), EventContextUtil::OwnSessionId(),
+                  g_headless ? 1 : 0, restarted ? 1 : 0, IsElevated() ? 1 : 0);
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icc);
     MyRegisterClass(hInstance);
 
     if (!InitInstance(hInstance, SW_HIDE))
     {
+        WARP_LOG_ERROR("main", "main window could not be created");
         return FALSE;
     }
 
-    StartSubsystems();
+    // PRIV-3: first-run disclosure / consent. Declining starts WARP paused (resume from the tray).
+    if (!cfg.consentAcknowledged)
+    {
+        int r = MessageBoxW(g_hWnd,
+            L"WARP records which files, apps and web pages you use on this PC (names, titles, paths and "
+            L"URLs - never file contents, keystrokes or screenshots) and keeps this history locally to help "
+            L"apps such as Search prioritize what matters to you.\n\n"
+            L"Private browsing windows, sign-in pages and excluded apps/sites are never recorded. You can pause "
+            L"or delete history at any time from the tray icon.\n\nStart recording now?",
+            L"WARP - Activity history", MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        Settings::Instance().SetConsentAcknowledged(true);
+        if (r != IDYES) Settings::Instance().SetPausedUntil(INT64_MAX);
+    }
+
+    // Installer / uninstaller asks a running agent to exit through this event.
+    g_shutdownEvent = CreateEventW(nullptr, TRUE, FALSE, Installer::ShutdownEventName());
+    if (g_shutdownEvent)
+    {
+        g_shutdownWatcher = std::thread([]() {
+            HANDLE hs[1] = { g_shutdownEvent };
+            if (WaitForMultipleObjects(1, hs, FALSE, INFINITE) == WAIT_OBJECT_0 && !g_stopping.load() && g_hWnd)
+                PostMessageW(g_hWnd, WM_APP_SHUTDOWN, 0, 0);
+        });
+    }
+
+    // RUN-7: pump first; storage, models and capture start on a worker.
+    g_startThread = std::thread([]() {
+        SetThreadDescription(GetCurrentThread(), L"WARP startup");
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        StartSubsystems();
+        CoUninitialize();
+    });
     SetTimer(g_hWnd, IDT_EVICTION_TIMER, 6 * 60 * 60 * 1000, nullptr);
+    SetTimer(g_hWnd, IDT_SUPERVISOR_TIMER, 30 * 1000, nullptr);
+    if (!g_headless) RestoreFromTray(g_hWnd);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
@@ -249,7 +633,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     if (g_hFontTitle)  DeleteObject(g_hFontTitle);
     if (g_hFontMono)   DeleteObject(g_hFontMono);
 
+    if (g_shutdownEvent)
+    {
+        SetEvent(g_shutdownEvent);
+        if (g_shutdownWatcher.joinable()) g_shutdownWatcher.join();
+        CloseHandle(g_shutdownEvent);
+    }
+    WARP_LOG_INFO("main", "WARP stopped");
+    Log::Shutdown();
     CoUninitialize();
+    if (g_instanceMutex) CloseHandle(g_instanceMutex);
     return (int)msg.wParam;
 }
 
@@ -296,6 +689,13 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 
     if (!g_hWnd)
         return FALSE;
+
+    // RUN-4: be told about logoff/shutdown ordering and Explorer restarts.
+    SetProcessShutdownParameters(0x3FF, SHUTDOWN_NORETRY);
+    g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    ChangeWindowMessageFilterEx(g_hWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g_hWnd, WM_APP_SHOW, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g_hWnd, WM_TRAYICON, MSGFLT_ALLOW, nullptr);   // Explorer (medium IL) -> elevated tray callback
 
     CreateUIControls(g_hWnd, hInstance);
     AddTrayIcon(g_hWnd);
@@ -766,47 +1166,12 @@ void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
     std::string* req = new std::string(jsonRequest);
 
     std::thread([hWnd, req]() {
-        std::string response;
+        std::string response = g_subsystemsUp.load()
+            ? g_api.Handle(*req, ApiClient::InProcess())
+            : std::string("Error: WARP is still starting up - try again in a moment.");
 
-        HANDLE hPipe = CreateFileW(
-            L"\\\\.\\pipe\\WarpFileActivityAPI",
-            GENERIC_READ | GENERIC_WRITE,
-            0, nullptr, OPEN_EXISTING, 0, nullptr);
-
-        if (hPipe == INVALID_HANDLE_VALUE)
         {
-            response = "Error: Could not connect to pipe (GetLastError=" +
-                       std::to_string(GetLastError()) + ")";
-        }
-        else
-        {
-            DWORD mode = PIPE_READMODE_MESSAGE;
-            SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
-
-            DWORD written = 0;
-            WriteFile(hPipe, req->c_str(), (DWORD)req->size(), &written, nullptr);
-
-            // Read the full message (loop on ERROR_MORE_DATA)
-            char buf[4096];
-            DWORD bytesRead = 0;
-            BOOL readOk;
-            for (;;)
-            {
-                readOk = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr);
-                if (readOk)
-                {
-                    response.append(buf, bytesRead);
-                    break;
-                }
-                if (GetLastError() == ERROR_MORE_DATA)
-                {
-                    response.append(buf, bytesRead);
-                    continue;
-                }
-                break; // real error
-            }
-
-            if (!response.empty())
+            if (!response.empty() && response[0] == '{')
             {
 
                 // Pretty-print the JSON (simple indentation)
@@ -856,12 +1221,6 @@ void SendApiQuery(HWND hWnd, const std::string& jsonRequest)
                 }
                 response = AnnotateTimestamps(pretty);
             }
-            else
-            {
-                response = "Error: ReadFile failed (GetLastError=" +
-                           std::to_string(GetLastError()) + ")";
-            }
-            CloseHandle(hPipe);
         }
 
         delete req;
@@ -931,6 +1290,12 @@ void OnQueryButton(HWND hWnd, int id)
 // =================================================================
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (g_wmTaskbarCreated != 0 && message == g_wmTaskbarCreated)
+    {
+        AddTrayIcon(hWnd);                 // Explorer restarted: the icon must be re-added (RUN-8)
+        UpdateTrayTip();
+        return 0;
+    }
     switch (message)
     {
     case WM_TRAYICON:
@@ -939,6 +1304,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         else if (lParam == WM_LBUTTONDBLCLK)
             RestoreFromTray(hWnd);
         break;
+
+    case WM_APP_START_UI:
+        StartUiSubsystems();
+        break;
+
+    case WM_APP_READY:
+        UpdateTrayTip();
+        break;
+
+    case WM_APP_SHOW:
+        RestoreFromTray(hWnd);
+        break;
+
+    case WM_APP_SHUTDOWN:
+        RemoveTrayIcon();
+        DestroyWindow(hWnd);
+        break;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        // RUN-4: logoff / shutdown - flush the open focus session and in-flight writes now;
+        // the process may be terminated right after this message returns.
+        if (wParam)
+        {
+            WARP_LOG_INFO("main", "session ending (flags=0x%llx): flushing", (unsigned long long)lParam);
+            StopSubsystems();
+        }
+        return 0;
 
     case WM_COMMAND:
     {
@@ -950,6 +1345,42 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             RemoveTrayIcon();
             DestroyWindow(hWnd);
         }
+        else if (wmId == IDM_TRAY_STATUS)
+        {
+            RestoreFromTray(hWnd);
+            SendApiQuery(hWnd, "{\"op\":\"GetStatus\"}");
+        }
+        else if (wmId == IDM_TRAY_PAUSE_1H)
+            SetCapturePaused((int64_t)time(nullptr) + 3600);
+        else if (wmId == IDM_TRAY_PAUSE_TOMORROW)
+        {
+            time_t now = time(nullptr);
+            struct tm lt = {};
+            localtime_s(&lt, &now);
+            lt.tm_mday += 1;
+            lt.tm_hour = 6;
+            lt.tm_min = 0;
+            lt.tm_sec = 0;
+            SetCapturePaused((int64_t)mktime(&lt));
+        }
+        else if (wmId == IDM_TRAY_RESUME)
+            SetCapturePaused(0);
+        else if (wmId == IDM_TRAY_PURGE_15M)
+            PurgeRecent(hWnd, 15 * 60, L"the last 15 minutes");
+        else if (wmId == IDM_TRAY_PURGE_1H)
+            PurgeRecent(hWnd, 3600, L"the last hour");
+        else if (wmId == IDM_TRAY_PURGE_TODAY)
+        {
+            time_t now = time(nullptr);
+            struct tm lt = {};
+            localtime_s(&lt, &now);
+            lt.tm_hour = 0;
+            lt.tm_min = 0;
+            lt.tm_sec = 0;
+            PurgeRecent(hWnd, (int64_t)now - (int64_t)mktime(&lt), L"today");
+        }
+        else if (wmId == IDM_TRAY_PURGE_ALL)
+            ClearHistory(hWnd);
         else if (wmId >= IDB_QUERY_15M && wmId <= IDB_QUERY_CUSTOM)
             OnQueryButton(hWnd, wmId);
         else if (wmId == IDB_TOGGLE_THEME)
@@ -1103,8 +1534,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == IDT_EVICTION_TIMER)
         {
-            g_db.EvictOlderThan30Days();
-            g_inference.RefreshRollingCounts();
+            // Retention, tombstones, rollup refresh, incremental vacuum - all on the store's
+            // writer thread (RUN-7, DATA-4); the UI thread never blocks on the database.
+            if (g_subsystemsUp.load()) g_store.ScheduleMaintenance();
+        }
+        else if (wParam == IDT_SUPERVISOR_TIMER)
+        {
+            // RUN-5 supervisor (UI part): apply pause expiry and refresh the tray health. Capture
+            // heartbeats run on the supervisor thread so ETW restarts never stall the hooks.
+            if (g_subsystemsUp.load()) ApplyPauseState();
+            UpdateTrayTip();
         }
         break;
 
@@ -1118,6 +1557,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY:
         KillTimer(hWnd, IDT_EVICTION_TIMER);
+        KillTimer(hWnd, IDT_SUPERVISOR_TIMER);
         RemoveTrayIcon();
         PostQuitMessage(0);
         break;
@@ -1137,8 +1577,54 @@ void AddTrayIcon(HWND hWnd)
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_WARP));
-    wcscpy_s(nid.szTip, L"WARP! - Monitoring file activity");
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    wcscpy_s(nid.szTip, L"WARP - starting");
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        if (Shell_NotifyIconW(NIM_ADD, &nid)) break;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        Sleep(200);
+    }
+}
+
+// Tray tooltip reflects health (RUN-5): recording / paused / degraded.
+void UpdateTrayTip()
+{
+    if (!nid.hWnd) return;
+    std::wstring tip;
+    const int64_t now = (int64_t)time(nullptr);
+    WarpSettings cfg = Settings::Instance().Get();
+    if (!g_subsystemsUp.load())
+        tip = L"WARP - starting";
+    else if (Settings::Instance().IsPaused(now))
+    {
+        if (cfg.pausedUntilUtc == INT64_MAX) tip = L"WARP - paused (resume from this menu)";
+        else
+        {
+            time_t t = (time_t)cfg.pausedUntilUtc;
+            struct tm lt = {};
+            localtime_s(&lt, &t);
+            wchar_t buf[64] = {};
+            wcsftime(buf, 64, L"%a %H:%M", &lt);
+            tip = std::wstring(L"WARP - paused until ") + buf;
+        }
+    }
+    else
+    {
+        std::wstring problems;
+        FileCapture::Stats fs = g_files.GetStats();
+        LaunchCapture::Stats ls = g_launch.GetStats();
+        ActivityStore::Stats ss = g_store.GetStats();
+        if (cfg.captureFiles && !fs.etwRunning && !fs.usnRunning) problems += L" files";
+        if (cfg.captureAppLaunch && !ls.etwRunning) problems += L" launches";
+        if (!g_store.IsOpen()) problems += L" storage";
+        if (ss.dropped > 0 && ss.queueDepth > 10000) problems += L" backlog";
+        tip = problems.empty() ? L"WARP - recording your activity" : L"WARP - degraded:" + problems;
+    }
+    if (tip.size() >= 127) tip.resize(127);
+    wcscpy_s(nid.szTip, tip.c_str());
+    nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 }
 
 void RemoveTrayIcon()
@@ -1150,9 +1636,27 @@ void ShowTrayMenu(HWND hWnd)
 {
     POINT pt;
     GetCursorPos(&pt);
+    const bool paused = Settings::Instance().IsPaused((int64_t)time(nullptr));
+
+    HMENU hPurge = CreatePopupMenu();
+    AppendMenuW(hPurge, MF_STRING, IDM_TRAY_PURGE_15M, L"Last 15 minutes");
+    AppendMenuW(hPurge, MF_STRING, IDM_TRAY_PURGE_1H, L"Last hour");
+    AppendMenuW(hPurge, MF_STRING, IDM_TRAY_PURGE_TODAY, L"Today");
+    AppendMenuW(hPurge, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hPurge, MF_STRING, IDM_TRAY_PURGE_ALL, L"Everything...");
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_OPEN, L"Open");
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_STATUS, L"Status");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    if (paused)
+        AppendMenuW(hMenu, MF_STRING, IDM_TRAY_RESUME, L"Resume recording");
+    else
+    {
+        AppendMenuW(hMenu, MF_STRING, IDM_TRAY_PAUSE_1H, L"Pause for 1 hour");
+        AppendMenuW(hMenu, MF_STRING, IDM_TRAY_PAUSE_TOMORROW, L"Pause until tomorrow");
+    }
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hPurge, L"Delete activity");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"Exit");
 
@@ -1160,7 +1664,7 @@ void ShowTrayMenu(HWND hWnd)
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN,
                    pt.x, pt.y, 0, hWnd, nullptr);
     PostMessage(hWnd, WM_NULL, 0, 0);
-    DestroyMenu(hMenu);
+    DestroyMenu(hMenu);        // also destroys the submenu
 }
 
 void MinimizeToTray(HWND hWnd)
@@ -1186,18 +1690,61 @@ void ClearHistory(HWND hWnd)
 {
     int result = MessageBoxW(hWnd,
         L"Are you sure you want to clear all activity history?\n\n"
-        L"This will permanently delete all recorded file activity.\n"
-        L"Only new events after clearing will be stored.",
+        L"This permanently and securely deletes everything WARP has recorded "
+        L"(raw events, per-item history, work threads and summaries).",
         L"WARP - Clear History",
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
 
     if (result == IDYES)
     {
-        g_db.ClearAll();
-        g_inference.ClearCache();
-        g_contextInference.ClearHistory();
-        SetWindowTextW(g_hResponse, L"Activity history cleared.");
+        SetWindowTextW(g_hResponse, L"Clearing...");
+        std::thread([hWnd]() {
+            // PRIV-4: context history first (epoch-safe), then a secure wipe on the writer thread
+            // (secure_delete + WAL truncate + VACUUM) so no in-flight event can resurrect anything.
+            g_contextInference.ClearHistory();
+            bool ok = g_store.ClearAll();
+            g_contextInference.ClearHistory();
+            const wchar_t* msg = ok ? L"Activity history cleared." : L"Clearing failed - see the log for details.";
+            size_t n = wcslen(msg) + 1;
+            wchar_t* copy = new wchar_t[n];
+            wcscpy_s(copy, n, msg);
+            PostMessageW(hWnd, WM_QUERY_RESULT, 0, (LPARAM)copy);
+        }).detach();
     }
+}
+
+void PurgeRecent(HWND hWnd, int64_t seconds, const wchar_t* label)
+{
+    std::wstring q = std::wstring(L"Delete everything WARP recorded during ") + label + L"?";
+    if (MessageBoxW(hWnd, q.c_str(), L"WARP - Delete activity", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        return;
+    const int64_t now = (int64_t)time(nullptr);
+    std::string req = "{\"op\":\"Purge\",\"start\":" + std::to_string(now - (std::max<int64_t>)(1, seconds)) +
+                      ",\"end\":" + std::to_string(now + 60) + "}";
+    RestoreFromTray(hWnd);
+    SendApiQuery(hWnd, req);
+}
+
+// Applies the effective pause state (user pause / policy) to every capture source.
+void ApplyPauseState()
+{
+    const bool paused = Settings::Instance().IsPaused((int64_t)time(nullptr));
+    if (paused == g_capturePausedApplied) return;
+    g_capturePausedApplied = paused;
+    g_files.SetPaused(paused);
+    g_launch.SetPaused(paused);
+    g_web.SetPaused(paused);
+    g_focus.SetPaused(paused);
+    WARP_LOG_INFO("main", "capture %s", paused ? "paused" : "resumed");
+}
+
+bool SetCapturePaused(int64_t untilUtc)
+{
+    bool ok = Settings::Instance().SetPausedUntil(untilUtc);
+    if (!ok) WARP_LOG_WARN("main", "pause state is locked by policy");
+    if (g_subsystemsUp.load()) ApplyPauseState();
+    UpdateTrayTip();
+    return ok;
 }
 
 void RestoreFromTray(HWND hWnd)
@@ -1209,23 +1756,13 @@ void RestoreFromTray(HWND hWnd)
 
 std::wstring GetDatabasePath()
 {
-    wchar_t appData[MAX_PATH] = {};
-    SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appData);
-    std::wstring dir = std::wstring(appData) + L"\\WARP";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\activity.db";
+    return g_dataDir + L"\\activity.db";
 }
 
 // ---------------------------------------------------------------------------
-// SetWinEventHook plumbing for app-launch window correlation.
-//
-// SetWinEventHook with WINEVENT_OUTOFCONTEXT marshals events to the thread
-// that called SetWinEventHook -- which must have a message loop. We install
-// the hook on the main UI thread (which already runs the WARP window's
-// message pump), so EVENT_OBJECT_CREATE notifications arrive there for free.
-//
-// We forward every newly-created window into LaunchCorrelator, which decides
-// whether it matches a parked process-start.
+// UI-thread WinEvent hook for launch correlation (APP-2/APP-3): EVENT_OBJECT_SHOW of a
+// top-level window completes a parked process start. OUTOFCONTEXT events are delivered to
+// this (pumping) thread; the handler only does a few cheap window checks.
 // ---------------------------------------------------------------------------
 static HWINEVENTHOOK g_hWinEventHook = nullptr;
 
@@ -1237,378 +1774,384 @@ static void CALLBACK LaunchWinEventProc(HWINEVENTHOOK /*hHook*/,
                                         DWORD          /*idEventThread*/,
                                         DWORD          /*dwmsEventTime*/)
 {
-    if (event != EVENT_OBJECT_CREATE)        return;
+    if (event != EVENT_OBJECT_SHOW)          return;
     if (idObject != OBJID_WINDOW)            return;
     if (idChild  != CHILDID_SELF)            return;
     if (!hwnd)                               return;
-    LaunchCorrelator::Instance().OnWindowCreated(hwnd);
+    g_launch.OnWindowShown(hwnd);
 }
 
+namespace
+{
+    int64_t NowUtcMs()
+    {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        return (int64_t)((t - 116444736000000000ULL) / 10000ULL);
+    }
+
+    std::string PresenceName()
+    {
+        return PresenceStateName((PresenceState)g_presenceState.load());
+    }
+
+    bool g_taskInstalled = false;
+
+    // SEC-1: models load from the install directory. The per-user copy is accepted only when
+    // WARP runs unelevated - an elevated process must never parse model files a standard user
+    // can replace.
+    std::wstring ModelsDir()
+    {
+        std::wstring exeModels = ExeDir() + L"\\models";
+        DWORD attr = GetFileAttributesW(exeModels.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return exeModels;
+        if (!IsElevated())
+        {
+            std::wstring user = g_dataDir + L"\\models";
+            attr = GetFileAttributesW(user.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return user;
+        }
+        return std::wstring();
+    }
+
+    // Which document is a focus session about (gap analysis §5.3, APP-5, WEB-8)?
+    //   browser   -> the page WebCapture last read for that window (canonical URL / doc id),
+    //                accepted only if its title is the one the window shows;
+    //   documents -> the file the same process recently opened whose name the title carries,
+    //                else an explicit recent open (Recent items / Office MRU) with that name.
+    bool ResolveDoc(HWND root, DWORD pid, const std::wstring& exePath, const std::wstring& title, FocusTracker::DocInfo& out)
+    {
+        WebCapture::PageInfo page;
+        if (g_web.LookupPage(root, page))
+        {
+            if (page.isPrivate || page.excluded) return false;
+            if (page.url.empty() && page.docId.empty()) return false;
+            std::wstring pt = DocResolver::NormalizeTitle(page.title);
+            if (!pt.empty() && title.find(pt) == std::wstring::npos && pt.find(title) == std::wstring::npos) return false;
+            out.key = StoreUtil::WebEntityKey(page.url, page.docId, page.title);
+            out.display = page.url;
+            out.type = "url";
+            return !out.key.empty();
+        }
+        std::wstring exeLower = EntityKey::FromUtf8(EntityKey::Key(EntityKey::BaseName(exePath)));
+        std::wstring docName = DocResolver::DocNameFromTitle(exeLower, title);
+        if (docName.empty()) return false;
+        std::wstring path;
+        if (!DocResolver::MatchPath(docName, g_files.RecentPathsForPid(pid, 6 * 3600 * 1000, 16), path) &&
+            !DocResolver::MatchPath(docName, g_files.RecentExplicitOpens(24 * 3600 * 1000, 64), path))
+            return false;
+        if (Settings::Instance().IsExcludedPath(path)) return false;
+        out.key = EntityKey::FileKey(path);
+        out.display = path;
+        out.type = "file";
+        return !out.key.empty();
+    }
+
+    // WEB-1 / PRIV-3: private windows, excluded apps / sites / titles never reach the store.
+    FocusTracker::Redaction Redact(HWND root, DWORD /*pid*/, const std::wstring& exePath, const std::wstring& title)
+    {
+        if (Settings::Instance().IsExcludedApp(exePath)) return FocusTracker::Redaction::DropAll;
+        if (g_web.IsPrivateWindow(root)) return FocusTracker::Redaction::DropContent;
+        WebCapture::PageInfo page;
+        if (g_web.LookupPage(root, page) && page.excluded) return FocusTracker::Redaction::DropContent;
+        if (Settings::Instance().IsExcludedTitle(title)) return FocusTracker::Redaction::DropContent;
+        return FocusTracker::Redaction::None;
+    }
+
+    // Extra GetStatus members (RUN-5): per-source health, presence, models, runtime. Paths, error
+    // texts and microphone / camera / media signals only for WARP's own CLI and tray (`full`).
+    void WriteStatus(WarpJson::Writer& w, bool full)
+    {
+        WarpSettings cfg = Settings::Instance().Get();
+        FileCapture::Stats f = g_files.GetStats();
+        LaunchCapture::Stats l = g_launch.GetStats();
+        WebCapture::Stats wb = g_web.GetStats();
+        w.Key("capture").BeginObject();
+        w.Key("files").BeginObject().KV("enabled", cfg.captureFiles).KV("etw_running", f.etwRunning).KV("usn_running", f.usnRunning)
+         .KV("recent_running", f.recentRunning).KV("mru_running", f.mruRunning).KV("emitted", f.emitted).KV("filtered", f.filtered)
+         .KV("queue_dropped", f.queueDropped).KV("etw_events_lost", f.etwEventsLost).KV("etw_buffers_lost", f.etwBuffersLost)
+         .KV("last_event_ms", f.lastEventMs).KV("session", f.etwSessionName);
+        if (full) w.KV("last_error", f.lastError);
+        w.EndObject();
+        w.Key("launches").BeginObject().KV("enabled", cfg.captureAppLaunch).KV("etw_running", l.etwRunning).KV("starts", l.starts)
+         .KV("recorded", l.recorded).KV("with_window", l.withWindow).KV("no_window", l.noWindow).KV("helpers", l.helpers)
+         .KV("system", l.system).KV("other_session", l.otherSession).KV("exits", l.exits).KV("events_lost", l.eventsLost)
+         .KV("last_event_ms", l.lastEventMs);
+        if (full) w.KV("last_error", l.lastError);
+        w.EndObject();
+        w.Key("web").BeginObject().KV("enabled", cfg.captureWeb).KV("pages", wb.pages).KV("private_dropped", wb.privateDropped)
+         .KV("excluded_dropped", wb.excludedDropped).KV("uia_requests", wb.uiaRequests).KV("uia_timeouts", wb.uiaTimeouts)
+         .KV("uia_failures", wb.uiaFailures).KV("last_event_ms", wb.lastEventMs).EndObject();
+        w.KV("focus_enabled", cfg.captureFocus);
+        w.EndObject();
+        PresenceSnapshot ps = PresenceMonitor::Instance().GetSnapshot();
+        w.Key("presence").BeginObject().KV("state", PresenceStateName(ps.state)).KV("since", ps.sinceUtc)
+         .KV("ms_since_input", (int64_t)ps.msSinceInput).KV("fullscreen", ps.fullscreen).KV("locked", ps.sessionLocked)
+         .KV("on_battery", ps.onBattery);
+        if (full) w.KV("media_playing", ps.mediaPlaying).KV("mic_in_use", ps.micInUse).KV("camera_in_use", ps.cameraInUse);
+        w.EndObject();
+        w.Key("models").BeginObject().KV("embedding_loaded", g_contextInference.IsModelLoaded())
+         .KV("llm_enabled", cfg.llmEnabled).KV("llm_available", g_llmSummarizer.IsAvailable())
+         .KV("llm_resident", g_llmSummarizer.IsLoaded()).EndObject();
+        if (full) w.KV("data_dir", g_dataDir);
+        w.KV("elevated", IsElevated()).KV("headless", g_headless).KV("logon_task_installed", g_taskInstalled);
+    }
+}
+
+// Worker thread: everything that does not need the UI thread (RUN-7).
 void StartSubsystems()
 {
-    std::wstring dbPath = GetDatabasePath();
-    g_db.Open(dbPath);
-    g_db.EvictOlderThan30Days();
+    WarpSettings cfg = Settings::Instance().Get();
+    g_taskInstalled = Installer::IsTaskInstalled();
 
-    // Initialize inference engine with direct DB access
-    g_inference.Init(g_db.DbHandle(), g_db.DbMutex());
-    g_inference.RefreshRollingCounts();
-
-    // Start the launch correlator BEFORE AppLaunchMonitor, so its sweeper
-    // thread is up by the time the first ETW process-start arrives.
-    LaunchCorrelator::Instance().Start();
-
-    // Start the foreground-change broker (single SetWinEventHook for
-    // EVENT_SYSTEM_FOREGROUND, fanned out to ForegroundMonitor and
-    // BrowsingMonitor). Replaces the old per-monitor 3s polling loops.
-    ForegroundChangeBroker::Instance().Start();
-
-    // Install the system-wide window-creation hook on the main UI thread
-    // so OUTOFCONTEXT notifications arrive on a thread with a message
-    // pump (this same thread). We listen ONLY to EVENT_OBJECT_CREATE,
-    // and the callback further filters to top-level windows.
-    g_hWinEventHook = SetWinEventHook(
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
-        nullptr,
-        LaunchWinEventProc,
-        0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-
-    g_fileMonitor.SetCallback([](const std::wstring& action,
-                                 const std::wstring& path,
-                                 const std::wstring& oldPath,
-                                 const EventContext& ctx) {
-        g_db.InsertActivity(action, path, oldPath, ctx);
-        int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnFileEvent(action, path, now, ctx.confidence);
-    });
-    g_fileMonitor.Start();
-
-    g_appLaunchMonitor.SetCallback([](const std::wstring& exeName,
-                                      const std::wstring& exePath,
-                                      DWORD               pid,
-                                      const EventContext& ctx) {
-        g_db.InsertAppLaunch(exeName, exePath, pid, ctx);
-        int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnAppLaunchEvent(exePath, now, ctx.confidence);
-    });
-    g_appLaunchMonitor.Start();
-
-    g_browsingMonitor.SetCallback([](const std::wstring& browser,
-                                     const std::wstring& title,
-                                     const std::wstring& url,
-                                     const EventContext& ctx) {
-        g_db.InsertBrowsingActivity(browser, title, url, ctx);
-        int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnBrowsingEvent(url.empty() ? title : url, now, ctx.confidence);
-    });
-    g_browsingMonitor.Start();
-
-    g_foregroundMonitor.SetCallback([](const std::wstring& exeName,
-                                       const std::wstring& exePath,
-                                       const std::wstring& windowTitle,
-                                       int                 durationSecs,
-                                       const EventContext& ctx) {
-        g_db.InsertAppFocusActivity(exeName, exePath, windowTitle, durationSecs, ctx);
-        int64_t now = static_cast<int64_t>(std::time(nullptr));
-        g_inference.OnAppFocusEvent(exePath, now, ctx.confidence);
-    });
-    g_foregroundMonitor.Start();
-
-    g_idleDetector.SetCallbacks(
-        []() {
-            g_fileMonitor.Pause();
-            g_appLaunchMonitor.Pause();
-            g_browsingMonitor.Pause();
-            g_foregroundMonitor.Pause();
-        },
-        []() {
-            g_fileMonitor.Resume();
-            g_appLaunchMonitor.Resume();
-            g_browsingMonitor.Resume();
-            g_foregroundMonitor.Resume();
-        }
-    );
-    g_idleDetector.Start(120000);
-
-    g_queryApi.Start(&g_db, &g_inference, &g_contextInference);
-
-    // Initialize and start the dynamic context inference engine.  If
-    // the sentence-encoder model files are present
-    // (`models/granite/model_quantized.onnx` + the extracted
-    // tokenizer files) next to the exe -- or under
-    // `%LOCALAPPDATA%\WARP\models` -- the engine uses the model to
-    // **dynamically cluster** the per-app descriptions seen in the
-    // rolling 15-min window.  No pre-defined topic buckets are
-    // involved; clusters emerge from the actual document/tab/app
-    // titles.  If the model is absent the engine falls back to a
-    // deterministic per-app composition.
+    // ---- storage (single writer, entity + history sinks) ----
+    g_store.AddSink(&g_entities);
+    g_store.AddSink(&g_history);
+    g_store.SetRetention(cfg.rawRetentionDays, cfg.entityRetentionDays);
+    const std::wstring dbPath = GetDatabasePath();
+    if (cfg.encryptDataDir)
     {
-        std::wstring modelsDir;
-        wchar_t exePath[MAX_PATH] = { 0 };
-        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0)
-        {
-            std::wstring p = exePath;
-            size_t slash = p.find_last_of(L"\\/");
-            if (slash != std::wstring::npos)
-            {
-                std::wstring exeDirModels = p.substr(0, slash) + L"\\models";
-                DWORD attr = GetFileAttributesW(exeDirModels.c_str());
-                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-                    modelsDir = exeDirModels;
-            }
-        }
-        if (modelsDir.empty())
-        {
-            wchar_t appData[MAX_PATH] = { 0 };
-            if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA,
-                                           nullptr, 0, appData)))
-            {
-                std::wstring fallback = std::wstring(appData) + L"\\WARP\\models";
-                DWORD attr = GetFileAttributesW(fallback.c_str());
-                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-                    modelsDir = fallback;
-            }
-        }
-        g_contextInference.Init(modelsDir);   // empty wstring => deterministic only
-
-        // Wire the confidence-weighted per-entity store so the
-        // dynamic context inference can bias its ranking and
-        // clustering by historical recency + 7-day popularity
-        // instead of re-deriving those signals from the raw event
-        // tables.  Best-effort: passing nullptr (or skipping this
-        // call entirely) keeps the legacy in-window-focus-only
-        // behaviour.
-        g_contextInference.SetInferenceEngine(&g_inference);
-
-        // Best-effort init of the optional LLM polishing layer.  When
-        // the Qwen3 model files aren't on disk this returns false
-        // and Polish() calls become no-ops; nothing in the pipeline
-        // regresses.
-        if (g_llmSummarizer.Init(modelsDir))
-            g_contextInference.SetLlmSummarizer(&g_llmSummarizer);
-
-        g_contextInference.Start(&g_db, &g_foregroundMonitor);
+        DWORD attrs = GetFileAttributesW(dbPath.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_ENCRYPTED)) EncryptFileW(dbPath.c_str());
     }
+    if (!g_store.Open(dbPath))
+        WARP_LOG_ERROR("main", "activity store could not be opened; capture continues but nothing is persisted");
+    else
+        g_store.ScheduleMaintenance();          // retention + leftover deletes from a previous run
+
+    // ---- presence (SIG-1/SIG-2: never pauses capture; tags it and closes focus sessions) ----
+    PresenceMonitor& pm = PresenceMonitor::Instance();
+    pm.Configure((DWORD)cfg.awayAfterSeconds * 1000);
+    g_presenceSinceMs = NowUtcMs();
+    pm.AddListener([](PresenceState oldState, PresenceState newState, const PresenceSnapshot& snap) {
+        const int64_t now = NowUtcMs();
+        PresenceRecord r;
+        r.startMs = g_presenceSinceMs.exchange(now);
+        r.endMs = now;
+        r.state = PresenceStateName(oldState);
+        if (!Settings::Instance().IsPaused(now / 1000)) g_store.RecordPresence(std::move(r));   // paused: nothing is recorded
+        g_presenceState = (int)newState;
+        g_focus.OnPresenceChanged(PresenceStateName(newState), snap.lastInputUtc * 1000);
+    });
+    if (cfg.capturePresence && pm.Start())
+        g_presenceState = (int)pm.GetSnapshot().state;
+
+    // ---- capture sources that run on their own threads ----
+    g_files.SetCallback([](FileEventRecord&& r) {
+        if (r.presence.empty()) r.presence = PresenceName();
+        g_store.RecordFile(std::move(r));
+    });
+    g_files.SetCursorStore(
+        [](const std::wstring& volume, std::string& blob) { return g_store.GetMeta("usn:" + EntityKey::Key(volume), blob); },
+        [](const std::wstring& volume, const std::string& blob) { g_store.SetMeta("usn:" + EntityKey::Key(volume), blob); });
+    if (cfg.captureFiles && !g_files.Start())
+        WARP_LOG_ERROR("main", "file capture could not start (see earlier errors); the supervisor will keep retrying");
+
+    g_launch.SetCallbacks(
+        [](LaunchEventRecord&& r) { g_store.RecordLaunch(std::move(r)); },
+        [](ProcessExitRecord&& r) { g_store.RecordProcessExit(std::move(r)); });
+    if (cfg.captureAppLaunch) g_launch.Start();
+
+    if (cfg.captureClipboardMetadata)
+        g_clipboard.Start([](const ClipboardEvent& e) {
+            if (Settings::Instance().IsPaused((int64_t)time(nullptr))) return;   // these monitors have no pause of their own
+            if (Settings::Instance().IsExcludedApp(e.ownerExePath)) return;
+            ClipboardRecord r;
+            r.eventMs = e.utcMs;
+            r.ownerExe = e.ownerExePath;
+            for (const std::wstring& f : e.formats) r.formats += (r.formats.empty() ? L"" : L",") + f;
+            g_store.RecordClipboard(std::move(r));
+        });
+    if (cfg.capturePrint &&
+        !g_print.Start([](const PrintEvent& e) {
+            if (Settings::Instance().IsPaused((int64_t)time(nullptr))) return;
+            PrintRecord r;
+            r.eventMs = e.utcMs;
+            r.document = e.documentName;
+            r.printer = e.printer;
+            r.pages = e.pages;
+            g_store.RecordPrint(std::move(r));
+        }, true))
+        WARP_LOG_WARN("main", "print capture unavailable: %S", g_print.Status().c_str());
+
+    // ---- intelligence ----
+    const std::wstring modelsDir = ModelsDir();
+    g_contextInference.Init(modelsDir);                 // empty => deterministic only
+    g_contextInference.SetEntityStore(&g_entities);
+    g_contextInference.SetHistoryEngine(&g_history);
+    g_contextInference.SetPresenceProvider([]() { return PresenceName(); });
+    // PERF-1 / INTEL-6: the LLM refiner is opt-in (LlmEnabled); nothing is loaded otherwise.
+    if (cfg.llmEnabled && g_llmSummarizer.Init(modelsDir))
+        g_contextInference.SetLlmSummarizer(&g_llmSummarizer);
+    WARP_LOG_INFO("main", "models: embedding=%d llm=%d (dir=%S)", g_contextInference.IsModelLoaded() ? 1 : 0,
+                  g_llmSummarizer.IsAvailable() ? 1 : 0, modelsDir.c_str());
+
+    // ---- consumer API ----
+    ApiServer::Deps deps;
+    deps.store = &g_store;
+    deps.entities = &g_entities;
+    deps.history = &g_history;
+    deps.context = &g_contextInference;
+    deps.statusProvider = [](WarpJson::Writer& w, bool full) { WriteStatus(w, full); };
+    deps.setPaused = [](int64_t untilUtc) {
+        bool ok = Settings::Instance().SetPausedUntil(untilUtc);
+        if (g_hWnd) PostMessageW(g_hWnd, WM_TIMER, IDT_SUPERVISOR_TIMER, 0);     // apply on the UI thread
+        return ok;
+    };
+    deps.productVersion = WARP_PRODUCT_VERSION;
+    g_api.Start(deps);
+
+    // ---- hooks must live on the UI thread ----
+    if (g_hWnd) PostMessageW(g_hWnd, WM_APP_START_UI, 0, 0);
+}
+
+// UI thread: WinEvent hooks and the capture that depends on them.
+void StartUiSubsystems()
+{
+    if (g_stopping.load() || g_subsystemsUp.load()) return;
+    WarpSettings cfg = Settings::Instance().Get();
+    ForegroundChangeBroker::Instance().Start();
+    // A window switch is proof of a present user: let Away -> Active happen now, not at the next poll.
+    ForegroundChangeBroker::Instance().Subscribe([](HWND, DWORD) { PresenceMonitor::Instance().NotifyUserActivity(); });
+    g_hWinEventHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, LaunchWinEventProc,
+                                      0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    g_web.SetCallback([](BrowseEventRecord&& r) {
+        if (r.presence.empty()) r.presence = PresenceName();
+        g_store.RecordBrowse(std::move(r));
+    });
+    if (cfg.captureWeb) g_web.Start();
+
+    g_focus.SetDocResolver(&ResolveDoc);
+    g_focus.SetRedaction(&Redact);
+    g_focus.SetCallback([](FocusEventRecord&& r) {
+        if (r.presence.empty()) r.presence = PresenceName();
+        g_store.RecordFocus(std::move(r));
+    });
+    if (cfg.captureFocus) g_focus.Start();
+
+    g_contextInference.Start(&g_store, &g_focus);
+    g_subsystemsUp = true;
+    g_capturePausedApplied = false;
+    ApplyPauseState();
+
+    // RUN-5 supervisor thread: every 30 s restart dead ETW consumers with backoff, poll lost events,
+    // reconcile sources with Settings, and retry a file capture that could not start at all.
+    g_supervisorStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_supervisorStop)
+    {
+        g_supervisorThread = std::thread([]() {
+            SetThreadDescription(GetCurrentThread(), L"WARP supervisor");
+            int fileRetryTicks = 0;
+            while (WaitForSingleObject(g_supervisorStop, 30 * 1000) == WAIT_TIMEOUT)
+            {
+                if (!g_subsystemsUp.load()) continue;
+                // Registry / policy changes apply without a restart: exclusions and pause are read per
+                // event, file sources are reconciled by Heartbeat, retention and log level here.
+                Settings::Instance().Load();
+                const WarpSettings live = Settings::Instance().Get();
+                g_store.SetRetention(live.rawRetentionDays, live.entityRetentionDays);
+                Log::SetMinLevel((Log::Level)(std::max)(0, (std::min)(3, live.logLevel)));
+                g_files.Heartbeat();
+                g_launch.Heartbeat();
+                // A running FileCapture restarts its own dead sources in Heartbeat; Start() is only retried
+                // when it never started (or stopped) - e.g. capture enabled live, or every source failed.
+                if (live.captureFiles && !g_files.IsRunning() && ++fileRetryTicks >= 10)
+                {
+                    fileRetryTicks = 0;                       // every ~5 minutes
+                    if (g_files.Start()) WARP_LOG_INFO("main", "file capture started by the supervisor");
+                }
+            }
+        });
+    }
+    WARP_LOG_INFO("main", "all subsystems started (startup took %lld s)", (long long)((int64_t)time(nullptr) - g_startedUtc));
+    PostMessageW(g_hWnd, WM_APP_READY, 0, 0);
 }
 
 void OnInferenceButton(HWND hWnd, int id)
 {
     if (id == IDB_INFER_TOP)
     {
-        // Read Top N value
         wchar_t buf[32] = {};
         GetWindowTextW(g_hEditInferTopN, buf, 32);
         int topN = _wtoi(buf);
         if (topN <= 0) topN = 50;
-        if (topN > 5000) topN = 5000;
+        if (topN > 1000) topN = 1000;
 
-        // Build entity type filter from checkboxes
         bool wantFile = (SendMessageW(g_hChkInferFile, BM_GETCHECK, 0, 0) == BST_CHECKED);
         bool wantApp  = (SendMessageW(g_hChkInferApp,  BM_GETCHECK, 0, 0) == BST_CHECKED);
         bool wantUrl  = (SendMessageW(g_hChkInferUrl,  BM_GETCHECK, 0, 0) == BST_CHECKED);
-        if (!wantFile && !wantApp && !wantUrl)
-            wantFile = wantApp = wantUrl = true;
+        int checked = (wantFile ? 1 : 0) + (wantApp ? 1 : 0) + (wantUrl ? 1 : 0);
+        std::string type;
+        if (checked == 1) type = wantFile ? "file" : (wantApp ? "app" : "url");
 
-        // Use GetInferenceDeltas with since_version=0 to get all records,
-        // then filter client-side and show top N by recency_score.
-        // We send through the pipe so it goes through the same path.
-        std::string request = "{\"op\":\"GetInferenceDeltas\",\"since_version\":0}";
-
+        // RANK-4: ranked by decayed engagement (TopEntities) instead of scanning the change feed.
+        std::string request = "{\"op\":\"TopEntities\",\"limit\":" + std::to_string(checked == 2 ? topN * 2 : topN) +
+                              (type.empty() ? std::string() : ",\"type\":\"" + type + "\"") + "}";
         SetWindowTextW(g_hResponse, L"Querying inferences...");
 
-        // Capture filter state for the thread
         struct InferFilter { bool file; bool app; bool url; int topN; };
-        InferFilter* pf = new InferFilter{ wantFile, wantApp, wantUrl, topN };
+        InferFilter* pf = new InferFilter{ wantFile || checked == 0, wantApp || checked == 0, wantUrl || checked == 0, topN };
         std::string* req = new std::string(request);
 
         std::thread([hWnd, req, pf]() {
-            std::string response;
+            std::string response = g_subsystemsUp.load()
+                ? g_api.Handle(*req, ApiClient::InProcess())
+                : std::string();
+            delete req;
 
-            HANDLE hPipe = CreateFileW(
-                L"\\\\.\\pipe\\WarpFileActivityAPI",
-                GENERIC_READ | GENERIC_WRITE,
-                0, nullptr, OPEN_EXISTING, 0, nullptr);
-
-            if (hPipe == INVALID_HANDLE_VALUE)
+            std::string output;
+            WarpJson::ParseResult pr = WarpJson::Parse(response);
+            if (!pr.ok || !pr.value.get("ok").asBool(false))
             {
-                response = "Error: Could not connect to pipe (GetLastError=" +
-                           std::to_string(GetLastError()) + ")";
+                output = response.empty() ? "WARP is still starting up - try again in a moment.\r\n" : response;
             }
             else
             {
-                DWORD mode = PIPE_READMODE_MESSAGE;
-                SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
-
-                DWORD written = 0;
-                WriteFile(hPipe, req->c_str(), (DWORD)req->size(), &written, nullptr);
-
-                char buf[65536];
-                DWORD bytesRead = 0;
-                BOOL readOk;
-                for (;;)
+                std::vector<const WarpJson::Value*> rows;
+                for (const WarpJson::Value& v : pr.value.get("results").items())
                 {
-                    readOk = ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr);
-                    if (readOk)
-                    {
-                        response.append(buf, bytesRead);
-                        break;
-                    }
-                    if (GetLastError() == ERROR_MORE_DATA)
-                    {
-                        response.append(buf, bytesRead);
-                        continue;
-                    }
-                    break;
+                    const std::string& t = v.get("entity_type").asString();
+                    if ((t == "file" && pf->file) || (t == "app" && pf->app) || (t == "url" && pf->url))
+                        rows.push_back(&v);
+                    if ((int)rows.size() >= pf->topN) break;
                 }
-
-                if (response.empty())
+                output += "Top " + std::to_string(rows.size()) + " entities by engagement "
+                          "(score = percentile within type, decayed at query time)\r\n";
+                output += std::string(78, '-') + "\r\n";
+                char line[512];
+                auto stamp = [](int64_t t) -> std::string {
+                    if (t <= 0) return std::string();
+                    time_t tt = (time_t)t;
+                    struct tm tmBuf;
+                    localtime_s(&tmBuf, &tt);
+                    char ts[64];
+                    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
+                    return ts;
+                };
+                for (size_t i = 0; i < rows.size(); ++i)
                 {
-                    response = "Error: ReadFile failed (GetLastError=" +
-                               std::to_string(GetLastError()) + ")";
-                }
-                CloseHandle(hPipe);
-            }
-
-            delete req;
-
-            // Parse the deltas JSON minimally: extract each record and sort
-            // We look for the deltas array and parse individual objects.
-            struct Rec {
-                std::string key;
-                std::string type;
-                double score;
-                int count7d;
-                int count30d;
-                int countTotal;
-                int64_t lastOpen;
-                int64_t lastEdit;
-            };
-            std::vector<Rec> records;
-
-            // Find "deltas":[
-            auto deltasPos = response.find("\"deltas\":[");
-            if (deltasPos != std::string::npos)
-            {
-                // Simple extraction: scan for each object { ... } inside the array
-                size_t pos = response.find('[', deltasPos) + 1;
-                while (pos < response.size())
-                {
-                    auto objStart = response.find('{', pos);
-                    if (objStart == std::string::npos) break;
-                    auto objEnd = response.find('}', objStart);
-                    if (objEnd == std::string::npos) break;
-
-                    std::string obj = response.substr(objStart, objEnd - objStart + 1);
-
-                    // Extract fields with a simple lambda
-                    auto getStr = [&](const std::string& o, const char* key) -> std::string {
-                        std::string k = std::string("\"" ) + key + "\":\"";
-                        auto p = o.find(k);
-                        if (p == std::string::npos) return "";
-                        p += k.size();
-                        auto e = o.find('"', p);
-                        return (e != std::string::npos) ? o.substr(p, e - p) : "";
-                    };
-                    auto getNum = [&](const std::string& o, const char* key) -> double {
-                        std::string k = std::string("\"" ) + key + "\":";
-                        auto p = o.find(k);
-                        if (p == std::string::npos) return 0.0;
-                        p += k.size();
-                        return strtod(o.c_str() + p, nullptr);
-                    };
-
-                    Rec r;
-                    r.key   = getStr(obj, "entity_key");
-                    r.type  = getStr(obj, "entity_type");
-                    r.score = getNum(obj, "recency_score");
-                    r.count7d    = static_cast<int>(getNum(obj, "open_count_7d"));
-                    r.count30d   = static_cast<int>(getNum(obj, "open_count_30d"));
-                    r.countTotal = static_cast<int>(getNum(obj, "open_count_total"));
-                    r.lastOpen   = static_cast<int64_t>(getNum(obj, "last_open_ts"));
-                    r.lastEdit   = static_cast<int64_t>(getNum(obj, "last_edit_ts"));
-
-                    // Apply entity type filter
-                    bool keep = false;
-                    if (r.type == "file" && pf->file) keep = true;
-                    if (r.type == "app"  && pf->app)  keep = true;
-                    if (r.type == "url"  && pf->url)  keep = true;
-                    if (keep)
-                        records.push_back(r);
-
-                    pos = objEnd + 1;
-                }
-            }
-
-            // Sort by recency_score descending
-            std::sort(records.begin(), records.end(),
-                      [](const Rec& a, const Rec& b) { return a.score > b.score; });
-
-            // Truncate to top N
-            if ((int)records.size() > pf->topN)
-                records.resize(pf->topN);
-
-            // Format as human-readable text
-            std::string output;
-            output += "Top " + std::to_string(records.size()) + " Inferences";
-            output += " (sorted by recency score)\r\n";
-            output += std::string(70, '-') + "\r\n";
-
-            char line[512];
-            for (size_t i = 0; i < records.size(); ++i)
-            {
-                const auto& r = records[i];
-                sprintf_s(line, sizeof(line),
-                    "%3d. [%s] score=%.1f  opens: 7d=%d 30d=%d total=%d\r\n",
-                    (int)(i + 1), r.type.c_str(), r.score,
-                    r.count7d, r.count30d, r.countTotal);
-                output += line;
-
-                // Unescape backslashes for display
-                std::string displayKey = r.key;
-                size_t p2 = 0;
-                while ((p2 = displayKey.find("\\\\", p2)) != std::string::npos)
-                {
-                    displayKey.replace(p2, 2, "\\");
-                    p2 += 1;
-                }
-                output += "     " + displayKey + "\r\n";
-
-                // Show timestamps if non-zero
-                if (r.lastOpen > 0 || r.lastEdit > 0)
-                {
-                    output += "     ";
-                    if (r.lastOpen > 0)
-                    {
-                        time_t t = static_cast<time_t>(r.lastOpen);
-                        struct tm tmBuf;
-                        localtime_s(&tmBuf, &t);
-                        char ts[64];
-                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
-                        output += std::string("last_open=") + ts + "  ";
-                    }
-                    if (r.lastEdit > 0)
-                    {
-                        time_t t = static_cast<time_t>(r.lastEdit);
-                        struct tm tmBuf;
-                        localtime_s(&tmBuf, &t);
-                        char ts[64];
-                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmBuf);
-                        output += std::string("last_edit=") + ts;
-                    }
+                    const WarpJson::Value& r = *rows[i];
+                    sprintf_s(line, sizeof(line), "%3d. [%s] score=%.2f  opens 7d=%lld  active 7d=%lld min  days=%lld\r\n",
+                              (int)(i + 1), r.get("entity_type").asString().c_str(), r.get("score").asDouble(),
+                              (long long)r.get("open_count_7d").asInt64(), (long long)(r.get("active_secs_7d").asInt64() / 60),
+                              (long long)r.get("distinct_days").asInt64());
+                    output += line;
+                    std::string display = r.get("display_name").asString();
+                    output += "     " + (display.empty() ? r.get("entity_key").asString() : display) + "\r\n";
+                    std::string reasons;
+                    for (const std::string& s : r.get("reasons").asStringArray()) reasons += (reasons.empty() ? "" : " | ") + s;
+                    if (!reasons.empty()) output += "     " + reasons + "\r\n";
+                    std::string lo = stamp(r.get("last_open_ts").asInt64()), le = stamp(r.get("last_edit_ts").asInt64());
+                    if (!lo.empty() || !le.empty())
+                        output += "     " + (lo.empty() ? std::string() : "last_open=" + lo + "  ") + (le.empty() ? std::string() : "last_edit=" + le) + "\r\n";
                     output += "\r\n";
                 }
-                output += "\r\n";
+                if (rows.empty()) output += "(No entities match the selected types yet.)\r\n";
             }
-
-            if (records.empty() && deltasPos != std::string::npos)
-                output += "(No inference records match the selected entity types.)\r\n";
-            else if (deltasPos == std::string::npos)
-                output += response;
-
             delete pf;
 
-            // Marshal result back to UI thread
             int wlen = MultiByteToWideChar(CP_UTF8, 0, output.c_str(), -1, nullptr, 0);
             wchar_t* wResult = new wchar_t[wlen];
             MultiByteToWideChar(CP_UTF8, 0, output.c_str(), -1, wResult, wlen);
@@ -1617,7 +2160,6 @@ void OnInferenceButton(HWND hWnd, int id)
     }
     else if (id == IDB_INFER_LOOKUP)
     {
-        // Read the path from the edit control
         wchar_t pathBuf[1024] = {};
         GetWindowTextW(g_hEditInferPath, pathBuf, 1024);
         if (pathBuf[0] == L'\0')
@@ -1625,45 +2167,48 @@ void OnInferenceButton(HWND hWnd, int id)
             SetWindowTextW(g_hResponse, L"Enter a file path, exe path, or URL to look up.");
             return;
         }
-
-        // Convert to UTF-8 for JSON
-        int len = WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, nullptr, 0, nullptr, nullptr);
-        std::string pathUtf8(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, &pathUtf8[0], len, nullptr, nullptr);
-
-        // Escape for JSON
-        std::string escaped;
-        escaped.reserve(pathUtf8.size() + 32);
-        for (char c : pathUtf8)
-        {
-            if (c == '"')       escaped += "\\\"";
-            else if (c == '\\') escaped += "\\\\";
-            else                 escaped += c;
-        }
-
-        std::string request = "{\"op\":\"QueryInferences\",\"paths\":[\"" + escaped + "\"]}";
+        // Scored lookup with reasons and the current-thread boost (API v2), built with the JSON writer.
+        std::string request;
+        WarpJson::Writer w(request);
+        w.BeginObject().KV("op", "ScoreEntities").Key("keys").BeginArray().String(std::wstring(pathBuf)).EndArray()
+         .KV("context", "current").EndObject();
         SendApiQuery(hWnd, request);
     }
 }
 
 void StopSubsystems()
 {
+    if (g_stopping.exchange(true)) return;
+    if (g_startThread.joinable()) g_startThread.join();     // startup must finish before teardown
+    g_subsystemsUp = false;
+    WARP_LOG_INFO("main", "stopping subsystems");
+    if (g_supervisorStop) SetEvent(g_supervisorStop);
+    if (g_supervisorThread.joinable()) g_supervisorThread.join();   // no heartbeat races the shutdown
+    if (g_supervisorStop) { CloseHandle(g_supervisorStop); g_supervisorStop = nullptr; }
+
     g_contextInference.Stop();
     g_llmSummarizer.Stop();
-    g_queryApi.Stop();
-    g_idleDetector.Stop();
-    g_foregroundMonitor.Stop();
-    g_browsingMonitor.Stop();
-    g_appLaunchMonitor.Stop();
-    g_fileMonitor.Stop();
-
+    g_api.Stop();
+    g_focus.Stop();                                          // emits the open focus session
+    g_web.Stop();
     if (g_hWinEventHook)
     {
         UnhookWinEvent(g_hWinEventHook);
         g_hWinEventHook = nullptr;
     }
-    LaunchCorrelator::Instance().Stop();
     ForegroundChangeBroker::Instance().Stop();
-
-    g_db.Close();
+    g_launch.Stop();
+    g_files.Stop();
+    g_clipboard.Stop();
+    g_print.Stop();
+    PresenceMonitor::Instance().Stop();
+    {
+        PresenceRecord r;
+        const int64_t now = NowUtcMs();
+        r.startMs = g_presenceSinceMs.exchange(now);
+        r.endMs = now;
+        r.state = PresenceName();
+        if (r.startMs > 0 && g_store.IsOpen() && !Settings::Instance().IsPaused(now / 1000)) g_store.RecordPresence(std::move(r));
+    }
+    g_store.Close();                                         // drains the writer queue (bounded)
 }

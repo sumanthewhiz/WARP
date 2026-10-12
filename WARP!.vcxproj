@@ -144,7 +144,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -163,7 +163,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -180,7 +180,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -199,7 +199,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -216,7 +216,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -235,9 +235,20 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'!='true'">onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies Condition="'$(HasOrtGenAi)'=='true'">onnxruntime.lib;onnxruntime-genai.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OrtRuntimeDir);$(OrtGenAiRuntimeDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
+  </ItemDefinitionGroup>
+  <!-- All configurations: C++17, SQLite features used by the store (FTS5 search index,
+       math functions), parallel compile. The process runs AsInvoker: the logon scheduled
+       task (registered by the WARP!.exe install verb) runs it with highest privileges for kernel ETW capture,
+       while CLI verbs and manual launches stay unelevated (capture degrades gracefully). -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>SQLITE_ENABLE_FTS5;SQLITE_ENABLE_MATH_FUNCTIONS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
   </ItemDefinitionGroup>
   <!-- Global conditional: when the ORT-GenAI NuGet has been
        restored, propagate WARP_HAS_ORT_GENAI to every C++ compile so
@@ -247,47 +258,85 @@
     <ClCompile>
       <PreprocessorDefinitions>WARP_HAS_ORT_GENAI;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <!-- SEC-1 / PERF-1: the GenAI runtime is delay-loaded, so it is mapped only when the
+         optional refiner is enabled and a missing DLL cannot keep WARP from starting. -->
+    <Link>
+      <DelayLoadDLLs>onnxruntime-genai.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalDependencies>delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="ActivityDatabase.h" />
-    <ClInclude Include="AppLaunchMonitor.h" />
-    <ClInclude Include="ModernBertTokenizer.h" />
-    <ClInclude Include="BrowsingMonitor.h" />
-    <ClInclude Include="UrlExtractor.h" />
+    <ClInclude Include="ActivityStore.h" />
+    <ClInclude Include="AddressBarReader.h" />
+    <ClInclude Include="ApiServer.h" />
+    <ClInclude Include="ClipboardMonitor.h" />
     <ClInclude Include="ContextInference.h" />
+    <ClInclude Include="CrashHandler.h" />
+    <ClInclude Include="DesktopInfo.h" />
+    <ClInclude Include="DocResolver.h" />
+    <ClInclude Include="EntityKey.h" />
+    <ClInclude Include="EntityStore.h" />
     <ClInclude Include="EventContext.h" />
-    <ClInclude Include="FileMonitor.h" />
+    <ClInclude Include="FileCapture.h" />
+    <ClInclude Include="FocusTracker.h" />
     <ClInclude Include="ForegroundChangeBroker.h" />
-    <ClInclude Include="ForegroundMonitor.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="IdleDetector.h" />
-    <ClInclude Include="InferenceEngine.h" />
-    <ClInclude Include="LaunchCorrelator.h" />
+    <ClInclude Include="HistoryEngine.h" />
+    <ClInclude Include="Installer.h" />
+    <ClInclude Include="Json.h" />
+    <ClInclude Include="LaunchCapture.h" />
     <ClInclude Include="LlmSummarizer.h" />
-    <ClInclude Include="SystemProcessClassifier.h" />
-    <ClInclude Include="QueryApi.h" />
+    <ClInclude Include="Logger.h" />
+    <ClInclude Include="ModernBertTokenizer.h" />
+    <ClInclude Include="OfficeMruReader.h" />
+    <ClInclude Include="OneDriveMapper.h" />
+    <ClInclude Include="PresenceMonitor.h" />
+    <ClInclude Include="PrintMonitor.h" />
+    <ClInclude Include="RecentItemsWatcher.h" />
     <ClInclude Include="Resource.h" />
-    <ClInclude Include="targetver.h" />
-    <ClInclude Include="WARP!.h" />
+    <ClInclude Include="Settings.h" />
     <ClInclude Include="sqlite3.h" />
+    <ClInclude Include="SystemProcessClassifier.h" />
+    <ClInclude Include="targetver.h" />
+    <ClInclude Include="UrlCanonicalizer.h" />
+    <ClInclude Include="UsnJournalReader.h" />
+    <ClInclude Include="WARP!.h" />
+    <ClInclude Include="WebCapture.h" />
+    <ClInclude Include="ZoneIdentifier.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ActivityDatabase.cpp" />
-    <ClCompile Include="AppLaunchMonitor.cpp" />
-    <ClCompile Include="BrowsingMonitor.cpp" />
-    <ClCompile Include="UrlExtractor.cpp" />
+    <ClCompile Include="ActivityStore.cpp" />
+    <ClCompile Include="AddressBarReader.cpp" />
+    <ClCompile Include="ApiServer.cpp" />
+    <ClCompile Include="ClipboardMonitor.cpp" />
     <ClCompile Include="ContextInference.cpp" />
+    <ClCompile Include="CrashHandler.cpp" />
+    <ClCompile Include="DesktopInfo.cpp" />
+    <ClCompile Include="DocResolver.cpp" />
+    <ClCompile Include="EntityKey.cpp" />
+    <ClCompile Include="EntityStore.cpp" />
     <ClCompile Include="EventContext.cpp" />
-    <ClCompile Include="FileMonitor.cpp" />
+    <ClCompile Include="FileCapture.cpp" />
+    <ClCompile Include="FocusTracker.cpp" />
     <ClCompile Include="ForegroundChangeBroker.cpp" />
-    <ClCompile Include="ForegroundMonitor.cpp" />
-    <ClCompile Include="IdleDetector.cpp" />
+    <ClCompile Include="HistoryEngine.cpp" />
+    <ClCompile Include="Installer.cpp" />
+    <ClCompile Include="Json.cpp" />
+    <ClCompile Include="LaunchCapture.cpp" />
     <ClCompile Include="LlmSummarizer.cpp" />
-    <ClCompile Include="QueryApi.cpp" />
-    <ClCompile Include="InferenceEngine.cpp" />
-    <ClCompile Include="LaunchCorrelator.cpp" />
+    <ClCompile Include="Logger.cpp" />
+    <ClCompile Include="OfficeMruReader.cpp" />
+    <ClCompile Include="OneDriveMapper.cpp" />
+    <ClCompile Include="PresenceMonitor.cpp" />
+    <ClCompile Include="PrintMonitor.cpp" />
+    <ClCompile Include="RecentItemsWatcher.cpp" />
+    <ClCompile Include="Settings.cpp" />
     <ClCompile Include="SystemProcessClassifier.cpp" />
+    <ClCompile Include="UrlCanonicalizer.cpp" />
+    <ClCompile Include="UsnJournalReader.cpp" />
     <ClCompile Include="WARP!.cpp" />
+    <ClCompile Include="WebCapture.cpp" />
+    <ClCompile Include="ZoneIdentifier.cpp" />
     <ClCompile Include="sqlite3.c">
       <CompileAs>CompileAsC</CompileAs>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

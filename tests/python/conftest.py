@@ -27,7 +27,8 @@ def cpp_source(repo_root) -> dict:
     """
     files = {
         "LlmSummarizer.cpp":  repo_root / "LlmSummarizer.cpp",
-        "InferenceEngine.cpp": repo_root / "InferenceEngine.cpp",
+        "EntityStore.cpp":    repo_root / "EntityStore.cpp",
+        "ActivityStore.h":    repo_root / "ActivityStore.h",
         "ContextInference.cpp": repo_root / "ContextInference.cpp",
     }
     out = {}

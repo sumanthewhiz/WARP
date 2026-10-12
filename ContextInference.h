@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <deque>
+#include <functional>
+#include <unordered_map>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -19,8 +22,10 @@ namespace Ort {
     struct MemoryInfo;
 }
 
-class ActivityDatabase;
-class ForegroundMonitor;
+class ActivityStore;
+class EntityStore;
+class HistoryEngine;
+class FocusTracker;
 
 // One snapshot in the rolling history of "what is the user doing right now?".
 // Each snapshot is composed from the configured lookback window of foreground /
@@ -82,8 +87,8 @@ struct ContextSnapshot
     //                  ppt/pptx in PowerPoint, jpg/png/heic in Photos /
     //                  IrfanView / Paint, cpp/h/json/txt in VS Code /
     //                  Notepad++ / Sublime, pdf in any reader, etc.) plus
-    //                  recently-opened file basenames from FileMonitor.
-    //   * Websites  -- per-tab aggregation of BrowsingMonitor records.
+    //                  recently-opened file basenames from FileCapture.
+    //   * Websites  -- per-tab aggregation of WebCapture records.
     //   * Apps      -- non-file, non-browser foreground apps: communications
     //                  (Outlook / Teams / Slack / Discord / WhatsApp / Zoom),
     //                  media players (Spotify / VLC), terminals, remote
@@ -121,8 +126,27 @@ struct ContextSnapshot
         int         focusSeconds = 0;
         int         pct          = 0; // % of total focus seconds.
         int         threadId     = 0; // Cluster ID this item belongs to (1-based).
+        std::string entityKey;    // Joinable entity key (document/URL when resolved, else app).
     };
     std::vector<AppItem> items;
+
+    // Structured "current task" (INTEL-2): the entities behind this snapshot with keys that
+    // join against ScoreEntities / GetChanges / QueryInferences.
+    struct EntityItem
+    {
+        std::string entityKey;
+        std::string entityType;   // file | url | app
+        std::string display;      // path / URL / app name
+        std::string title;        // cleaned title
+        std::string app;          // friendly app the entity was used in
+        std::string role;         // focus | reference | communication
+        int         activeSecs   = 0;   // clipped active seconds inside the window
+        int64_t     lastActiveTs = 0;
+        double      score        = 0.0; // long-horizon engagement percentile [0,1]
+    };
+    std::vector<EntityItem> entities;
+    int64_t      threadId = 0;          // persistent work-thread id (HistoryEngine), 0 if none
+    std::string  presence;              // active | passive | away | locked | asleep | ""
 };
 
 // =====================================================================
@@ -141,19 +165,22 @@ struct ContextSnapshot
 //     embedding pipeline initializes; otherwise the engine still runs
 //     in a deterministic-only fallback mode.  Pass an empty wstring
 //     to skip the model load entirely.
-//   * Start(db, fg) -- spawns a background thread that wakes every 60 s,
-//     reads the last 15 minutes of activity from `db` plus the live
-//     foreground session from `fg`, composes a summary, and appends it
-//     to history when it materially changes (or every 5 min as a heartbeat
-//     -- whichever comes first).  The "latest" cache is always refreshed.
+//   * Start(store, fg) -- spawns a background (EcoQoS) thread that wakes every
+//     ContextCadenceSeconds (default 60 s), reads the clipped activity intervals of the
+//     last 15 minutes from the ActivityStore plus the live foreground session (with its
+//     resolved document) from `fg`, composes a summary + current_entities[], records the
+//     observation in the HistoryEngine (work threads) and appends it to history when it
+//     materially changes (or every 5 min as a heartbeat).  Material changes are also
+//     persisted so history survives restarts.  The "latest" cache is always refreshed.
 //   * Stop()     -- joins the thread.
 //
 // Query API
-//   * GetRecentContext(category, windowSecs)
+//   * GetRecentContext(category, windowSecs, includeVector)
 //         JSON: {"recent_context": <snapshot>}  (single snapshot)
-//   * GetRecentContexts(n, category, windowSecs)
-//         JSON: {"recent_contexts":[...]} newest first.
-//   * ClearHistory() -- empties history (called on user "Clear").
+//   * GetRecentContexts(n, category, windowSecs, includeVector)
+//         JSON: {"recent_contexts":[...]} newest first (memory, then persisted history).
+//   * GetCurrentContextJson(includeVector) -- presence, foreground, latest snapshot.
+//   * ClearHistory() -- empties history (called on user "Clear"); epoch-safe.
 //
 // `category` is one of "all" (default), "files", "websites", "apps".
 // When supplied (and not "all") the response carries ONLY that
@@ -163,17 +190,16 @@ struct ContextSnapshot
 //
 // `windowSecs` is the activity lookback window in seconds (default
 // 15 * 60 = 900).  When the requested window equals the default and a
-// fresh cached snapshot is available, that cache is returned; for any
-// other window the snapshot is composed on demand against the
-// requested span.  For GetRecentContexts the rolling history is also
-// filtered by timestamp to only include entries whose snapshot
-// timestamp falls within the last `windowSecs`.
+// fresh cached snapshot is available, that cache is returned; any
+// other window is composed on demand WITHOUT the LLM, cached with a TTL
+// (60 s up to 2 h, 5 min up to 24 h, 15 min beyond) and serialized so
+// identical concurrent requests coalesce.  For GetRecentContexts the
+// history is filtered by timestamp to the last `windowSecs`.
 //
-// History cap is 1440 (24 h at one snapshot per minute, with material-
+// In-memory history cap is 1440 (24 h at one snapshot per minute, with material-
 // change dedup the actual count is usually much smaller).
 // =====================================================================
 class LlmSummarizer;   // optional polishing layer, see LlmSummarizer.h
-class InferenceEngine; // confidence-weighted per-entity store, see InferenceEngine.h
 
 class ContextInference
 {
@@ -183,48 +209,45 @@ public:
 
     bool Init(const std::wstring& modelsDir = L"");
     bool IsModelLoaded() const { return m_modelReady; }
-    void Start(ActivityDatabase* db, ForegroundMonitor* fg);
+    void Start(ActivityStore* store, FocusTracker* fg);
     void Stop();
 
-    // Wire in (or detach with nullptr) the optional LLM polishing
-    // layer.  Caller retains ownership of the LlmSummarizer instance
-    // and must not destroy it while ContextInference is running.
-    // Calling this AFTER Start() is fine -- the polisher is read
-    // under a lock on every snapshot compose.
+    // Wire in (or detach with nullptr) the optional LLM refiner.  Caller retains ownership.
+    // The LLM only runs when enabled in Settings (off by default), on AC power unless
+    // LlmAllowedOnBattery, for the combined "all" summary, and only when its inputs changed.
     void SetLlmSummarizer(LlmSummarizer* llm);
 
-    // Wire in (or detach with nullptr) the confidence-weighted
-    // per-entity inference store.  When connected, ComposeSnapshot
-    // boosts each in-window entry's effective focus seconds using
-    // the entity's historical `recency_score` + `open_count_7d` from
-    // the store, so:
-    //   (a) the dynamic context inference and the per-entity
-    //       inference engine agree on which entities matter;
-    //   (b) we don't recompute popularity / recency signals from
-    //       scratch when the inference engine has already done it
-    //       incrementally on every raw event;
-    //   (c) cluster ranking + theme weighting incorporate the
-    //       confidence weighting that was applied at event-capture
-    //       time (a 30 s focus session that the noise filter scored
-    //       confidence=0.3 contributes less than a confidence=1.0
-    //       session of the same length, because the InferenceEngine
-    //       already amortized that confidence into open_count_7d).
-    // Caller retains ownership; must not destroy while
-    // ContextInference is running.  Calling this AFTER Start() is
-    // fine -- the engine is read under a lock on every compose.
-    void SetInferenceEngine(InferenceEngine* eng);
+    // Per-entity engagement store (EntityStore).  When connected, in-window ranking gets a
+    // BOUNDED historical tie-breaker (<= 1.5x, INTEL-4) from each entity's engagement percentile,
+    // and current_entities[] carry their long-horizon score.
+    void SetEntityStore(EntityStore* es);
+
+    // Historical layer: each compose is recorded as a work-thread observation and material
+    // changes are persisted so history survives restarts (HIST-1, INTEL-6).
+    void SetHistoryEngine(HistoryEngine* h);
+
+    // Returns the current presence state ("active", "passive", "away", "locked", "asleep").
+    void SetPresenceProvider(std::function<std::string()> provider);
 
     void RunOnce();
     std::string GetRecentContext (const std::string& category    = "all",
-                                  int64_t            windowSecs  = 0);
+                                  int64_t            windowSecs  = 0,
+                                  bool               includeVector = true);
     std::string GetRecentContexts(int                count,
                                   const std::string& category    = "all",
-                                  int64_t            windowSecs  = 0);
+                                  int64_t            windowSecs  = 0,
+                                  bool               includeVector = true);
+    // Structured current context (API v2 GetCurrentContext): presence, foreground, current
+    // entities with keys/roles/active seconds, combined summary.  JSON object.
+    std::string GetCurrentContextJson(bool includeVector = false);
     void ClearHistory();
 
+    // Embedding helper shared with the history layer (thread labels). Empty if no model.
+    std::vector<float> EmbedText(const std::string& text) { return Embed(text); }
+
 private:
-    ActivityDatabase*  m_db = nullptr;
-    ForegroundMonitor* m_fg = nullptr;
+    ActivityStore*     m_store = nullptr;
+    FocusTracker*      m_fg = nullptr;
     std::thread        m_thread;
     std::atomic<bool>  m_running{ false };
     HANDLE             m_stopEvent = nullptr;
@@ -233,6 +256,17 @@ private:
     ContextSnapshot              m_latest;       // Always the most recent compute.
     bool                         m_haveLatest = false;
     std::mutex                   m_mutex;
+    std::atomic<uint64_t>        m_epoch{ 0 };   // bumped by ClearHistory: in-flight composes are discarded
+
+    // On-demand (non-default window) snapshots, cached with a TTL and composed one at a
+    // time so identical concurrent requests coalesce (INTEL-7).
+    std::mutex                                      m_composeMtx;
+    std::unordered_map<int64_t, ContextSnapshot>    m_windowCache;
+
+    // Embedding LRU cache keyed by text (INTEL-6).
+    std::mutex                                                  m_embedMtx;
+    std::unordered_map<std::string, std::vector<float>>        m_embedCache;
+    std::deque<std::string>                                     m_embedOrder;
 
     // ---- Sentence-encoder embedding pipeline (optional) ----------------
     // Single supported model: ibm-granite/granite-embedding-small-english-r2
@@ -258,19 +292,15 @@ private:
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;
 
-    // Optional confidence-weighted per-entity inference store.
-    // Borrowed; not owned.  When non-null, ComposeSnapshot uses
-    // `Lookup()` on every snapshot to bias the per-entry ranking
-    // and clustering by historical recency + popularity.  When
-    // null, ranking falls back to in-window focus seconds only --
-    // identical to pre-v5.14 behaviour, so unit tests / tooling
-    // that constructs a ContextInference without wiring the engine
-    // continues to work.
-    InferenceEngine*     m_inference = nullptr;
+    // Borrowed collaborators (nullptr in unit tests / tooling).
+    EntityStore*         m_entities = nullptr;
+    HistoryEngine*       m_historyEngine = nullptr;
+    std::function<std::string()> m_presence;
 
-    // Compute a 384-dim L2-normalized sentence embedding for `text`.
+    // Compute a 384-dim L2-normalized sentence embedding for `text` (LRU-cached).
     // Returns an empty vector if the model is not loaded or inference fails.
     std::vector<float> Embed(const std::string& text);
+    std::vector<float> EmbedUncached(const std::string& text);
 
     // Cosine similarity for two L2-normalized vectors (== dot product).
     static float CosineSim(const std::vector<float>& a,
@@ -278,8 +308,9 @@ private:
 
     void TimerLoop();
     // Compose a fresh snapshot covering the last `windowSecs` seconds of
-    // activity.  Pass 0 to use the default 15-minute window.
-    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0);
+    // activity.  Pass 0 to use the default 15-minute window.  `allowLlm` is false for
+    // on-demand windows (the LLM never runs on a client's request path).
+    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true);
 
     // Decide whether `snap` is materially different from the last-appended
     // history entry.  Used to keep `GetRecentContexts` from returning rows
@@ -287,7 +318,7 @@ private:
     bool ShouldAppendToHistory(const ContextSnapshot& snap) const;
 
     static std::string SnapshotToJsonObject(const ContextSnapshot& s,
-                                            const std::string& category = "all");
+                                            const std::string& category = "all",
+                                            bool includeVector = true);
     static std::string WideToUtf8(const std::wstring& w);
-    static std::string EscapeJson(const std::string& s);
 };

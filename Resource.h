@@ -18,7 +18,22 @@
 #define IDM_TRAY_OPEN			200
 #define IDM_TRAY_EXIT			201
 #define IDC_STATUS_TEXT			202
+#define IDM_TRAY_STATUS			210
+#define IDM_TRAY_PAUSE_1H		211
+#define IDM_TRAY_PAUSE_TOMORROW	212
+#define IDM_TRAY_RESUME			213
+#define IDM_TRAY_PURGE_15M		214
+#define IDM_TRAY_PURGE_1H		215
+#define IDM_TRAY_PURGE_TODAY	216
+#define IDM_TRAY_PURGE_ALL		217
 #define IDT_EVICTION_TIMER		301
+#define IDT_SUPERVISOR_TIMER	303
+
+// Private window messages
+#define WM_APP_START_UI			(WM_APP + 1)   // worker -> UI: install hooks / UI-thread capture
+#define WM_APP_READY			(WM_APP + 2)   // startup finished
+#define WM_APP_SHOW				(WM_APP + 3)   // a second instance asked us to show the window
+#define WM_APP_SHUTDOWN			(WM_APP + 4)   // installer / shutdown event asked us to exit
 
 // API test buttons (predefined windows)
 #define IDB_QUERY_15M			400

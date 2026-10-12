@@ -1,9 +1,14 @@
 #include "framework.h"
 #include "ContextInference.h"
 #include "LlmSummarizer.h"
-#include "InferenceEngine.h"
-#include "ActivityDatabase.h"
-#include "ForegroundMonitor.h"
+#include "ActivityStore.h"
+#include "EntityStore.h"
+#include "EntityKey.h"
+#include "HistoryEngine.h"
+#include "FocusTracker.h"
+#include "Settings.h"
+#include "Json.h"
+#include "Logger.h"
 
 #include <onnxruntime_cxx_api.h>
 
@@ -19,8 +24,7 @@
 #include <unordered_set>
 #include <sstream>
 
-// Recompute the snapshot every 60 seconds (cheap -- no ML).  The 15-minute
-// rolling window stays in lock-step regardless.
+// Default compose cadence (seconds); Settings::ContextCadenceSeconds overrides (15..3600).
 static const DWORD CONTEXT_INTERVAL_MS = 60 * 1000;
 
 // Activity window: last 15 minutes.
@@ -198,7 +202,7 @@ static std::string ExeBasenameUtf8(const std::wstring& exeNameW)
 }
 
 // True if this exe should be ignored when computing the user's context.
-// These are the same shell/system processes ForegroundMonitor already
+// These are the same shell/system processes FocusTracker already
 // filters from emission; we list them again here as defense-in-depth
 // against any that did leak through.
 static bool IsBoringExe(const std::wstring& exeLower)
@@ -253,7 +257,7 @@ static bool IsFileAppFriendlyName(const std::string& friendlyName)
         // Image viewers / light editors
         "photos", "irfanview", "paint", "paint.net", "gimp",
         "windows photo viewer",
-        // Virtual entries injected from FileMonitor
+        // Virtual entries injected from file activity (FileCapture)
         "document", "file",
     };
     std::string lower = Utf8Lower(friendlyName);
@@ -620,7 +624,7 @@ static std::string CleanTitle(const std::string& title,
 
 // =====================================================================
 //  Per-app aggregation.  Combines focus events (from DB) + the live
-//  active session (from ForegroundMonitor) + a browsing-title override
+//  active session (from FocusTracker) + a browsing-title override
 //  for browser apps.
 // =====================================================================
 struct AppAgg
@@ -632,8 +636,8 @@ struct AppAgg
     int          totalFocusSecs = 0;
     // Effective focus seconds used for ranking, clustering, and
     // per-cluster theme weighting.  Defaults to totalFocusSecs but is
-    // boosted by ApplyInferenceBoost() using the InferenceEngine's
-    // recency_score + open_count_7d so the dynamic context inference
+    // boosted by ApplyInferenceBoost() using the EntityStore's
+    // short-horizon engagement percentile (bounded to <= 1.5x) so the dynamic context inference
     // pipeline agrees with the per-entity weighted store on which
     // entries matter.  Raw totalFocusSecs is left untouched so the
     // user-facing focus_seconds / dominant_focus_pct / items[].pct
@@ -643,13 +647,18 @@ struct AppAgg
     std::string  bestTitle;         // cleaned, ready for one-liner
     std::string  rawTitle;          // original window title before cleaning
     bool         isBrowser      = false;
-    // Lookup key carriers for InferenceEngine.  Populated only on
-    // entries whose primary identity isn't the exe (FileMonitor virtuals
+    // Lookup key carriers for the EntityStore.  Populated only on
+    // entries whose primary identity isn't the exe (file-activity virtuals
     // identify by file path; per-tab website virtuals identify by URL
     // when available).  Empty on regular focused-app entries -- those
     // fall back to lowercased(exePath).
-    std::wstring filePath;          // populated for FileMonitor virts only
+    std::wstring filePath;          // populated for file-activity virts only
     std::wstring webUrl;            // populated for browsing virts only
+    // Resolved entity identity (INTEL-1): the document / URL this entry is about when the
+    // focus session resolved one, else empty (the entry is about the app itself).
+    std::string  entityKey;
+    std::string  entityType;        // file | url | ""
+    std::wstring entityDisplay;
 };
 
 // =====================================================================
@@ -767,7 +776,7 @@ static const std::unordered_set<std::string>& BrandNoise()
         // like "documents", "downloads", "pictures", "music", "videos"
         // are intentionally NOT here -- they appear all the time in
         // legitimate file titles ("Quarterly Documents Review.docx",
-        // "Photo Pictures from Trip.jpg", etc.).  The FileMonitor
+        // "Photo Pictures from Trip.jpg", etc.).  The file-activity
         // augmentation now strictly allowlists extensions and skips
         // when a real file app has focus, so we don't need to nuke
         // these tokens at the theme layer too.
@@ -1022,6 +1031,29 @@ bool ContextInference::Init(const std::wstring& modelsDir)
 // =====================================================================
 std::vector<float> ContextInference::Embed(const std::string& text)
 {
+    if (!m_modelReady || !m_ortSession || text.empty()) return {};
+    {
+        std::lock_guard<std::mutex> lk(m_embedMtx);
+        auto it = m_embedCache.find(text);
+        if (it != m_embedCache.end()) return it->second;
+    }
+    std::vector<float> v = EmbedUncached(text);
+    if (v.empty()) return v;
+    std::lock_guard<std::mutex> lk(m_embedMtx);
+    if (m_embedCache.emplace(text, v).second)
+    {
+        m_embedOrder.push_back(text);
+        while (m_embedOrder.size() > 1024)
+        {
+            m_embedCache.erase(m_embedOrder.front());
+            m_embedOrder.pop_front();
+        }
+    }
+    return v;
+}
+
+std::vector<float> ContextInference::EmbedUncached(const std::string& text)
+{
     if (!m_modelReady || !m_ortSession) return {};
 
     std::vector<int64_t> inputIds =
@@ -1081,10 +1113,10 @@ float ContextInference::CosineSim(const std::vector<float>& a,
     return dot;
 }
 
-void ContextInference::Start(ActivityDatabase* db, ForegroundMonitor* fg)
+void ContextInference::Start(ActivityStore* store, FocusTracker* fg)
 {
     if (m_running) return;
-    m_db = db;
+    m_store = store;
     m_fg = fg;
     m_running = true;
     ResetEvent(m_stopEvent);
@@ -1097,10 +1129,22 @@ void ContextInference::SetLlmSummarizer(LlmSummarizer* llm)
     m_llm = llm;
 }
 
-void ContextInference::SetInferenceEngine(InferenceEngine* eng)
+void ContextInference::SetEntityStore(EntityStore* es)
 {
     std::lock_guard<std::mutex> lk(m_mutex);
-    m_inference = eng;
+    m_entities = es;
+}
+
+void ContextInference::SetHistoryEngine(HistoryEngine* h)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_historyEngine = h;
+}
+
+void ContextInference::SetPresenceProvider(std::function<std::string()> provider)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_presence = std::move(provider);
 }
 
 void ContextInference::Stop()
@@ -1113,26 +1157,122 @@ void ContextInference::Stop()
 
 void ContextInference::TimerLoop()
 {
+    SetThreadDescription(GetCurrentThread(), L"WARP context");
+    // Background inference is never latency-critical: let Windows schedule it on efficient
+    // cores at low frequency (EcoQoS, PERF-2).
+    THREAD_POWER_THROTTLING_STATE pt = {};
+    pt.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    pt.StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &pt, sizeof(pt));
+
+    // Identity of what is in front right now (empty while away / nothing tracked).
+    auto focusSignature = [this]() -> std::wstring
+    {
+        FocusTracker::ActiveSession a;
+        if (m_fg && m_fg->GetCurrentSession(a)) return a.exePath + L"\x1f" + a.windowTitle;
+        return std::wstring();
+    };
+
+    std::wstring lastFg = focusSignature();
     RunOnce();
+    // Read AFTER each compose: RunOnce's own work-thread write (HistoryEngine::PersistThread) advances
+    // the change sequence and must not count as new activity, or no cycle would ever be skipped.
+    int64_t lastSeq = m_store ? m_store->CurrentChangeSeq() : 0;
+    ULONGLONG lastRunTick = GetTickCount64();
     while (m_running)
     {
-        DWORD r = WaitForSingleObject(m_stopEvent, CONTEXT_INTERVAL_MS);
+        int cadence = Settings::Instance().Get().contextCadenceSeconds;
+        if (cadence < 15) cadence = 15;
+        if (cadence > 3600) cadence = 3600;
+        // PERF-2: half as often on battery or with battery saver on.
+        SYSTEM_POWER_STATUS power = {};
+        if (GetSystemPowerStatus(&power) && (power.ACLineStatus == 0 || power.SystemStatusFlag == 1))
+            cadence = (std::min)(cadence * 2, 3600);
+        DWORD r = WaitForSingleObject(m_stopEvent, (DWORD)cadence * 1000);
         if (r == WAIT_OBJECT_0 || !m_running) break;
+        // PERF-1: the optional refiner does not stay resident while unused.
+        LlmSummarizer* llm = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            llm = m_llm;
+        }
+        if (llm) llm->UnloadIfIdle(10 * 60 * 1000);
+        if (Settings::Instance().IsPaused(static_cast<int64_t>(std::time(nullptr)))) continue;
+        // PERF-2: nothing new committed and the same window in front => the context has not
+        // changed materially; refresh at most every 5 minutes (in-progress dwell still grows).
+        const int64_t seq = m_store ? m_store->CurrentChangeSeq() : 0;
+        const std::wstring fg = focusSignature();
+        if (seq == lastSeq && fg == lastFg && GetTickCount64() - lastRunTick < 5ull * 60 * 1000) continue;
         RunOnce();
+        lastSeq = m_store ? m_store->CurrentChangeSeq() : 0;
+        lastFg = fg;
+        lastRunTick = GetTickCount64();
     }
 }
 
 void ContextInference::RunOnce()
 {
-    if (!m_db) return;
+    if (!m_store || !m_store->IsOpen()) return;
+    const uint64_t epoch = m_epoch.load();
+    uint64_t histGeneration = UINT64_MAX;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_historyEngine) histGeneration = m_historyEngine->Generation();   // before any input is read
+    }
 
-    ContextSnapshot snap = ComposeSnapshot();
+    ContextSnapshot snap;
+    try
+    {
+        snap = ComposeSnapshot(0, true);
+    }
+    catch (const std::exception& e)
+    {
+        WARP_LOG_ERROR("context", "compose failed: %s", e.what());
+        return;
+    }
+
+    HistoryEngine* hist = nullptr;
+    bool append = false;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_epoch.load() != epoch) return;          // history was cleared while composing
+        append = ShouldAppendToHistory(snap);
+        hist = m_historyEngine;
+    }
+
+    // Record the observation in the historical layer (thread assignment every cycle;
+    // persistence only on material change).
+    if (hist)
+    {
+        SnapshotInput in;
+        in.ts = snap.timestamp;
+        in.windowSecs = snap.windowSeconds;
+        for (const auto& e : snap.entities)
+        {
+            SnapshotEntity se;
+            se.entityKey = e.entityKey;
+            se.entityType = e.entityType;
+            se.display = WarpJson::Utf8ToWide(e.display);
+            se.activeSecs = e.activeSecs;
+            in.entities.push_back(std::move(se));
+        }
+        in.label = snap.summary.empty() ? std::string() : snap.summary.front();
+        if (!in.label.empty()) in.embedding = Embed(in.label);
+        in.model = snap.model;
+        in.persist = append;
+        in.generation = histGeneration;
+        if (append) in.json = SnapshotToJsonObject(snap, "all", false);
+        if (m_epoch.load() != epoch) return;          // cleared while embedding: never persist pre-clear activity
+        snap.threadId = hist->RecordSnapshot(in);
+    }
 
     std::lock_guard<std::mutex> lk(m_mutex);
+    if (m_epoch.load() != epoch) return;
     m_latest     = snap;
     m_haveLatest = true;
 
-    if (ShouldAppendToHistory(snap))
+    if (append)
     {
         m_history.push_back(snap);
         if (m_history.size() > HISTORY_MAX)
@@ -1174,55 +1314,28 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 
 // ApplyInferenceBoost
 // ---------------------------------------------------------------------
-// Bias each entry's `weightedFocusSecs` by its historical recency and
-// 7-day open-count, sourced from the confidence-weighted InferenceEngine
-// store.  This is what makes the dynamic context inference and the
-// per-entity inference engine agree on which entries matter, rather
-// than each computing its own popularity / recency signal from scratch.
+// Bias each entry's `weightedFocusSecs` by the entity's historical engagement from the
+// EntityStore, as a BOUNDED tie-breaker (INTEL-4):
 //
-// Boost formula (per-entry):
+//     weightedFocusSecs = totalFocusSecs * (1 + 0.5 * shortHorizonPercentile)   // 1.0x .. 1.5x
 //
-//     boost = 1.0
-//           + log1p(recency_score / 50.0)     // ~ 0 .. 1.85 (cap 200/255)
-//           + log1p(open_count_7d / 5.0)      // ~ 0 .. 2.40 (cap ~50/7d)
-//     weightedFocusSecs = totalFocusSecs * boost
-//
-// Range: 1.0x (entity unknown to InferenceEngine or never opened)
-//        .. ~5.3x (high-recency, frequently-opened entity).
-//
-// Properties:
-//   * In-window focus seconds remain the dominant signal.  A 5-minute
-//     focused session (300 s) boosted to 5.3x = 1590 still loses to a
-//     10-minute focused session (600 s) at the default 1.0x baseline.
-//     Boost only swings the order when in-window focus is comparable.
-//   * The boost is multiplicative, so an entity with zero in-window
-//     focus (totalFocusSecs == 0) gets weightedFocusSecs == 0 too --
-//     historical signal never *invents* presence, it only re-ranks
-//     entries that are already in the bag.
-//   * No-op when m_inference is null (unit tests / pre-v5.14 wiring).
-//
-// `keyOf` extracts the InferenceEngine entity key from an AppAgg:
-// lowercased(filePath) for file virts, lowercased(webUrl|bestTitle)
-// for browsing virts, lowercased(exePath) for regular focused apps.
+// The previous unbounded formula (1 + ln(1+recency/50) + ln(1+open7d/5), up to ~5x) let
+// habitual apps (mail, chat, the browser) float above what the user is doing right now.
+// With a 1.5x ceiling, 10 focused minutes always beat 6 minutes on a "popular" entity,
+// while equally-focused entries are ordered by how much they matter to the user.
+// Multiplicative: zero in-window focus stays zero (history never invents presence).
 static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
-                                InferenceEngine*                     eng,
+                                EntityStore*                         es,
                                 std::function<std::string(const AppAgg&)> keyOf)
 {
-    if (!eng || bag.empty())
-    {
-        // Make sure weightedFocusSecs is at least seeded with the raw
-        // value so downstream ranking still has a usable score.
-        for (auto& a : bag)
-            if (a.weightedFocusSecs == 0.0)
-                a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
-        return;
-    }
+    for (auto& a : bag)
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+    if (!es || bag.empty()) return;
 
     std::vector<std::string> keys;
-    keys.reserve(bag.size());
     std::vector<size_t> keyToIdx;
+    keys.reserve(bag.size());
     keyToIdx.reserve(bag.size());
-
     for (size_t i = 0; i < bag.size(); ++i)
     {
         std::string k = keyOf(bag[i]);
@@ -1230,28 +1343,25 @@ static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
         keys.push_back(std::move(k));
         keyToIdx.push_back(i);
     }
-
-    // Seed weightedFocusSecs with the raw value before applying boost,
-    // so any entries that don't get a key (or come back empty from the
-    // store) still have a sensible default.
-    for (auto& a : bag)
-        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
-
     if (keys.empty()) return;
 
-    std::vector<InferenceRecord> records = eng->Lookup(keys);
-    for (size_t i = 0; i < records.size() && i < keyToIdx.size(); ++i)
+    std::vector<EntityScore> scores = es->Score(keys, "short", 0, false);
+    for (size_t i = 0; i < scores.size() && i < keyToIdx.size(); ++i)
     {
-        const InferenceRecord& rec = records[i];
-        if (rec.entityKey.empty()) continue;   // unknown to InferenceEngine
-
-        double recBoost  = std::log1p(rec.recencyScore / 50.0);
-        double freqBoost = std::log1p(rec.openCount7d  / 5.0);
-        double boost     = 1.0 + recBoost + freqBoost;
-
+        if (!scores[i].found) continue;
         AppAgg& a = bag[keyToIdx[i]];
-        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * boost;
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * (1.0 + 0.5 * scores[i].score);
     }
+}
+
+// Entity key used for boosting / joining: the resolved document / URL when known, else the app.
+static std::string EntityKeyOfAgg(const AppAgg& a)
+{
+    if (!a.entityKey.empty()) return a.entityKey;
+    if (!a.filePath.empty()) return EntityKey::FileKey(a.filePath);
+    if (!a.webUrl.empty()) return EntityStore::NormalizeKey(a.webUrl);
+    if (!a.exePath.empty()) return StoreUtil::AppEntityKey(a.exePath, std::wstring());
+    return std::string();
 }
 
 // =====================================================================
@@ -1486,7 +1596,7 @@ static std::vector<std::string> ComposeRichListing(
     return { "User is " + std::string(verb) + " " + body + appClause };
 }
 
-ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
+ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
 
@@ -1495,12 +1605,33 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     snap.windowEndTs   = snap.timestamp;
     snap.windowStartTs = snap.timestamp - windowSecs;
     snap.windowSeconds = windowSecs;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_presence) snap.presence = m_presence();
+    }
 
-    // ---- Gather raw signals ---------------------------------------
-    auto focus  = m_db->QueryAppFocusCustomSeconds(windowSecs);
-    auto browse = m_db->QueryBrowsingCustomSeconds(windowSecs);
-    auto apps   = m_db->QueryAppLaunchesCustomSeconds(windowSecs);
-    auto files  = m_db->QueryFilesCustomSeconds(windowSecs);
+    // ---- Gather raw signals (bounded reads, INTEL-7) ----------------
+    // Focus sessions are intervals: take every session OVERLAPPING the window and clip it,
+    // scaling its active (non-idle) seconds to the in-window part (INTEL-3). A 3-hour session
+    // that ended 14 minutes ago therefore contributes 60 s to a 15-minute window, not 10,800 s.
+    const int kMaxRows = 20000;
+    auto focus  = m_store->QueryFocus(snap.windowStartTs, snap.windowEndTs, kMaxRows);
+    auto browse = m_store->QueryBrowsing(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
+    auto apps   = m_store->QueryLaunches(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
+    auto files  = m_store->QueryFiles(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
+    for (auto& f : focus)
+    {
+        int64_t s = (std::max)(f.startTs, snap.windowStartTs);
+        int64_t e = (std::min)(f.endTs > 0 ? f.endTs : f.timestampUtc, snap.windowEndTs);
+        int64_t wall = (std::max<int64_t>)(1, (f.endTs > 0 && f.startTs > 0) ? f.endTs - f.startTs : f.durationSecs);
+        double activeFrac = f.activeSecs > 0 ? (std::min)(1.0, (double)f.activeSecs / (double)wall) : 1.0;
+        f.durationSecs = e > s ? (int)std::lround((double)(e - s) * activeFrac) : 0;
+        f.timestampUtc = e;
+    }
+    // A deleted / renamed-away file is not "being worked on" (INTEL-1).
+    files.erase(std::remove_if(files.begin(), files.end(), [](const FileActivity& f) {
+        return f.isDir || f.action == L"DELETE" || f.action == L"RENAME" || f.confidence < 0.2;
+    }), files.end());
 
     std::unordered_set<std::string> sigs;
     if (!focus.empty())  sigs.insert("app_focus");
@@ -1514,14 +1645,11 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                                         + apps.size()  + files.size());
 
     // ---- Live-session overlay (critical for accuracy) -------------
-    // ForegroundMonitor only emits a row on focus *change*.  If the user
-    // has been parked in the same window for the whole 15-min slice we
-    // would see an empty focus list -- so we ask the monitor for the
-    // currently-tracked session and synthesize a virtual focus row from
-    // it that overlaps with the rolling window.
+    // FocusTracker only emits a row when a session ends.  Ask it for the session in
+    // progress (with its resolved document) and add the in-window part as a virtual row.
     if (m_fg)
     {
-        ForegroundMonitor::ActiveSession active;
+        FocusTracker::ActiveSession active;
         if (m_fg->GetCurrentSession(active))
         {
             int64_t startTs = active.startedAtUtcSecs > 0
@@ -1529,43 +1657,50 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 : (snap.timestamp - active.durationSoFarSecs);
             int64_t effectiveStart = (std::max)(startTs, snap.windowStartTs);
             int     dwellInWindow  = static_cast<int>(snap.timestamp - effectiveStart);
+            if (active.durationSoFarSecs > 0 && active.activeSecsSoFar >= 0 && active.activeSecsSoFar < active.durationSoFarSecs)
+                dwellInWindow = (int)std::lround(dwellInWindow * ((double)active.activeSecsSoFar / active.durationSoFarSecs));
             if (dwellInWindow > 0)
             {
                 AppFocusActivity virt{};
                 virt.id           = -1;
-                virt.timestampUtc = effectiveStart;
+                virt.timestampUtc = snap.timestamp;
+                virt.startTs      = effectiveStart;
+                virt.endTs        = snap.timestamp;
                 virt.exeName      = active.exeName;
                 virt.exePath      = active.exePath;
                 virt.windowTitle  = active.windowTitle;
                 virt.durationSecs = dwellInWindow;
+                virt.activeSecs   = dwellInWindow;
+                virt.docKey       = active.docKey;
+                virt.docDisplay   = active.docDisplay;
+                virt.docType      = active.docType;
                 focus.push_back(virt);
-                if (snap.signalTypes.empty() || snap.signalTypes[0] != "app_focus")
+                if (std::find(snap.signalTypes.begin(), snap.signalTypes.end(), "app_focus") == snap.signalTypes.end())
                 {
-                    if (std::find(snap.signalTypes.begin(),
-                                  snap.signalTypes.end(),
-                                  "app_focus") == snap.signalTypes.end())
-                    {
-                        snap.signalTypes.push_back("app_focus");
-                        std::sort(snap.signalTypes.begin(), snap.signalTypes.end());
-                    }
+                    snap.signalTypes.push_back("app_focus");
+                    std::sort(snap.signalTypes.begin(), snap.signalTypes.end());
                 }
                 snap.activityCount += 1;
             }
         }
     }
 
-    // ---- Aggregate by exe -----------------------------------------
-    std::unordered_map<std::string, AppAgg> byExe; // key: lowercased exe basename
+    // ---- Aggregate by (app, document) -----------------------------
+    // INTEL-1: the unit is the document / URL the focus session resolved to, not the exe, so
+    // five files edited in VS Code are five entries with their own dwell time.
+    std::unordered_map<std::string, AppAgg> byExe; // key: exe basename [+ "|" + entity key]
 
     int totalFocusSecs = 0;
 
     for (const auto& f : focus)
     {
+        if (f.durationSecs <= 0) continue;
         std::wstring exeLower  = ToLower(f.exeName);
         std::wstring pathLower = ToLower(f.exePath);
         if (IsBoringExe(exeLower)) continue;
 
         std::string key = ExeBasenameUtf8(exeLower);
+        if (!f.docKey.empty()) key += "|" + f.docKey;
         auto& agg = byExe[key];
         if (agg.exeName.empty())
         {
@@ -1575,9 +1710,14 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             agg.friendlyName = cls.first;
             agg.verb         = cls.second;
             agg.isBrowser    = IsBrowser(exeLower, pathLower);
+            agg.entityKey    = f.docKey;
+            agg.entityType   = f.docType == "file" ? "file" : (f.docKey.empty() ? "" : "url");
+            agg.entityDisplay = f.docDisplay;
+            if (agg.entityType == "url") agg.webUrl = f.docDisplay;
+            else if (agg.entityType == "file") agg.filePath = f.docDisplay;
         }
-        agg.totalFocusSecs += (std::max)(0, f.durationSecs);
-        totalFocusSecs     += (std::max)(0, f.durationSecs);
+        agg.totalFocusSecs += f.durationSecs;
+        totalFocusSecs     += f.durationSecs;
         if (f.timestampUtc > agg.lastSeenTs)
         {
             agg.lastSeenTs = f.timestampUtc;
@@ -1587,11 +1727,9 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         }
     }
 
-    // ---- Browser title override -----------------------------------
-    // Browser window titles often look like "GitHub - Microsoft Edge" --
-    // BrowsingMonitor extracts a cleaner title that's more representative
-    // of the active tab.  For each browser app, find the most recent
-    // browsing record from any browser instance and prefer that title.
+    // ---- Browser title fallback -----------------------------------
+    // Only for browser entries whose focus session did NOT resolve a URL, and only from the
+    // same browser (the old code gave every browser the newest title from any browser).
     if (!browse.empty())
     {
         std::sort(browse.begin(), browse.end(),
@@ -1600,40 +1738,42 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                   });
         for (auto& kv : byExe)
         {
-            if (!kv.second.isBrowser) continue;
-            // Pick the most recent browsing event (any browser); good
-            // enough for the one-liner.  Could be tightened to match
-            // browser by name, but Chrome/Edge/Firefox all share the
-            // "title bar" layout so cross-matching is acceptable.
+            AppAgg& agg = kv.second;
+            if (!agg.isBrowser || !agg.entityKey.empty()) continue;
+            std::string friendlyLower = AsciiLower(agg.friendlyName);
+            std::string exeLower = ExeBasenameUtf8(ToLower(agg.exeName));
             for (const auto& b : browse)
             {
+                std::string br = AsciiLower(WideToUtf8(b.browser));
+                if (!br.empty() && br.find(friendlyLower) == std::string::npos && friendlyLower.find(br) == std::string::npos &&
+                    br.find(exeLower) == std::string::npos)
+                    continue;
                 std::string t = WideToUtf8(b.title);
                 if (t.empty()) continue;
-                kv.second.rawTitle  = t;
-                kv.second.bestTitle = CleanTitle(t, kv.second.friendlyName);
+                agg.rawTitle  = t;
+                agg.bestTitle = CleanTitle(t, agg.friendlyName);
+                if (!b.url.empty()) agg.webUrl = b.url;
                 break;
             }
         }
     }
 
-    snap.focusSeconds = totalFocusSecs;
+    snap.focusSeconds = (std::min)(totalFocusSecs, (int)windowSecs);
 
     // ---- Score & rank apps ----------------------------------------
     std::vector<AppAgg> ranked;
     ranked.reserve(byExe.size());
     for (auto& kv : byExe) ranked.push_back(std::move(kv.second));
 
-    // Apply confidence-weighted historical boost from the InferenceEngine
-    // BEFORE sorting so the order reflects both in-window focus and
-    // historical recency / popularity.  Key: lowercased(exePath); regular
-    // focused-app entries identify by exe, so neither filePath nor
-    // webUrl is set here -- they're populated only on the FileMonitor
-    // and per-tab virtuals built later for the per-facet bags.
-    ApplyInferenceBoost(ranked, m_inference,
-        [](const AppAgg& a) -> std::string {
-            if (a.exePath.empty()) return std::string();
-            return InferenceEngine::NormalizeEntityKey(a.exePath);
-        });
+    // Bounded historical tie-breaker (INTEL-4), keyed by the resolved entity when known.
+    EntityStore* entities = nullptr;
+    LlmSummarizer* llm = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        entities = m_entities;
+        llm = m_llm;
+    }
+    ApplyInferenceBoost(ranked, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
 
     std::sort(ranked.begin(), ranked.end(),
               [](const AppAgg& a, const AppAgg& b){
@@ -1797,7 +1937,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             //                  virtual entries it appears in.  Uses
             //                  weightedFocusSecs (not raw seconds) so a historically
             //                  popular but currently low-focus entry still gets
-            //                  some token-level weight via the InferenceEngine boost.
+            //                  some token-level weight via the EntityStore boost.
             std::unordered_map<std::string, int>          freq;
             std::unordered_map<std::string, int>          titlesWith;
             std::unordered_map<std::string, double>       focusWeight;
@@ -2464,7 +2604,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     if (clusterOf.empty()) clusterOf.assign(ranked.size(), -1);
     snap.model = m_modelReady ? m_modelName : std::string("deterministic");
 
-    // ---- Structured breakdown (per-app top 5) ---------------------
+    // ---- Structured breakdown (per-entry top 5) -------------------
     for (size_t i = 0; i < ranked.size() && snap.items.size() < MAX_ITEMS; ++i)
     {
         ContextSnapshot::AppItem it;
@@ -2479,7 +2619,40 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         it.threadId     = (i < clusterOf.size() && clusterOf[i] >= 0)
                               ? clusterOf[i] + 1
                               : 0;
+        it.entityKey    = EntityKeyOfAgg(ranked[i]);
         snap.items.push_back(std::move(it));
+    }
+
+    // ---- Current entities (INTEL-2) --------------------------------
+    // Joinable keys + roles + clipped active seconds: what a search app boosts on.
+    {
+        static const char* const kCommApps[] = { "Outlook", "Teams", "Slack", "Discord", "WhatsApp", "Zoom", "Skype", "Telegram", "Mail" };
+        std::vector<std::string> keys;
+        for (size_t i = 0; i < ranked.size() && snap.entities.size() < 12; ++i)
+        {
+            const AppAgg& a = ranked[i];
+            ContextSnapshot::EntityItem e;
+            e.entityKey = EntityKeyOfAgg(a);
+            if (e.entityKey.empty()) continue;
+            e.entityType = !a.entityType.empty() ? a.entityType : (!a.filePath.empty() ? "file" : (!a.webUrl.empty() ? "url" : "app"));
+            e.display = !a.entityDisplay.empty() ? WideToUtf8(a.entityDisplay)
+                      : (!a.filePath.empty() ? WideToUtf8(a.filePath) : (!a.webUrl.empty() ? WideToUtf8(a.webUrl) : a.friendlyName));
+            e.title = a.bestTitle;
+            e.app = a.friendlyName;
+            bool comm = false;
+            for (const char* c : kCommApps) if (a.friendlyName.find(c) != std::string::npos) { comm = true; break; }
+            e.role = comm ? "communication" : (snap.entities.size() < 2 && a.totalFocusSecs >= 30 ? "focus" : "reference");
+            e.activeSecs = a.totalFocusSecs;
+            e.lastActiveTs = a.lastSeenTs;
+            keys.push_back(e.entityKey);
+            snap.entities.push_back(std::move(e));
+        }
+        if (entities && !keys.empty())
+        {
+            std::vector<EntityScore> sc = entities->Score(keys, "long", 0, false);
+            for (size_t i = 0; i < sc.size() && i < snap.entities.size(); ++i)
+                if (sc[i].found) snap.entities[i].score = sc[i].score;
+        }
     }
 
     if (ranked.empty())
@@ -2569,7 +2742,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     }
 
     // Augment Files with recently-touched file basenames captured by
-    // FileMonitor.  Two design constraints:
+    // FileCapture.  Two design constraints:
     //
     //   (a) Strict allowlist of user-content extensions only.  The
     //       previous "deny .dll/.log/.tmp/.bak" was too loose -- it
@@ -2582,11 +2755,11 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     //
     //   (b) Skip augmentation entirely when a real file app is
     //       actively in focus.  When the user is sitting in Excel
-    //       editing a spreadsheet, the FileMonitor pool is irrelevant
+    //       editing a spreadsheet, the file-activity pool is irrelevant
     //       background noise -- typing in Excel generates dozens of
     //       writes to OneDrive caches, Office auto-recover files,
     //       and similar transient artefacts that we *cannot* fully
-    //       filter at the FileMonitor layer because some of those
+    //       filter at the capture layer because some of those
     //       artefacts are real user content (e.g. Outlook .ost).
     //       Bypassing the augmentation when there's an obvious
     //       focused-file signal preserves correctness for the
@@ -2607,7 +2780,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         // one extractable content token across their titles.  When
         // they don't (titles like "Word", "Excel", "PowerPoint"
         // alone), let augmentation through so the actual filename
-        // from FileMonitor surfaces in the summary.
+        // from FileCapture surfaces in the summary.
         bool haveFocusedFileApp        = false;
         bool focusedAppHasUsefulTitle  = false;
         for (const auto& a : rankedFiles)
@@ -2665,7 +2838,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 seenLowered.insert(AsciiLower(a.bestTitle));
 
             // Track each unique basename + its full path so the
-            // InferenceEngine boost can look up the per-file record
+            // EntityStore boost can look up the per-file record
             // (which is keyed by the full lowercased path).  Pick the
             // most-recently-seen full path when several map to the
             // same basename.
@@ -2727,9 +2900,9 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.verb            = "Editing";
                 agg.bestTitle       = v.base;
                 agg.rawTitle        = v.base;
-                agg.filePath        = v.fullPath;   // for InferenceEngine lookup
+                agg.filePath        = v.fullPath;   // for EntityStore lookup
                 // Cap synthetic focus at 15 s per virt regardless of
-                // FileMonitor hit volume.  Real foreground sessions
+                // file-activity hit volume.  Real foreground sessions
                 // (typically 30 s -- many minutes) thus dominate the
                 // theme even when several virts are present.
                 int synth = (std::min)(15, (std::max)(3, v.hits * 3));
@@ -2738,20 +2911,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.isBrowser       = false;
                 rankedFiles.push_back(std::move(agg));
             }
-            // Apply InferenceEngine boost across the whole rankedFiles
-            // bag (real focused-file apps that were already boosted in
-            // the combined-ranked pass + the FileMonitor virtuals just
-            // added).  File apps get keyed by exePath; file virtuals
-            // by filePath.  Re-boosting the real apps is cheap (cache
-            // hit) and keeps the bag internally consistent.
-            ApplyInferenceBoost(rankedFiles, m_inference,
-                [](const AppAgg& a) -> std::string {
-                    if (!a.filePath.empty())
-                        return InferenceEngine::NormalizeEntityKey(a.filePath);
-                    if (!a.exePath.empty())
-                        return InferenceEngine::NormalizeEntityKey(a.exePath);
-                    return std::string();
-                });
+            // Apply the bounded EntityStore boost across the whole rankedFiles
+            // bag (real focused-file entries + the file-activity virtuals just
+            // added), keyed by resolved document / file path / app.
+            ApplyInferenceBoost(rankedFiles, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
             std::sort(rankedFiles.begin(), rankedFiles.end(),
                       [](const AppAgg& a, const AppAgg& b){
                           if (a.weightedFocusSecs != b.weightedFocusSecs)
@@ -2761,7 +2924,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
         }
     }
 
-    // rankedApps was split off `ranked` before the FileMonitor-virt
+    // rankedApps was split off `ranked` before the file-activity virt
     // augmentation, but ApplyInferenceBoost on `ranked` already
     // populated weightedFocusSecs on each entry (file apps and
     // non-file apps alike).  No need to re-run the boost on
@@ -2775,21 +2938,43 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                   return a.lastSeenTs > b.lastSeenTs;
               });
 
-    // Build the Websites bag from BrowsingMonitor records.  Each
-    // unique tab title becomes a virtual AppAgg with focus weighted
-    // by visit count (we don't have per-tab dwell time -- visit count
-    // is a reasonable proxy for "interest").  Cap at 16 entries so we
-    // don't blow ONNX cost on hyper-active browsing windows.
+    // Build the Websites bag: real dwell from browser focus sessions that resolved a page,
+    // else WebCapture visit rows (dwell attributed per window, or a small per-visit proxy).
+    // Cap at 16 entries so we don't blow ONNX cost on hyper-active browsing windows.
     std::vector<AppAgg> rankedWeb;
     {
-        std::unordered_map<std::string, AppAgg> webByTitle;
-        for (const auto& b : browse)
+        // Real dwell first: browser focus sessions that resolved a URL entity (INTEL-1).
+        std::unordered_map<std::string, AppAgg> webByTitle;   // key: entity key, else lowercased title
+        std::unordered_set<std::string> withRealDwell;
+        for (const auto& a : ranked)
         {
+            if (!a.isBrowser || a.entityKey.empty() || a.totalFocusSecs <= 0) continue;
+            AppAgg w = a;
+            w.friendlyName = "Browser";
+            w.verb = "Reading";
+            webByTitle[a.entityKey] = w;
+            withRealDwell.insert(a.entityKey);
+        }
+        // Visits without a focus session. WebCapture closes a page when the next one appears in the
+        // same window, so a page's on-screen time travels on the NEXT row of that window
+        // (dwellSecs). The page still open in a window, and rows from unknown windows, get a
+        // small per-visit proxy.
+        std::vector<const BrowsingActivity*> ordered;
+        ordered.reserve(browse.size());
+        for (const auto& b : browse) ordered.push_back(&b);
+        std::sort(ordered.begin(), ordered.end(), [](const BrowsingActivity* x, const BrowsingActivity* y) {
+            if (x->windowId != y->windowId) return x->windowId < y->windowId;
+            if (x->timestampUtc != y->timestampUtc) return x->timestampUtc < y->timestampUtc;
+            return x->id < y->id;
+        });
+        for (size_t i = 0; i < ordered.size(); ++i)
+        {
+            const BrowsingActivity& b = *ordered[i];
             std::string raw = WideToUtf8(b.title);
             if (raw.empty()) continue;
             std::string clean = CleanTitle(raw, "Browser");
             if (clean.empty()) continue;
-            std::string key = AsciiLower(clean);
+            std::string key = !b.entityKey.empty() ? b.entityKey : AsciiLower(clean);
             auto& agg = webByTitle[key];
             if (agg.bestTitle.empty())
             {
@@ -2798,39 +2983,23 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
                 agg.friendlyName = "Browser";
                 agg.verb         = "Reading";
                 agg.isBrowser    = true;
+                if (!b.entityKey.empty()) { agg.entityKey = b.entityKey; agg.entityType = "url"; }
             }
-            // Record the URL of the most recent visit so the
-            // InferenceEngine lookup uses URL (preferred) -- which
-            // matches how OnBrowsingEvent stores browsing entries
-            // (URL if non-empty, title otherwise).
             if (b.timestampUtc > agg.lastSeenTs)
             {
                 agg.lastSeenTs = b.timestampUtc;
-                if (!b.url.empty()) agg.webUrl = b.url;
+                if (!b.url.empty()) { agg.webUrl = b.url; agg.entityDisplay = b.url; }
             }
-            agg.totalFocusSecs += 30;
+            if (withRealDwell.count(key)) continue;
+            int shown = 0;
+            if (b.windowId != 0 && i + 1 < ordered.size() && ordered[i + 1]->windowId == b.windowId)
+                shown = ordered[i + 1]->dwellSecs;
+            agg.totalFocusSecs += shown > 0 ? (std::min)(shown, 300) : 30;
         }
         rankedWeb.reserve(webByTitle.size());
         for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
 
-        // Apply InferenceEngine boost: prefer URL key, fall back to
-        // lowercased title (matches InferenceEngine::OnBrowsingEvent's
-        // "url.empty()? title : url" key choice).
-        ApplyInferenceBoost(rankedWeb, m_inference,
-            [](const AppAgg& a) -> std::string {
-                if (!a.webUrl.empty())
-                    return InferenceEngine::NormalizeEntityKey(a.webUrl);
-                if (!a.bestTitle.empty())
-                {
-                    // bestTitle is already in UTF-8 mixed case; lowercase
-                    // it to match the InferenceEngine key form.
-                    std::string lo = a.bestTitle;
-                    for (char& c : lo)
-                        if (c >= 'A' && c <= 'Z') c = char(c + 32);
-                    return lo;
-                }
-                return std::string();
-            });
+        ApplyInferenceBoost(rankedWeb, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
 
         std::sort(rankedWeb.begin(), rankedWeb.end(),
                   [](const AppAgg& a, const AppAgg& b){
@@ -2842,44 +3011,43 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
     }
 
     // ---- Canonical per-facet summaries: rich deterministic listing --
-    // Keep the cluster->theme token output as the LLM topic hint
-    // (themeFiles/Websites/Apps); surface the richer listing.
-    std::vector<std::string> themeFiles    = composeOneLinerFromBag(rankedFiles, /*categoryMode=*/true).lines;
-    std::vector<std::string> themeWebsites = composeOneLinerFromBag(rankedWeb,   /*categoryMode=*/true).lines;
-    std::vector<std::string> themeApps     = composeOneLinerFromBag(rankedApps,  /*categoryMode=*/true).lines;
+    // Themes are only a fallback / LLM hint now: compute a facet's theme only when the
+    // listing yields nothing for a non-empty bag (INTEL-6: no embedding work thrown away).
+    auto facetListing = [&](const std::vector<AppAgg>& bag, const char* cat) -> std::vector<std::string> {
+        std::vector<std::string> lst = ComposeRichListing(bag, cat, std::vector<std::string>());
+        if (lst.empty() && !bag.empty())
+            lst = ComposeRichListing(bag, cat, composeOneLinerFromBag(bag, /*categoryMode=*/true).lines);
+        return lst;
+    };
+    snap.summaryFiles    = facetListing(rankedFiles, "files");
+    snap.summaryWebsites = facetListing(rankedWeb,   "websites");
+    snap.summaryApps     = facetListing(rankedApps,  "apps");
 
-    snap.summaryFiles    = ComposeRichListing(rankedFiles, "files",    themeFiles);
-    snap.summaryWebsites = ComposeRichListing(rankedWeb,   "websites", themeWebsites);
-    snap.summaryApps     = ComposeRichListing(rankedApps,  "apps",     themeApps);
-
-    // ---- LLM refinement (gated) -----------------------------------
-    // The canonical per-facet summary is now the rich deterministic
-    // listing produced above.  When the Qwen3-0.6B "brain" model is
-    // loaded we still give it a chance to produce nicer prose, but its
-    // output only REPLACES the listing when it is at least as grounded
-    // in the actual window titles as the listing is -- measured by
-    // granite cosine to the joined titles.
-    //
-    // Why gated rather than unconditional (the pre-v5.17 behaviour):
-    // an A/B harness over 12 realistic scenarios (Qwen3-0.6B + granite,
-    // see commit message) showed the unconditional LLM override was a
-    // net LOSS -- the 0.6B model drops activity breadth, its output is
-    // rejected by the grounding gate 75-90% of the time (so the user
-    // was usually shown the terse token-theme), and even when accepted
-    // it is, on average, LESS grounded than the listing (granite
-    // cos-to-titles 0.906 vs 0.920).  The gate keeps the rare genuine
-    // LLM win (cleaner prose for a single-topic facet) while flooring
-    // the common case at the much-better listing.  The cluster->theme
-    // token output (themeAll / themeFiles / ...) is passed as the LLM
-    // topic hint, exactly as before.
-    snap.modelPolish = (m_llm && m_llm->IsLoaded())
-                          ? m_llm->ModelName()
-                          : std::string("(not loaded)");
-    if (m_llm && m_llm->IsLoaded())
+    // ---- LLM refinement (opt-in, gated) -----------------------------
+    // The rich deterministic listing is canonical (v5.17 A/B: the 0.6B model matched it at
+    // best, at ~4.6 s of CPU per call). The LLM therefore runs only when ALL of these hold:
+    //   * enabled in Settings (LlmEnabled, off by default) and loaded,
+    //   * a periodic compose (never on a client's request path, INTEL-7),
+    //   * on AC power unless LlmAllowedOnBattery, and while the user is at the machine (PERF-1),
+    //   * the combined "all" summary only, and only when its inputs changed,
+    // and its output replaces the listing only when the groundedness gate can actually be
+    // evaluated (granite loaded, all three embeddings present) and passes (INTEL-5).
+    WarpSettings cfg = Settings::Instance().Get();
+    bool onBattery = false;
     {
-        // Combined "all" -- merged top-N items already in snap.items.
+        SYSTEM_POWER_STATUS ps = {};
+        if (GetSystemPowerStatus(&ps)) onBattery = ps.ACLineStatus == 0;
+    }
+    const bool userPresent = snap.presence.empty() || snap.presence == "active" || snap.presence == "passive";
+    const bool llmLoaded = llm && llm->IsAvailable();
+    snap.modelPolish = llmLoaded ? llm->ModelName() : std::string("(not loaded)");
+    const bool llmWillRun = llmLoaded && allowLlm && cfg.llmEnabled && userPresent &&
+                            (!onBattery || cfg.llmAllowedOnBattery) && m_modelReady;
+    if (llmWillRun)
+    {
         std::vector<LlmActivityItem> llmItemsAll;
         llmItemsAll.reserve(snap.items.size());
+        std::string inputSig;
         for (const auto& it : snap.items)
         {
             LlmActivityItem li;
@@ -2888,99 +3056,55 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
             li.rawTitle     = it.rawTitle;
             li.focusSeconds = it.focusSeconds;
             li.pct          = it.pct;
+            inputSig += it.app + "\x1f" + it.title + "\x1e";
             llmItemsAll.push_back(std::move(li));
         }
 
-        // Per-facet projection from the corresponding bag.  `pct` is
-        // recomputed relative to the *facet* total focus so a single
-        // dominant Files entry reads as "100% of files focus" rather
-        // than "12% of global focus".  Cap each facet's item list at
-        // kMaxPromptItems-equivalent (5) so the prompt stays small.
-        auto bagToLlmItems = [](const std::vector<AppAgg>& bag)
-            -> std::vector<LlmActivityItem>
+        // Re-use the previous refinement when the inputs are unchanged.
+        static std::mutex s_llmMtx;
+        static std::string s_lastSig;
+        static std::vector<std::string> s_lastListing, s_lastOutput;
+        bool reused = false;
         {
-            std::vector<LlmActivityItem> out;
-            if (bag.empty()) return out;
-            int64_t total = 0;
-            for (const auto& a : bag) total += a.totalFocusSecs;
-            const size_t cap = (std::min)(bag.size(), static_cast<size_t>(5));
-            out.reserve(cap);
-            for (size_t i = 0; i < cap; ++i)
+            std::lock_guard<std::mutex> lk(s_llmMtx);
+            if (!s_lastSig.empty() && s_lastSig == inputSig && s_lastListing == snap.summary)
             {
-                const AppAgg& a = bag[i];
-                LlmActivityItem li;
-                li.app          = a.friendlyName;
-                li.title        = a.bestTitle;
-                li.rawTitle     = a.rawTitle;
-                li.focusSeconds = a.totalFocusSecs;
-                li.pct = (total > 0)
-                         ? static_cast<int>(
-                               (100.0 * a.totalFocusSecs) / total + 0.5)
-                         : 0;
-                out.push_back(std::move(li));
+                if (!s_lastOutput.empty()) snap.summary = s_lastOutput;
+                reused = true;
             }
-            return out;
-        };
+        }
 
-        std::vector<LlmActivityItem> llmItemsFiles    = bagToLlmItems(rankedFiles);
-        std::vector<LlmActivityItem> llmItemsWebsites = bagToLlmItems(rankedWeb);
-        std::vector<LlmActivityItem> llmItemsApps     = bagToLlmItems(rankedApps);
-
-        // Joiner used by the groundedness gate.
-        auto joinLines = [](const std::vector<std::string>& v) -> std::string {
-            std::string s;
-            for (size_t i = 0; i < v.size(); ++i)
-            {
-                if (i) s += ". ";
-                s += v[i];
-            }
-            return s;
-        };
-
-        // Helper: run the LLM for one facet.  The LLM output replaces
-        // the rich listing only when it (a) survives the LLM's own
-        // grounding / anti-copy gates AND (b) is at least as grounded
-        // in the window titles as the listing -- granite cosine to the
-        // joined item titles, with a small tolerance so genuinely
-        // nicer prose isn't rejected for a trivial grounding dip.
-        auto runFacet = [&](std::vector<std::string>&        canonical,
-                            const std::vector<std::string>&  hint,
-                            const std::vector<LlmActivityItem>& facetItems,
-                            const char*                       category)
+        if (!reused && !llmItemsAll.empty())
         {
-            if (facetItems.empty()) return;
-            auto generated = m_llm->Polish(hint, facetItems, category);
-            if (generated.empty()) return;
-
-            // Groundedness gate (only when the granite encoder is
-            // available; otherwise keep the listing -- we can't score).
-            if (m_modelReady)
+            auto joinLines = [](const std::vector<std::string>& v) -> std::string {
+                std::string s;
+                for (size_t i = 0; i < v.size(); ++i) { if (i) s += ". "; s += v[i]; }
+                return s;
+            };
+            std::vector<std::string> listing = snap.summary;
+            std::vector<std::string> accepted;
+            std::vector<std::string> generated = llm->Polish(themeAll, llmItemsAll, "all");
+            if (!generated.empty())
             {
                 std::string titles;
-                for (const auto& it : facetItems)
+                for (const auto& it : llmItemsAll)
                 {
                     if (!titles.empty()) titles += ". ";
                     titles += it.title.empty() ? it.rawTitle : it.title;
                 }
                 std::vector<float> eT = Embed(titles);
                 std::vector<float> eG = Embed(joinLines(generated));
-                std::vector<float> eC = Embed(joinLines(canonical));
-                if (!eT.empty() && !eG.empty() && !eC.empty())
-                {
-                    float cosG = CosineSim(eG, eT);
-                    float cosC = CosineSim(eC, eT);
-                    // Reject the LLM rewrite when it is meaningfully
-                    // less grounded than the listing.
-                    if (cosG + 0.02f < cosC) return;
-                }
+                std::vector<float> eC = Embed(joinLines(listing));
+                // INTEL-5: no score => no override (the old code fell through to `canonical = generated`).
+                if (!eT.empty() && !eG.empty() && !eC.empty() && CosineSim(eG, eT) + 0.02f >= CosineSim(eC, eT))
+                    accepted = generated;
             }
-            canonical = generated;
-        };
-
-        runFacet(snap.summary,         themeAll,      llmItemsAll,      "all");
-        runFacet(snap.summaryFiles,    themeFiles,    llmItemsFiles,    "files");
-        runFacet(snap.summaryWebsites, themeWebsites, llmItemsWebsites, "websites");
-        runFacet(snap.summaryApps,     themeApps,     llmItemsApps,     "apps");
+            if (!accepted.empty()) snap.summary = accepted;
+            std::lock_guard<std::mutex> lk(s_llmMtx);
+            s_lastSig = inputSig;
+            s_lastListing = listing;
+            s_lastOutput = accepted;
+        }
     }
 
     // ---- Granite translator: embed the canonical summary -----------
@@ -3021,103 +3145,73 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs)
 //  Query API
 // =====================================================================
 std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
-                                                   const std::string& category)
+                                                   const std::string& category,
+                                                   bool includeVector)
 {
-    // Resolve the top-level `summary` surface based on the requested
-    // category and decide which per-category fields to emit.
-    //
-    //   * category == "all": the combined summary is surfaced as
-    //     `summary` and the three per-category summaries are *also*
-    //     emitted (so a single "All" round-trip carries the data the
-    //     UI dropdown can switch between without re-querying).
-    //
-    //   * category == "files" / "websites" / "apps": only the
-    //     matching per-category summary is emitted -- as the top-level
-    //     `summary`.  The other two categories and the combined
-    //     "all" summary are *not* serialized, keeping the response
-    //     focused on what the consumer asked for.
-    auto emitArray = [&](std::ostringstream& out,
-                         const std::vector<std::string>& lines) {
-        out << "[";
-        for (size_t i = 0; i < lines.size(); ++i)
-        {
-            if (i) out << ",";
-            out << "\"" << EscapeJson(lines[i]) << "\"";
-        }
-        out << "]";
+    // category == "all": combined summary as `summary` plus the three per-category summaries.
+    // category == "files" / "websites" / "apps": only that category's summary, as `summary`.
+    const std::vector<std::string>* topSummary = &s.summary;
+    if (category == "files")         topSummary = &s.summaryFiles;
+    else if (category == "websites") topSummary = &s.summaryWebsites;
+    else if (category == "apps")     topSummary = &s.summaryApps;
+
+    // One compliant writer (API-7): every control character escaped, invalid UTF-8 (e.g. a
+    // title cut mid-sequence, INTEL-8) replaced by U+FFFD, NaN written as null.
+    std::string out;
+    WarpJson::Writer w(out);
+    auto lines = [&w](const char* key, const std::vector<std::string>& v) {
+        w.Key(key).BeginArray();
+        for (const std::string& l : v) w.String(l);
+        w.EndArray();
     };
-
-    const std::vector<std::string>* topSummary         = &s.summary;
-    if (category == "files")
-    {
-        topSummary         = &s.summaryFiles;
-    }
-    else if (category == "websites")
-    {
-        topSummary         = &s.summaryWebsites;
-    }
-    else if (category == "apps")
-    {
-        topSummary         = &s.summaryApps;
-    }
-
-    std::ostringstream o;
-    o << "{"
-      << "\"timestamp\":"        << s.timestamp
-      << ",\"window_start\":"    << s.windowStartTs
-      << ",\"window_end\":"      << s.windowEndTs
-      << ",\"window_seconds\":"  << s.windowSeconds
-      << ",\"category\":\""      << EscapeJson(category) << "\""
-      << ",\"summary\":";
-    emitArray(o, *topSummary);
-
+    w.BeginObject()
+     .KV("timestamp", s.timestamp)
+     .KV("window_start", s.windowStartTs)
+     .KV("window_end", s.windowEndTs)
+     .KV("window_seconds", s.windowSeconds)
+     .KV("category", category);
+    lines("summary", *topSummary);
     if (category == "all")
     {
-        // Emit all three per-category summaries alongside the combined.
-        o << ",\"summary_files\":";    emitArray(o, s.summaryFiles);
-        o << ",\"summary_websites\":"; emitArray(o, s.summaryWebsites);
-        o << ",\"summary_apps\":";     emitArray(o, s.summaryApps);
+        lines("summary_files", s.summaryFiles);
+        lines("summary_websites", s.summaryWebsites);
+        lines("summary_apps", s.summaryApps);
     }
-
-    o << ",\"activity_count\":" << s.activityCount
-      << ",\"focus_seconds\":"  << s.focusSeconds
-      << ",\"dominant_focus_pct\":" << s.dominantPct
-      << ",\"confidence\":"     << s.confidence
-      << ",\"thread_count\":"   << s.threadCount
-      << ",\"model\":\""        << EscapeJson(s.model) << "\""
-      << ",\"model_polish\":\"" << EscapeJson(s.modelPolish) << "\""
-      << ",\"signal_types\":[";
-    for (size_t i = 0; i < s.signalTypes.size(); ++i)
+    w.KV("activity_count", (int64_t)s.activityCount)
+     .KV("focus_seconds", (int64_t)s.focusSeconds)
+     .KV("dominant_focus_pct", (int64_t)s.dominantPct)
+     .KV("confidence", s.confidence)
+     .KV("thread_count", (int64_t)s.threadCount)
+     .KV("thread_id", s.threadId)
+     .KV("presence", s.presence)
+     .KV("model", s.model)
+     .KV("model_polish", s.modelPolish);
+    lines("signal_types", s.signalTypes);
+    if (includeVector)
     {
-        if (i) o << ",";
-        o << "\"" << EscapeJson(s.signalTypes[i]) << "\"";
+        w.Key("summary_embedding").BeginArray();
+        for (float f : s.summaryEmbedding) w.Double(std::round((double)f * 1e6) / 1e6);
+        w.EndArray();
     }
-    o << "],\"summary_embedding\":[";
-    // Compact comma-separated floats with 6-decimal precision.  Always
-    // emitted (empty array when the embedding model isn't loaded) so
-    // downstream consumers can rely on the field being present.
-    for (size_t i = 0; i < s.summaryEmbedding.size(); ++i)
+    w.Key("items").BeginArray();
+    for (const auto& it : s.items)
     {
-        if (i) o << ",";
-        char buf[24];
-        std::snprintf(buf, sizeof(buf), "%.6f", s.summaryEmbedding[i]);
-        o << buf;
+        w.BeginObject().KV("app", it.app).KV("exe", it.exe).KV("title", it.title).KV("raw_title", it.rawTitle)
+         .KV("focus_seconds", (int64_t)it.focusSeconds).KV("pct", (int64_t)it.pct).KV("thread_id", (int64_t)it.threadId);
+        if (!it.entityKey.empty()) w.KV("entity_key", it.entityKey);
+        w.EndObject();
     }
-    o << "],\"items\":[";
-    for (size_t i = 0; i < s.items.size(); ++i)
+    w.EndArray();
+    w.Key("current_entities").BeginArray();
+    for (const auto& e : s.entities)
     {
-        if (i) o << ",";
-        const auto& it = s.items[i];
-        o << "{\"app\":\""        << EscapeJson(it.app)
-          << "\",\"exe\":\""      << EscapeJson(it.exe)
-          << "\",\"title\":\""    << EscapeJson(it.title)
-          << "\",\"raw_title\":\""<< EscapeJson(it.rawTitle)
-          << "\",\"focus_seconds\":" << it.focusSeconds
-          << ",\"pct\":"  << it.pct
-          << ",\"thread_id\":" << it.threadId << "}";
+        w.BeginObject().KV("entity_key", e.entityKey).KV("entity_type", e.entityType).KV("display", e.display)
+         .KV("title", e.title).KV("app", e.app).KV("role", e.role).KV("active_secs_in_window", (int64_t)e.activeSecs)
+         .KV("last_active_ts", e.lastActiveTs).KV("score", e.score).KV("thread_id", s.threadId).EndObject();
     }
-    o << "]}";
-    return o.str();
+    w.EndArray();
+    w.EndObject();
+    return out;
 }
 
 // Normalize the requested category to one of the four known values.
@@ -3164,83 +3258,137 @@ static int64_t NormalizeWindowSecs(int64_t requested)
 }
 
 std::string ContextInference::GetRecentContext(const std::string& category,
-                                               int64_t            windowSecs)
+                                               int64_t            windowSecs,
+                                               bool               includeVector)
 {
     std::string cat = NormalizeCategory(category);
     int64_t     win = NormalizeWindowSecs(windowSecs);
 
-    // For the default window we serve the cached `m_latest` snapshot
-    // (refreshed by the 60-second timer).  For any non-default window
-    // we compose fresh on demand against the requested span.
+    // Default window: the cached snapshot from the periodic compose. Other windows are
+    // composed on demand WITHOUT the LLM, cached with a TTL proportional to the window and
+    // serialized so identical concurrent requests coalesce (INTEL-7).
     ContextSnapshot fresh;
     bool            useFresh = false;
-    if (win != 900 && m_db)
+    if (win != 900 && m_store && m_store->IsOpen())
     {
-        fresh    = ComposeSnapshot(win);
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        const int64_t ttl = win <= 7200 ? 60 : (win <= 86400 ? 300 : 900);
+        const uint64_t epoch = m_epoch.load();
+        std::lock_guard<std::mutex> ck(m_composeMtx);
+        auto it = m_windowCache.find(win);
+        if (it != m_windowCache.end() && now - it->second.timestamp < ttl)
+            fresh = it->second;
+        else
+        {
+            fresh = ComposeSnapshot(win, /*allowLlm=*/false);
+            fresh.threadId = m_historyEngine ? m_historyEngine->CurrentThreadId() : 0;
+            if (m_epoch.load() == epoch) m_windowCache[win] = fresh;
+        }
         useFresh = true;
     }
 
     std::lock_guard<std::mutex> lk(m_mutex);
-    std::ostringstream o;
-    o << "{\"recent_context\":";
-    if (useFresh)
-        o << SnapshotToJsonObject(fresh, cat);
-    else if (m_haveLatest)
-        o << SnapshotToJsonObject(m_latest, cat);
-    else
-        o << "null";
-    o << ",\"category\":\"" << cat << "\""
-      << ",\"window_seconds\":" << win
-      << ",\"history_count\":" << m_history.size() << "}";
-    return o.str();
+    std::string out;
+    WarpJson::Writer w(out);
+    w.BeginObject().Key("recent_context");
+    if (useFresh)              w.Raw(SnapshotToJsonObject(fresh, cat, includeVector));
+    else if (m_haveLatest)     w.Raw(SnapshotToJsonObject(m_latest, cat, includeVector));
+    else                       w.Null();
+    w.KV("category", cat).KV("window_seconds", win).KV("history_count", (int64_t)m_history.size()).EndObject();
+    return out;
 }
 
 std::string ContextInference::GetRecentContexts(int                count,
                                                 const std::string& category,
-                                                int64_t            windowSecs)
+                                                int64_t            windowSecs,
+                                                bool               includeVector)
 {
     if (count <= 0)  count = 10;
     if (count > 200) count = 200;
     std::string cat = NormalizeCategory(category);
     int64_t     win = NormalizeWindowSecs(windowSecs);
 
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Filter history by timestamp: only return snapshots whose
-    // `timestamp` falls within the requested lookback window.  This
-    // gives the natural "show me what I've been doing in the last 1 h
-    // / 24 h / 7 d / ..." semantics regardless of the underlying
-    // per-snapshot compute window (which stays at the default 15 min
-    // for the rolling history thread).
+    // Only snapshots whose timestamp falls inside the requested lookback window.
     int64_t now    = static_cast<int64_t>(std::time(nullptr));
     int64_t cutoff = now - win;
 
-    std::vector<const ContextSnapshot*> latestFirst;
-    for (auto it = m_history.rbegin();
-         it != m_history.rend() && (int)latestFirst.size() < count;
-         ++it)
+    std::vector<std::string> rows;
+    int64_t oldestInMemory = INT64_MAX;
+    size_t historyCount = 0;
+    HistoryEngine* hist = nullptr;
     {
-        if (it->timestamp < cutoff) break;
-        latestFirst.push_back(&*it);
+        std::lock_guard<std::mutex> lk(m_mutex);
+        historyCount = m_history.size();
+        hist = m_historyEngine;
+        for (auto it = m_history.rbegin(); it != m_history.rend() && (int)rows.size() < count; ++it)
+        {
+            if (it->timestamp < cutoff) break;
+            rows.push_back(SnapshotToJsonObject(*it, cat, includeVector));
+            oldestInMemory = it->timestamp;
+        }
+    }
+    // History persisted by earlier runs (INTEL-6): fill the remainder for the "all" view.
+    int persisted = 0;
+    if ((int)rows.size() < count && hist && cat == "all")
+    {
+        for (const std::string& j : hist->ContextSnapshotsJson(count, cutoff))
+        {
+            if ((int)rows.size() >= count) break;
+            WarpJson::ParseResult pr = WarpJson::Parse(j);
+            if (!pr.ok || !pr.value.isObject()) continue;
+            if (pr.value.get("timestamp").asInt64(0) >= oldestInMemory) continue;   // already served from memory
+            rows.push_back(j);
+            ++persisted;
+        }
     }
 
-    std::ostringstream o;
-    o << "{\"recent_contexts\":[";
-    for (size_t i = 0; i < latestFirst.size(); ++i)
+    std::string out;
+    WarpJson::Writer w(out);
+    w.BeginObject().Key("recent_contexts").BeginArray();
+    for (const std::string& r : rows) w.Raw(r);
+    w.EndArray().KV("category", cat).KV("window_seconds", win).KV("returned", (int64_t)rows.size())
+     .KV("from_persisted", (int64_t)persisted).KV("history_count", (int64_t)historyCount).KV("requested", (int64_t)count).EndObject();
+    return out;
+}
+
+std::string ContextInference::GetCurrentContextJson(bool includeVector)
+{
+    FocusTracker::ActiveSession active;
+    bool haveActive = m_fg && m_fg->GetCurrentSession(active);
+    std::string presence;
     {
-        if (i) o << ",";
-        o << SnapshotToJsonObject(*latestFirst[i], cat);
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_presence) presence = m_presence();
     }
-    o << "],\"category\":\"" << cat << "\""
-      << ",\"window_seconds\":" << win
-      << ",\"returned\":"  << latestFirst.size()
-      << ",\"history_count\":" << m_history.size()
-      << ",\"requested\":" << count << "}";
-    return o.str();
+
+    std::lock_guard<std::mutex> lk(m_mutex);
+    std::string out;
+    WarpJson::Writer w(out);
+    w.BeginObject().KV("now", static_cast<int64_t>(std::time(nullptr))).KV("presence", presence);
+    w.Key("foreground");
+    if (haveActive)
+    {
+        w.BeginObject().KV("exe_name", active.exeName).KV("exe_path", active.exePath).KV("window_title", active.windowTitle)
+         .KV("since", active.startedAtUtcSecs).KV("active_secs", (int64_t)active.activeSecsSoFar);
+        if (!active.docKey.empty())
+            w.KV("entity_key", active.docKey).KV("entity_type", active.docType == "file" ? "file" : "url").KV("display", active.docDisplay);
+        w.EndObject();
+    }
+    else w.Null();
+    w.Key("snapshot");
+    if (m_haveLatest) w.Raw(SnapshotToJsonObject(m_latest, "all", includeVector));
+    else w.Null();
+    w.EndObject();
+    return out;
 }
 
 void ContextInference::ClearHistory()
 {
+    ++m_epoch;                                   // in-flight composes are discarded (PRIV-4)
+    {
+        std::lock_guard<std::mutex> ck(m_composeMtx);
+        m_windowCache.clear();
+    }
     std::lock_guard<std::mutex> lk(m_mutex);
     m_history.clear();
     m_latest = ContextSnapshot{};
@@ -3252,40 +3400,5 @@ void ContextInference::ClearHistory()
 // =====================================================================
 std::string ContextInference::WideToUtf8(const std::wstring& w)
 {
-    if (w.empty()) return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string s(len > 0 ? len - 1 : 0, '\0');
-    if (len > 0)
-        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], len, nullptr, nullptr);
-    return s;
-}
-
-std::string ContextInference::EscapeJson(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 16);
-    for (char c : s)
-    {
-        switch (c)
-        {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if ((unsigned char)c < 0x20)
-            {
-                char buf[8];
-                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                out += buf;
-            }
-            else
-            {
-                out += c;
-            }
-            break;
-        }
-    }
-    return out;
+    return WarpJson::WideToUtf8(w);
 }

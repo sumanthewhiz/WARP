@@ -15,83 +15,78 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="targetver.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Resource.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="WARP!.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="FileMonitor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="IdleDetector.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="sqlite3.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="ActivityDatabase.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="AppLaunchMonitor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="BrowsingMonitor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="QueryApi.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="InferenceEngine.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="ForegroundMonitor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="ContextInference.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
+    <ClInclude Include="framework.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="targetver.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Resource.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="WARP!.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="sqlite3.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ActivityStore.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="EntityStore.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="HistoryEngine.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ApiServer.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Json.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="UrlCanonicalizer.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="EntityKey.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="FileCapture.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="UsnJournalReader.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="RecentItemsWatcher.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="OfficeMruReader.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ZoneIdentifier.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="OneDriveMapper.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="LaunchCapture.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="WebCapture.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="AddressBarReader.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="FocusTracker.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="DocResolver.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ForegroundChangeBroker.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PresenceMonitor.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ClipboardMonitor.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="PrintMonitor.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="DesktopInfo.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="EventContext.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="SystemProcessClassifier.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ContextInference.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="LlmSummarizer.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ModernBertTokenizer.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Settings.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Logger.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="CrashHandler.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Installer.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="WARP!.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="FileMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="IdleDetector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="sqlite3.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="ActivityDatabase.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="AppLaunchMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="BrowsingMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="QueryApi.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="InferenceEngine.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="ForegroundMonitor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="ContextInference.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
+    <ClCompile Include="WARP!.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="sqlite3.c"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ActivityStore.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="EntityStore.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="HistoryEngine.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ApiServer.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="Json.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="UrlCanonicalizer.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="EntityKey.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="FileCapture.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="UsnJournalReader.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="RecentItemsWatcher.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="OfficeMruReader.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ZoneIdentifier.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="OneDriveMapper.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="LaunchCapture.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="WebCapture.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="AddressBarReader.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="FocusTracker.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="DocResolver.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ForegroundChangeBroker.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PresenceMonitor.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ClipboardMonitor.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="PrintMonitor.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="DesktopInfo.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="EventContext.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="SystemProcessClassifier.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ContextInference.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="LlmSummarizer.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="Settings.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="Logger.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="CrashHandler.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="Installer.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="WARP!.rc">

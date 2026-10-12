@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Model inputs for the WARP build (gap analysis SEC-2). scripts/fetch_models.ps1 downloads every",
+    "file from https://huggingface.co/<repo>/resolve/<commit>/<path> (immutable) and verifies it:",
+    "against 'sha256' when pinned, otherwise against the hashes Hugging Face publishes for that commit.",
+    "A 'revision' that is a branch name and empty 'sha256' values are UNPINNED: CI warns, and",
+    "-RequirePinned (release builds) fails. Refresh the pins with:",
+    "    pwsh scripts/fetch_models.ps1 -UpdateLock"
+  ],
+  "models": [
+    {
+      "name": "granite",
+      "repo": "onnx-community/granite-embedding-small-english-r2-ONNX",
+      "revision": "main",
+      "license": "Apache-2.0",
+      "dest": "models/granite",
+      "files": [
+        { "path": "onnx/model_quantized.onnx", "dest": "model_quantized.onnx", "sha256": "" },
+        { "path": "onnx/model_quantized.onnx_data", "dest": "model_quantized.onnx_data", "sha256": "" }
+      ]
+    },
+    {
+      "name": "granite-tokenizer",
+      "repo": "ibm-granite/granite-embedding-small-english-r2",
+      "revision": "main",
+      "license": "Apache-2.0",
+      "dest": "models/granite",
+      "files": [
+        { "path": "tokenizer.json", "dest": "tokenizer.json", "sha256": "" }
+      ]
+    },
+    {
+      "name": "qwen",
+      "repo": "xiaoyao9184/Qwen3-0.6B-onnx-genai",
+      "revision": "main",
+      "license": "Apache-2.0",
+      "dest": "models/qwen",
+      "files": [
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/chat_template.jinja", "dest": "chat_template.jinja", "sha256": "" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/genai_config.json", "dest": "genai_config.json", "sha256": "" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx", "dest": "model.onnx", "sha256": "" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx.data", "dest": "model.onnx.data", "sha256": "" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer.json", "dest": "tokenizer.json", "sha256": "" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer_config.json", "dest": "tokenizer_config.json", "sha256": "" }
+      ]
+    }
+  ]
+}

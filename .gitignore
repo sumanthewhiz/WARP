@@ -5,6 +5,8 @@ Release/
 x64/
 ARM64/
 binaries/
+build/
+dist/
 *.obj
 *.pdb
 *.ilk

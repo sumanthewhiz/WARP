@@ -3,20 +3,13 @@
 //
 // Single source of truth for "the foreground window changed" notifications.
 //
-// The previous design had ForegroundMonitor and BrowsingMonitor each running
-// their own 3-second polling thread that called GetForegroundWindow(). That
-// meant:
-//   * Up to 3 seconds of attribution lag on every foreground switch.
-//   * Two threads doing duplicate work and arriving at slightly different
-//     conclusions depending on poll timing.
-//   * No way to react to an Alt+Tab burst -- by the time the next poll
-//     fired, the user had moved on.
-//
-// This broker installs a single SetWinEventHook(EVENT_SYSTEM_FOREGROUND)
-// on the main UI thread (which already has a message pump for the
-// LaunchCorrelator hook) and fans the event out to all subscribers. The
-// hook fires synchronously the moment Windows promotes a new HWND to the
-// foreground -- typically within milliseconds of the user gesture.
+// One SetWinEventHook(EVENT_SYSTEM_FOREGROUND) on the main UI thread (which
+// pumps messages for WARP's other WinEvent hooks) fans the event out to all
+// subscribers (FocusTracker, WebCapture, PresenceMonitor's activity nudge). The
+// hook fires the moment Windows promotes a new HWND to the foreground --
+// typically within milliseconds of the user gesture -- instead of polling.
+// Owned windows are normalized to their root owner, and UWP frames
+// (ApplicationFrameHost) to the hosted app's CoreWindow process.
 //
 // The broker also notifies EventContext so subsequent CaptureContext()
 // calls can attribute an event to the foreground PID without needing to
