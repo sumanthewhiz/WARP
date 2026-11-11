@@ -1,5 +1,6 @@
 // Test runner for WarpTests.exe (see WarpTests.h).
 #include "WarpTests.h"
+#include "Json.h"
 
 #include <atomic>
 #include <chrono>
@@ -8,12 +9,15 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
 namespace
 {
     int g_failures = 0;
 }
+
+int RunQualityReplay(const std::wstring& input, const std::wstring& output, const std::wstring& models);
 
 namespace wt
 {
@@ -75,6 +79,7 @@ namespace wt
 int wmain(int argc, wchar_t** argv)
 {
     std::string filter;
+    std::wstring replay, output, report, models;
     unsigned timeoutSec = 600;
     // Options may be spelled --name, -name or /name.
     auto is = [](const wchar_t* arg, const wchar_t* name)
@@ -86,6 +91,10 @@ int wmain(int argc, wchar_t** argv)
     {
         if (is(argv[i], L"filter") && i + 1 < argc) filter = wt::Narrow(argv[++i]);
         else if (is(argv[i], L"timeout") && i + 1 < argc) timeoutSec = (unsigned)_wtoi(argv[++i]);
+        else if (is(argv[i], L"replay") && i + 1 < argc) replay = argv[++i];
+        else if (is(argv[i], L"output") && i + 1 < argc) output = argv[++i];
+        else if (is(argv[i], L"report") && i + 1 < argc) report = argv[++i];
+        else if (is(argv[i], L"models") && i + 1 < argc) models = argv[++i];
         else if (is(argv[i], L"list"))
         {
             for (const wt::TestCase& t : wt::Registry()) std::printf("%s.%s\n", t.suite, t.name);
@@ -104,7 +113,18 @@ int wmain(int argc, wchar_t** argv)
         TerminateProcess(GetCurrentProcess(), 3);
     }).detach();
 
+    if (!replay.empty())
+    {
+        try
+        {
+            if (output.empty()) throw std::runtime_error("/replay requires /output");
+            return RunQualityReplay(replay, output, models);
+        }
+        catch (const std::exception& e) { std::fprintf(stderr, "Replay failed: %s\n", e.what()); return 1; }
+    }
+
     int run = 0, failedTests = 0;
+    auto results = WarpJson::Value::Array();
     for (const wt::TestCase& t : wt::Registry())
     {
         std::string full = std::string(t.suite) + "." + t.name;
@@ -126,8 +146,23 @@ int wmain(int argc, wchar_t** argv)
         if (!ok) ++failedTests;
         std::printf("[%s] %s (%lld ms)\n", ok ? "  OK  " : " FAIL ", full.c_str(), ms);
         std::fflush(stdout);
+        auto result = WarpJson::Value::Object();
+        result.set("name", WarpJson::Value::String(full));
+        result.set("passed", WarpJson::Value::Bool(ok));
+        result.set("duration_ms", WarpJson::Value::Int(ms));
+        results.push(std::move(result));
     }
     std::printf("\n%d test(s) run, %d failed\n", run, failedTests);
+    if (!report.empty())
+    {
+        auto value = WarpJson::Value::Object();
+        value.set("tests", std::move(results));
+        value.set("run", WarpJson::Value::Int(run));
+        value.set("failed", WarpJson::Value::Int(failedTests));
+        std::ofstream out{ std::filesystem::path(report), std::ios::binary };
+        out << WarpJson::Serialize(value);
+        if (!out) return 2;
+    }
     if (run == 0) return 2;
     return failedTests ? 1 : 0;
 }

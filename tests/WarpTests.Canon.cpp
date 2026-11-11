@@ -7,6 +7,8 @@
 #include "EntityKey.h"
 #include "EntityStore.h"
 #include "FileCapture.h"
+#include "FocusTracker.h"
+#include "PrintMonitor.h"
 #include "UrlCanonicalizer.h"
 #include "sqlite3.h"
 
@@ -154,7 +156,7 @@ TEST(EntityKey, ApiKeysRoundTrip)
     CHECK_EQ(EntityStore::NormalizeKey(L"Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"), app);
     CHECK_EQ(EntityStore::NormalizeKey(EntityKey::FromUtf8(app)), app);
     const std::string yt = EntityStore::NormalizeKey(L"https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-    CHECK_EQ(yt, std::string("yt:dqw4w9wgxcq"));
+    CHECK_EQ(yt, std::string("yt:dQw4w9WgXcQ"));
     CHECK_EQ(EntityStore::NormalizeKey(EntityKey::FromUtf8(yt)), yt);
     const std::string pr = EntityStore::NormalizeKey(L"https://github.com/Microsoft/WARP/pull/42");
     CHECK_EQ(EntityStore::NormalizeKey(EntityKey::FromUtf8(pr)), pr);
@@ -189,18 +191,57 @@ TEST(DocResolver, ExtractsDocumentNamesPerAppGrammar)
     CHECK(!DocResolver::IsDocumentApp(L"explorer.exe"));
 }
 
-TEST(DocResolver, MatchesNewestCandidateByNameOrStem)
+TEST(DocResolver, AbstainsOnAmbiguousNameOrStem)
 {
     std::wstring out;
     const std::vector<std::wstring> c = { L"C:\\new\\Report.docx", L"C:\\old\\Report.docx", L"C:\\x\\notes.txt" };
-    CHECK(DocResolver::MatchPath(L"Report", c, out));
-    CHECK_EQ(out, std::wstring(L"C:\\new\\Report.docx"));
+    bool ambiguous = false;
+    CHECK(!DocResolver::MatchPath(L"Report", c, out, &ambiguous));
+    CHECK(ambiguous);
+    CHECK(out.empty());
     CHECK(DocResolver::MatchPath(L"NOTES.TXT", c, out));
     CHECK_EQ(out, std::wstring(L"C:\\x\\notes.txt"));
     CHECK(!DocResolver::MatchPath(L"notes.md", c, out));
     CHECK(!DocResolver::MatchPath(L"", c, out));
+    CHECK(DocResolver::MatchPath(L"Report", { L"C:\\new\\Report.docx", L"c:\\NEW\\REPORT.DOCX" }, out, &ambiguous));
+    CHECK(!ambiguous);
+    CHECK(!DocResolver::MatchPath(L"report", { L"C:\\x\\report.docx", L"C:\\x\\report.pdf" }, out, &ambiguous));
+    CHECK(ambiguous);
 }
 
+TEST(EntityKey, PreservesCaseSensitiveWebIdentity)
+{
+    CHECK(EntityKey::UrlKey(L"https://example.org/PlanA") != EntityKey::UrlKey(L"https://example.org/plana"));
+    CHECK_EQ(EntityKey::UrlKey(L"HTTPS://EXAMPLE.ORG/PlanA?q=AbC"), std::string("https://example.org/PlanA?q=AbC"));
+    CHECK(EntityKey::DocKey(L"gdoc:AbC123") != EntityKey::DocKey(L"gdoc:abc123"));
+    CHECK_EQ(EntityStore::NormalizeKey(L"GDOC:AbC123"), std::string("gdoc:AbC123"));
+    CHECK_EQ(EntityStore::NormalizeKey(L"https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit"),
+             std::string("gdoc:1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"));
+}
+
+TEST(Focus, DistinguishesPassiveIdleAndUnknownInput)
+{
+    CHECK_EQ(FocusTracker::AttentionState("active", 0), std::string("active"));
+    CHECK_EQ(FocusTracker::AttentionState("active", 180000), std::string("idle"));
+    CHECK_EQ(FocusTracker::AttentionState("passive", 180000), std::string("passive"));
+    CHECK_EQ(FocusTracker::AttentionState("passive", 100), std::string("active"));
+    CHECK_EQ(FocusTracker::AttentionState("active", 0xFFFFFFFFu), std::string("unknown"));
+    CHECK_EQ(FocusTracker::AttentionState("locked", 100), std::string("idle"));
+}
+
+TEST(Print, RequiresQualifiedOwnUserAndLocalClient)
+{
+    const std::vector<std::wstring> own{ L"CONTOSO\\Alice", L"alice@contoso.example", L"S-1-5-21-1-1001" };
+    const std::vector<std::wstring> local{ L"WORKPC", L"workpc.contoso.example" };
+    CHECK(PrintMonitor::IsOwnLocalJob(L"contoso\\alice", L"\\\\workpc", own, local));
+    CHECK(PrintMonitor::IsOwnLocalJob(L"alice@contoso.example", L"workpc.contoso.example", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"CONTOSO\\Bob", L"WORKPC", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"OTHER\\Alice", L"WORKPC", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"Alice", L"WORKPC", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"", L"WORKPC", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"CONTOSO\\Alice", L"", own, local));
+    CHECK(!PrintMonitor::IsOwnLocalJob(L"CONTOSO\\Alice", L"OTHERPC", own, local));
+}
 // ---------------------------------------------------------------- FileCapture path rules
 TEST(FileRules, RecognizesTransientAndDownloadNames)
 {

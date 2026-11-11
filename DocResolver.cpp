@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "DocResolver.h"
+#include "EntityKey.h"
 
 #include <algorithm>
 #include <cwctype>
@@ -145,20 +146,30 @@ namespace DocResolver
         return std::wstring();
     }
 
-    bool MatchPath(const std::wstring& docName, const std::vector<std::wstring>& candidates, std::wstring& out)
+    bool MatchPath(const std::wstring& docName, const std::vector<std::wstring>& candidates, std::wstring& out, bool* ambiguous)
     {
+        out.clear();
+        if (ambiguous) *ambiguous = false;
         if (docName.empty()) return false;
         const std::wstring want = Lower(docName);
         const bool wantHasExt = HasExtension(docName);
+        std::string matchedKey;
         for (const std::wstring& c : candidates)
         {
             std::wstring name = Lower(FileNameOf(c));
             if (name == want || (!wantHasExt && StemOf(name) == want))
             {
+                const std::string key = EntityKey::FileKey(c);
+                if (!matchedKey.empty() && key != matchedKey)
+                {
+                    out.clear();
+                    if (ambiguous) *ambiguous = true;
+                    return false;
+                }
+                matchedKey = key;
                 out = c;
-                return true;
             }
         }
-        return false;
+        return !matchedKey.empty();
     }
 }

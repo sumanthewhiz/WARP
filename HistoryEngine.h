@@ -1,8 +1,8 @@
 #pragma once
 // HistoryEngine — the historical layer (gap-analysis HIST-1..4, INTEL-6 persistence).
 //
-//   * Work sessions : contiguous presence (active/passive) or focus activity, split by
-//                     away / lock / sleep gaps >= kSessionGapSec.
+//   * Work sessions : durable interval union of presence/focus support, split by gaps
+//                     >= kSessionGapSec (and never joined across purged time).
 //   * Work threads  : every context snapshot carries its entity set (keys + active seconds);
 //                     consecutive snapshots join the thread with the highest weighted-Jaccard
 //                     overlap (with hysteresis for the current thread), otherwise a new thread
@@ -79,6 +79,7 @@ struct WorkSessionInfo
     int64_t endTs = 0;
     int     activeSecs = 0;
     int     passiveSecs = 0;
+    int     accountingVersion = 1; // 0 = bounded legacy estimate; 1 = interval union
 };
 
 struct RelatedEntity
@@ -138,22 +139,12 @@ private:
         std::unordered_map<std::string, std::string> memberTypes;
         bool        dirtyMembers = false;
     };
-    struct SessionState
-    {
-        int64_t id = 0;
-        int64_t startTs = 0;
-        int64_t endTs = 0;
-        double  activeSecs = 0;
-        double  passiveSecs = 0;
-    };
-
     int64_t AssignSnapshot(WriterContext& w, const SnapshotInput& in);
     void    EnsureThreadsLoaded(WriterContext& w);
     void    PersistThread(WriterContext& w, ThreadState& t);
     void    ExtendSpan(WriterContext& w, int64_t threadId, int64_t ts, double activeSecs);
     void    UpdateEdges(WriterContext& w, const SnapshotInput& in, double scale);
     void    ExtendSession(WriterContext& w, int64_t startTs, int64_t endTs, double activeSecs, double passiveSecs);
-    void    CloseSession(WriterContext& w);
     void    ResetCaches();
 
     ActivityStore* m_store = nullptr;
@@ -161,8 +152,6 @@ private:
     // writer-thread only
     bool    m_threadsLoaded = false;
     std::map<int64_t, ThreadState> m_threads;          // recently active threads
-    SessionState m_session;
-    bool    m_haveSession = false;
     int64_t m_spanThread = 0;                          // thread of the currently open span
     int64_t m_spanStart = 0;
     int64_t m_spanEnd = 0;

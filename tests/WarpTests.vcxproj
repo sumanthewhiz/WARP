@@ -4,8 +4,8 @@
   (gap analysis ENG-1). Not part of WARP!.sln on purpose; build and run it with
       msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64
       build\tests\x64\Release\WarpTests.exe   (options: /filter Store. /timeout 600 /list)
-  The product sources are compiled directly (no ONNX Runtime: WarpTests.Stubs.cpp stands in
-  for the ContextInference members ApiServer references).
+  Product sources include the real context composer. ONNX Runtime is linked, but models
+  and live collectors are not started by the deterministic regression/replay suite.
 -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
@@ -32,6 +32,9 @@
     <ProjectGuid>{6e3f2b71-94c8-4d0b-b1a5-2f7c90d84e16}</ProjectGuid>
     <RootNamespace>WarpTests</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <OrtPackage>$(MSBuildThisFileDirectory)..\..\packages\Microsoft.ML.OnnxRuntime.1.23.0</OrtPackage>
+    <OrtArch Condition="'$(Platform)'=='ARM64'">arm64</OrtArch>
+    <OrtArch Condition="'$(Platform)'!='ARM64'">x64</OrtArch>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
@@ -58,11 +61,13 @@
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <PreprocessorDefinitions>WARP_UNIT_TESTS;SQLITE_ENABLE_FTS5;SQLITE_ENABLE_MATH_FUNCTIONS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..;$(OrtPackage)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(OrtPackage)\runtimes\win-$(OrtArch)\native;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -83,24 +88,30 @@
   <ItemGroup>
     <!-- tests -->
     <ClCompile Include="WarpTests.Main.cpp" />
-    <ClCompile Include="WarpTests.Stubs.cpp" />
     <ClCompile Include="WarpTests.Json.cpp" />
     <ClCompile Include="WarpTests.Canon.cpp" />
     <ClCompile Include="WarpTests.Store.cpp" />
     <ClCompile Include="WarpTests.Api.cpp" />
+    <ClCompile Include="WarpTests.Context.cpp" />
     <!-- product code under test -->
     <ClCompile Include="..\ActivityStore.cpp" />
     <ClCompile Include="..\ApiServer.cpp" />
+    <ClCompile Include="..\ContextInference.cpp" />
+    <ClCompile Include="..\DesktopInfo.cpp" />
     <ClCompile Include="..\DocResolver.cpp" />
     <ClCompile Include="..\EntityKey.cpp" />
     <ClCompile Include="..\EntityStore.cpp" />
     <ClCompile Include="..\EventContext.cpp" />
     <ClCompile Include="..\FileCapture.cpp" />
+    <ClCompile Include="..\FocusTracker.cpp" />
+    <ClCompile Include="..\ForegroundChangeBroker.cpp" />
     <ClCompile Include="..\HistoryEngine.cpp" />
     <ClCompile Include="..\Json.cpp" />
     <ClCompile Include="..\Logger.cpp" />
+    <ClCompile Include="..\LlmSummarizer.cpp" />
     <ClCompile Include="..\OfficeMruReader.cpp" />
     <ClCompile Include="..\OneDriveMapper.cpp" />
+    <ClCompile Include="..\PrintMonitor.cpp" />
     <ClCompile Include="..\RecentItemsWatcher.cpp" />
     <ClCompile Include="..\Settings.cpp" />
     <ClCompile Include="..\SystemProcessClassifier.cpp" />
@@ -114,4 +125,7 @@
     </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyTestRuntime" AfterTargets="Build">
+    <Copy SourceFiles="$(OrtPackage)\runtimes\win-$(OrtArch)\native\onnxruntime.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

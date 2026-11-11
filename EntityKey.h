@@ -24,14 +24,14 @@ namespace EntityKey
 //   - "\Device\HarddiskVolumeN\..." and other device-namespace paths are returned unchanged
 std::wstring CanonicalPath(const std::wstring& path);
 
-// Case-folded key of any identifier (path, canonical URL, AUMID, doc id): Unicode-correct lowercase via
+// Case-folded key of a case-insensitive identifier: Unicode-correct lowercase via
 // LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE), returned as UTF-8.
 std::string Key(const std::wstring& s);
 
 std::string FileKey(const std::wstring& path);            // Key(CanonicalPath(path))
 std::string AppKey(const std::wstring& exePathOrAumid);   // path -> FileKey; otherwise "aumid:" + Key(aumid)
-std::string UrlKey(const std::wstring& canonicalUrl);     // Key(canonicalUrl)
-std::string DocKey(const std::wstring& docId);            // Key(docId), docId already prefixed ("gdoc:...")
+std::string UrlKey(const std::wstring& canonicalUrl);     // fold scheme/authority only; preserve path/query case
+std::string DocKey(const std::wstring& docId);            // fold provider prefix only; preserve opaque ID case
 
 // Last path component (display helper): "C:\a\Report.docx" -> "Report.docx". Roots are returned as-is.
 std::wstring BaseName(const std::wstring& path);

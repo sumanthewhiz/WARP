@@ -8,6 +8,7 @@
 #include "EntityStore.h"
 #include "HistoryEngine.h"
 #include "Json.h"
+#include "sqlite3.h"
 
 #include <thread>
 
@@ -225,7 +226,7 @@ TEST(Api, StatusThreadsAndLongPoll)
     WarpJson::Value s = f.Call("{\"op\":\"GetStatus\"}");
     CHECK(s["ok"].asBool());
     CHECK(s["store"]["open"].asBool());
-    CHECK_EQ(s["store"]["schema_version"].asInt64(), (int64_t)2);
+    CHECK_EQ(s["store"]["schema_version"].asInt64(), (int64_t)3);
     CHECK(s["settings"].isObject());
     CHECK(f.Call("{\"op\":\"GetWorkThreads\"}")["threads"].isArray());
 
@@ -242,6 +243,30 @@ TEST(Api, StatusThreadsAndLongPoll)
     CHECK(GetTickCount64() - t0 < 9000);              // woke up on the commit, not on the timeout
 }
 
+TEST(Api, LegacyIdentityLookupDoesNotReinterpretOldUrlKeys)
+{
+    ApiFixture f;
+    REQUIRE(f.open);
+    BrowseEventRecord row;
+    row.url = L"https://www.youtube.com/watch?v=AbCdEf12345";
+    row.docId = L"yt:AbCdEf12345";
+    row.title = L"Video"; row.browser = L"Edge";
+    REQUIRE(f.store.RecordBrowse(row));
+    REQUIRE(f.store.RunSync([](WriterContext& w) {
+        REQUIRE(sqlite3_exec(w.db,
+            "INSERT INTO entity_alias VALUES('https://www.youtube.com/watch?v=abcdef12345','yt:AbCdEf12345',1);",
+            nullptr, nullptr, nullptr) == SQLITE_OK);
+    }));
+    const std::string url = "https://www.youtube.com/watch?v=abcdef12345";
+    const auto exact = f.Call("{\"op\":\"ScoreEntities\",\"keys\":[\"" + url + "\"]}");
+    CHECK(!exact["results"][0]["found"].asBool());
+    const auto legacy = f.Call("{\"op\":\"ScoreEntities\",\"identity_version\":1,\"keys\":[\"" + url + "\"]}");
+    CHECK(legacy["results"][0]["found"].asBool());
+    CHECK_EQ(legacy["results"][0]["entity_key"].asString(), std::string("yt:AbCdEf12345"));
+    const auto query = f.Call("{\"op\":\"QueryInferences\",\"identity_version\":1,\"paths\":[\"" + url + "\"]}");
+    CHECK_EQ(query["results"][url]["entity_key"].asString(), std::string("yt:AbCdEf12345"));
+    CHECK_EQ(ErrorCode(f.Call("{\"op\":\"ScoreEntities\",\"identity_version\":3,\"keys\":[]}")), std::string("invalid_request"));
+}
 TEST(Api, HealthOpsAnswerWithTheStoreClosedAndRedactForThirdParties)
 {
     ApiFixture f;

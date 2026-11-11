@@ -155,6 +155,11 @@ raw event queries, `QueryInferences`, `GetInferenceDeltas`, `GetRecentContext` a
 | Raw events | file, app launch, browsing | adds `app_focus`, `confidence`, `source`, `entity_key`, `limit`, `min_confidence`, `truncated` and paging with `before_id` / `next_before_id` |
 | Inference `version` | per-entity counter | the global `change_seq` (monotonic across all entities); `GetInferenceDeltas` also returns `deleted`, `next_version`, `current_version`, `more` and `reset` |
 
+**Phase A (`dev`, storage schema 3):** the transport stays API v2. Attention now
+separates active/passive/idle/unknown, web keys preserve case-sensitive identity,
+and persisted history supports every facet. Missing raw attention is `null`, not
+fabricated wall time. See [SCHEMA.md](SCHEMA.md) for migration/retention semantics.
+
 ---
 
 ## Prerequisites
@@ -400,7 +405,8 @@ Every response is one JSON object whose first member is `"api_version": 2`.
 
 Entities -- files, apps and web pages / documents -- are identified by an `entity_key`
 that is shared by every operation, by the raw events (`entity_key`, `doc_key`) and by the
-context snapshots. Keys are lower-cased with the invariant locale and returned as UTF-8.
+context snapshots. Keys are UTF-8 and **typed**: file paths/AUMIDs remain
+case-folded; URL paths/query values and opaque document-ID payloads preserve case.
 
 | `entity_type` | Key | Example |
 |---|---|---|
@@ -412,9 +418,10 @@ Operations that take **raw identifiers** -- `QueryInferences.paths`, `ScoreEntit
 `GetRelated.key`, `Purge.key` -- normalize every string the way WARP's own producers do.
 The first matching rule wins:
 
-1. A key WARP hands out is used as it is (case-folded): strings starting with `aumid:`,
+1. A key WARP hands out round-trips: strings starting with `aumid:`,
    `doc:`, `yt:`, `gdoc:`, `gdrive:`, `spo:`, `spo-path:`, `od:`, `gh:`, `ado:`, `figma:` or
    `jira:` (prefix matched case-insensitively, followed by at least one character).
+   Only the provider prefix is folded for document keys; AUMIDs remain case-folded.
 2. A drive-letter path (`C:\...`, `C:/...`) or UNC path (`\\server\share\...`) is a file
    path -> file key.
 3. A string containing `!` and no `\` or `/` is a raw packaged-app AUMID
@@ -427,6 +434,21 @@ The first matching rule wins:
 
 Responses echo your exact strings: `QueryInferences` keys its `results` by them and
 `ScoreEntities` returns `key` (yours) next to `entity_key` (normalized).
+
+**Identity format 2 (default).** `https://example.org/PlanA` is not `/plana`;
+`yt:AbCdEf12345` is not `yt:abcdef12345`. Do not lowercase keys in clients.
+For `ScoreEntities` and `QueryInferences`, optional `identity_version: 1` explicitly
+resolves retained old folded-key aliases; `2` is the default. Other values/types
+return `invalid_request`. An ambiguous/unrecoverable/expired legacy web identity
+returns not found, never an arbitrary case variant. A newly seen case variant can
+invalidate a previously unique alias. Purge and other operations use canonical
+format-2 keys; resolve an old key first if necessary.
+Legacy mode takes already-canonical keys returned by old WARP, rather than
+reinterpreting old URL keys as new provider document IDs.
+
+The v3 migration requests a change-feed reset for affected existing history.
+Discard cached old keys and resync. Unrecoverable collided aggregate history is
+not guessed; see [upgrade behavior](SCHEMA.md#upgrade-behavior).
 
 **Round trips.** Every `entity_key` WARP returns -- file keys, exe-path and `aumid:` app
 keys, document identities and canonical URLs -- normalizes to itself, so keys from
@@ -609,7 +631,12 @@ to page through a fixed range, use [`QueryTimeline`](#querytimeline).
 | `window_title` | string | always | Window title. |
 | `duration_secs` | integer | always | Wall-clock length of the session. |
 | `start_ts` / `end_ts` | integer | always | Session start / end. |
-| `active_secs` | integer | always | Seconds with the user present (idle / away time excluded). |
+| `active_secs` | integer or null | always | Interaction-active foreground seconds; excludes passive presence. `null` means unknown, including an old positive active/passive total that cannot be separated. Zero is measured zero. |
+| `passive_secs` / `idle_secs` | integer or null | always | Separately measured passive-presence / old-input time; unavailable legacy components are null. Passive media does not prove attention to this document. |
+| `unknown_attention_secs` | integer | always | Unclassified foreground-exposure remainder. |
+| `attention_status` | string | always | `measured`, `unknown` or `legacy_combined`. |
+| `aumid` | string | always | Packaged-app identity, empty if unavailable. |
+| `doc_resolution` | string | always | `browser_window`, `filename_candidate`, `ambiguous`, `unresolved`, `withheld` or migrated `legacy_candidate`. |
 | `doc_key` | string | when resolved | Entity key of the document or page shown. |
 | `doc_display` | string | with `doc_key` | Path or URL of that document / page. |
 | `doc_type` | string | with `doc_key` | `file`, `url` or `webdoc`. |
@@ -760,6 +787,7 @@ required (without the activity scope, `display_name` and `title` are omitted).
 | `horizon` | string | `blend` | `short` (days), `long` (weeks) or `blend`; any other value -> `invalid_request` (`'horizon' must be short, long or blend`). |
 | `reasons` | bool | `true` | Include `reasons[]`. |
 | `context` | string | -- | `"current"` adds `context_boost` to every result and `current_thread` to the response (only while the history engine runs). |
+| `identity_version` | integer | `2` | `1` explicitly resolves old folded-key aliases; ambiguous legacy identities are not found. Also supported by `QueryInferences`. |
 
 ```json
 {
@@ -1071,9 +1099,9 @@ cursors (activity scope).
 |---|---|---|
 | `files` | `file` requested | `id`, `timestamp`, `action`, `path`, `old_path` (renames), `entity_key`, `source`, `confidence` |
 | `app_launches` | `app_launch` requested | `id`, `timestamp`, `exe_name`, `exe_path`, `aumid` (empty if none), `confidence` |
-| `focus` | `app_focus` requested | `id`, `start_ts`, `end_ts`, `active_secs`, `exe_name`, `window_title`, plus `doc_key` / `doc_display` / `doc_type` when resolved; sessions overlapping the range |
+| `focus` | `app_focus` requested | `id`, `start_ts`, `end_ts`, nullable `active_secs` / `passive_secs` / `idle_secs`, `unknown_attention_secs`, `attention_status`, `exe_name`, `exe_path`, `aumid`, `window_title`, `doc_resolution`, plus `doc_key` / `doc_display` / `doc_type` when resolved; whole sessions overlapping the range |
 | `browsing` | `browsing` requested | `id`, `timestamp`, `browser`, `title`, `url` (empty if none), `entity_key` |
-| `sessions` | `sessions` requested and the history engine runs | work sessions overlapping the range, newest first, at most 500: `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs` |
+| `sessions` | `sessions` requested and the history engine runs | whole work sessions overlapping the range, newest first, at most 500: `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs`, `accounting_version` (`1`: durable interval union; `0`: contains a bounded legacy estimate). Overlapping focus/presence do not add duplicate time. |
 | `threads` | `threads` requested and the history engine runs | work threads active in the range, most recent first, at most 50: `id`, `label`, `active_secs_in_range`, `spans` (`[start, end]` pairs) |
 | `next_cursor` | always | `null`, or an object naming each event type that has more rows |
 
@@ -1272,10 +1300,14 @@ agent's short-term memory (v1 shape: no `ok` member).
   materially from the previous entry (a summary line or the dominant app changed) or the
   previous entry is 5 minutes old -- entries are context *transitions*, not polling ticks.
 - History entries are also persisted (table `context_snapshot`, kept for the raw-event
-  retention). For `category: "all"`, snapshots older than the in-memory history (e.g. from
-  before a restart) are filled in from the database; those are always the `all` view,
-  without `summary_embedding`, and carry their real work-thread id in `thread_id` and in
-  every `current_entities[].thread_id`.
+  retention). Every category (`all`, `files`, `websites`, `apps`, and legacy
+  `documents`) fills older entries from the database and applies the same summary
+  projection as memory. `include_vector: false` always omits `summary_embedding`;
+  when true, unavailable persisted vectors are `[]`, not a different label embedding.
+  Persisted entries carry their real work-thread id. Old snapshots retain their
+  historical estimates and are marked `attention_semantics: "legacy_combined"`.
+- This lists previously generated snapshots. It is not reconstruction of a new
+  arbitrary historical interval; `window_seconds` filters snapshot generation times.
 
 #### GetCurrentContext
 
@@ -1319,7 +1351,7 @@ one call.
 |---|---|
 | `context.now` | Server time. |
 | `context.presence` | `active`, `passive`, `away`, `locked` or `asleep` (empty if unknown). |
-| `context.foreground` | The current foreground session, or `null`: `exe_name`, `exe_path`, `window_title`, `since` (session start), `active_secs` so far; plus `entity_key`, `entity_type` (`file` or `url`) and `display` when the window shows a resolved document or page. |
+| `context.foreground` | The current foreground session, or `null`: `exe_name`, `exe_path`, `aumid`, `window_title`, `since` (session start), `active_secs`, `passive_secs`, `idle_secs`, `unknown_attention_secs` so far, and `resolution`; plus `entity_key`, `entity_type` (`file` or `url`) and `display` when resolved. |
 | `context.snapshot` | The latest periodic snapshot (`null` before the first compose). |
 | `thread` | Current work thread: `id` (0 if none) and `label`. Present while the history engine runs. |
 
@@ -1343,6 +1375,11 @@ The snapshot object returned by `GetRecentContext` (`recent_context`), `GetRecen
   "summary_apps": [],
   "activity_count": 47,
   "focus_seconds": 812,
+  "foreground_exposure_seconds": 900,
+  "passive_seconds": 40,
+  "idle_seconds": 48,
+  "unknown_attention_seconds": 0,
+  "attention_semantics": "interaction_active_v1",
   "dominant_focus_pct": 61,
   "confidence": 0.84,
   "thread_count": 2,
@@ -1384,7 +1421,10 @@ With `category` `files`, `websites` or `apps`, `summary` holds that facet's summ
 | `summary_websites` | string[] | Only for `all`. Browser tabs. |
 | `summary_apps` | string[] | Only for `all`. Everything else: communication, media, terminals, remote desktops, version-control UIs, ... |
 | `activity_count` | integer | Raw signals considered. |
-| `focus_seconds` | integer | Foreground seconds in the window. |
+| `focus_seconds` | integer | Measured interaction-active foreground seconds in the window; zero is never expanded to wall duration. |
+| `foreground_exposure_seconds` | integer | Foreground wall-time union, including passive/idle/unknown exposure. |
+| `passive_seconds` / `idle_seconds` / `unknown_attention_seconds` | integer | Separate clipped attention components; background media is not promoted to active document time. Mixed long segments use proportional estimates. |
+| `attention_semantics` | string | `interaction_active_v1` for new compositions; `legacy_combined` on migrated historical snapshots. |
 | `dominant_focus_pct` | integer | Share of focus time in the top app, 0-100. |
 | `confidence` | number | 0-0.99 heuristic signal quality (focus volume, dominance, variety of signals) -- not a model probability. |
 | `thread_count` | integer | Activity clusters in the window (without the embedding model every app is its own cluster). |
@@ -1395,7 +1435,16 @@ With `category` `files`, `websites` or `apps`, `summary` holds that facet's summ
 | `signal_types` | string[] | Contributing signals: `app_focus`, `browsing`, `app_launch`, `file`. |
 | `summary_embedding` | number[] | Only with `include_vector`: 384-dimension, L2-normalized embedding of the joined `summary` lines (6 decimals); empty without the embedding model. |
 | `items[]` | object[] | Top apps by focus time (at most 5): `app` (friendly name), `exe`, `title` (cleaned), `raw_title` (original window title), `focus_seconds`, `pct` (integer share of focus), `thread_id` (1-based cluster id **within this snapshot**, not a work-thread id) and `entity_key` (document / page when resolved, else the app; omitted when empty). |
-| `current_entities[]` | object[] | The entities behind the snapshot, joinable with the entity operations: `entity_key`, `entity_type` (`file`, `url` or `app`), `display` (path, URL or app), `title`, `app` (where it was used), `role` (`focus`, `reference` or `communication`), `active_secs_in_window`, `last_active_ts`, `score` (long-horizon engagement percentile, 0-1) and `thread_id` (the snapshot's work-thread id). |
+| `current_entities[]` | object[] | Joinable `entity_key`, `entity_type`, `display`, `title`, `app`, `role` (`focus`, `reference`, `communication`, `observed`, `passive`, `attention_unknown`), `active_secs_in_window`, `foreground_exposure_secs`, `passive_secs`, `idle_secs`, `unknown_attention_secs`, `observed_action`, `resolution`, `last_active_ts` (0 without measured active time), `last_observed_ts`, `score` and `thread_id`. A qualified observation can exist without an engagement-store record (`ScoreEntities.found` may be false). |
+
+When there is no interaction-active focus, admitted file/browser/app observations
+still populate summaries, facets and structured entities, without synthetic focus
+seconds. `observed_action` is `foreground`, `open`, `modify`, `create`, `save`,
+`download`, `page_observed` or `launch`. An OPEN is rendered as "Opened", not
+"Editing"; a filesystem modification is described as observed, not proven to be a
+user edit. An unresolved browser window does not borrow another window's page
+identity. Comprehensive all-signal canonical evidence and page episodes remain
+later-phase work.
 
 ### 6. Status and Control
 
@@ -1444,7 +1493,7 @@ settings. No parameters, no scope; answers even when the activity store is not o
   "paused_until": 0,
   "consent_acknowledged": true,
   "store": {
-    "open": true, "schema_version": 2,
+    "open": true, "schema_version": 3,
     "integrity": "ok", "db_bytes": 73400320, "wal_bytes": 4194304, "queue_depth": 0,
     "enqueued": 182311, "dropped": 0, "written": 182311, "batches": 9120, "write_errors": 0,
     "last_commit_utc": 1760003995, "change_seq": 58251, "reset_seq": 0,
@@ -1484,7 +1533,7 @@ as above):
 
 ```json
 {
-  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 2 },
+  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 3 },
   "capture": { "files": { "session": "WARP-KernelFile-1", "last_error": "" },
                "launches": { "last_event_ms": 1760003001000, "last_error": "" } },
   "presence": { "state": "active", "on_battery": false, "media_playing": false, "mic_in_use": false,

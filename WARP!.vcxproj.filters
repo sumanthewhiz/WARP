@@ -21,6 +21,7 @@
     <ClInclude Include="WARP!.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="sqlite3.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ActivityStore.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="Attention.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="EntityStore.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="HistoryEngine.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ApiServer.h"><Filter>Header Files</Filter></ClInclude>

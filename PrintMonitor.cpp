@@ -2,6 +2,10 @@
 #include "PrintMonitor.h"
 
 #include <winevt.h>
+#define SECURITY_WIN32
+#include <security.h>
+#include <secext.h>
+#include <sddl.h>
 
 #include <cstdlib>
 #include <cwchar>
@@ -10,6 +14,8 @@
 #include <vector>
 
 #pragma comment(lib, "wevtapi.lib")
+#pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace
 {
@@ -18,6 +24,43 @@ namespace
 
     // True while a subscription callback runs on this thread: EvtClose must not be called then.
     thread_local bool t_inCallback = false;
+
+    bool CurrentIdentity(std::vector<std::wstring>& owners, std::vector<std::wstring>& machines)
+    {
+        owners.clear();
+        machines.clear();
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+        DWORD bytes = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+        std::vector<BYTE> buffer(bytes);
+        const bool got = bytes && GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes);
+        CloseHandle(token);
+        if (!got) return false;
+        LPWSTR sid = nullptr;
+        if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &sid))
+        {
+            owners.emplace_back(sid);
+            LocalFree(sid);
+        }
+        for (auto format : { NameSamCompatible, NameUserPrincipal })
+        {
+            ULONG size = 0;
+            GetUserNameExW(format, nullptr, &size);
+            if (!size) continue;
+            std::vector<wchar_t> text(size + 1);
+            if (GetUserNameExW(format, text.data(), &size)) owners.emplace_back(text.data());
+        }
+        for (auto format : { ComputerNameNetBIOS, ComputerNameDnsHostname, ComputerNameDnsFullyQualified })
+        {
+            DWORD size = 0;
+            GetComputerNameExW(format, nullptr, &size);
+            if (!size) continue;
+            std::vector<wchar_t> text(size + 1);
+            if (GetComputerNameExW(format, text.data(), &size)) machines.emplace_back(text.data());
+        }
+        return !owners.empty() && !machines.empty();
+    }
 
     int64_t FileTimeToUnixMs(const FILETIME& ft)
     {
@@ -327,6 +370,11 @@ bool PrintMonitor::Start(Callback cb, bool enableChannelIfDisabled)
         SetStatus(L"no callback supplied");
         return false;
     }
+    if (!CurrentIdentity(m_ownNames, m_localNames))
+    {
+        SetStatus(L"print capture unavailable: cannot establish own-user/local-machine identity");
+        return false;
+    }
 
     std::wstring why;
     if (!EnsureChannelEnabled(enableChannelIfDisabled, why))
@@ -338,7 +386,7 @@ bool PrintMonitor::Start(Callback cb, bool enableChannelIfDisabled)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_callback = std::move(cb);
-        m_status = std::wstring(L"active: ") + kChannel + L", EventID 307";
+        m_status = std::wstring(L"active: ") + kChannel + L", EventID 307, verified own-user/local-client jobs only";
     }
     m_healthy.store(true);
     m_accepting.store(true);                // before EvtSubscribe so the first event is not dropped
@@ -411,6 +459,28 @@ void PrintMonitor::OnSubscriptionError(DWORD error)
     SetStatus(WithError(L"subscription error; call Stop() then Start() to resubscribe", error));
 }
 
+bool PrintMonitor::IsOwnLocalJob(const std::wstring& owner, const std::wstring& clientMachine,
+                               const std::vector<std::wstring>& ownQualifiedNames,
+                               const std::vector<std::wstring>& localMachineNames)
+{
+    // A bare account name cannot distinguish local/domain users with the same name.
+    // Missing owner/client metadata fails closed; never resolve somebody else's name.
+    if (owner.empty() || clientMachine.empty()) return false;
+    const size_t slash = owner.find(L'\\'), at = owner.find(L'@');
+    const bool qualified = (slash != std::wstring::npos && slash > 0 && slash + 1 < owner.size()) ||
+                           (at != std::wstring::npos && at > 0 && at + 1 < owner.size()) ||
+                           owner.compare(0, 4, L"S-1-") == 0;
+    if (!qualified) return false;
+    bool own = false;
+    for (const auto& name : ownQualifiedNames)
+        if (CompareStringOrdinal(owner.c_str(), -1, name.c_str(), -1, TRUE) == CSTR_EQUAL) { own = true; break; }
+    if (!own) return false;
+    const std::wstring client = clientMachine.compare(0, 2, L"\\\\") == 0 ? clientMachine.substr(2) : clientMachine;
+    for (const auto& name : localMachineNames)
+        if (!name.empty() && CompareStringOrdinal(client.c_str(), -1, name.c_str(), -1, TRUE) == CSTR_EQUAL) return true;
+    return false;
+}
+
 void PrintMonitor::OnEvent(HANDLE eventHandle)
 {
     if (!m_accepting.load())
@@ -431,6 +501,7 @@ void PrintMonitor::OnEvent(HANDLE eventHandle)
     ev.clientMachine = ElementText(xml, from, L"Param4");
     ev.printer       = ElementText(xml, from, L"Param5");
     ev.pages         = ParseDword(ElementText(xml, from, L"Param8"));
+    if (!IsOwnLocalJob(ev.owner, ev.clientMachine, m_ownNames, m_localNames)) return;
     int64_t createdMs = 0;
     ev.utcMs = ParseUtcTimestamp(AttributeValue(xml, L"TimeCreated", L"SystemTime"), createdMs)
                    ? createdMs

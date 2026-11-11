@@ -2,6 +2,7 @@
 #include "ApiServer.h"
 #include "ActivityStore.h"
 #include "EntityStore.h"
+#include "EntityKey.h"
 #include "HistoryEngine.h"
 #include "ContextInference.h"
 #include "Settings.h"
@@ -804,7 +805,11 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
         {
             w.BeginObject().KV("id", f.id).KV("timestamp", f.timestampUtc).KV("exe_name", f.exeName).KV("exe_path", f.exePath)
              .KV("window_title", f.windowTitle).KV("duration_secs", (int64_t)f.durationSecs)
-             .KV("start_ts", f.startTs).KV("end_ts", f.endTs).KV("active_secs", (int64_t)f.activeSecs);
+             .KV("start_ts", f.startTs).KV("end_ts", f.endTs).KV("aumid", f.aumid)
+             .KV("attention_status", f.attentionStatus).KV("unknown_attention_secs", f.unknownSecs).KV("doc_resolution", f.docResolution);
+            w.Key("active_secs"); if (f.activeSecs < 0) w.Null(); else w.Int(f.activeSecs);
+            w.Key("passive_secs"); if (f.passiveSecs < 0) w.Null(); else w.Int(f.passiveSecs);
+            w.Key("idle_secs"); if (f.idleSecs < 0) w.Null(); else w.Int(f.idleSecs);
             if (!f.docKey.empty()) w.KV("doc_key", f.docKey).KV("doc_display", f.docDisplay).KV("doc_type", f.docType);
             w.KV("confidence", f.confidence).EndObject();
         }
@@ -818,6 +823,10 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
 
 std::string ApiServer::QueryInferences(const Value& req)
 {
+    const auto& identityVersion = req.get("identity_version");
+    if (!identityVersion.isNull() && (!identityVersion.isInteger() ||
+        (identityVersion.asInt64() != 1 && identityVersion.asInt64() != 2)))
+        return Error("invalid_request", "'identity_version' must be 1 (legacy keys) or 2 (case-safe keys)");
     if (!m_deps.entities) return Error("unavailable", "entity store is not running");
     const Value& paths = req.has("paths") ? req.get("paths") : req.get("keys");
     if (!paths.isArray()) return Error("invalid_request", "'paths' must be an array of strings");
@@ -830,10 +839,11 @@ std::string ApiServer::QueryInferences(const Value& req)
     {
         if (!v.isString()) continue;
         raw.push_back(v.asString());
-        keys.push_back(NormalizeRaw(v.asString()));
+        keys.push_back(identityVersion.asInt64(2) == 1
+            ? EntityKey::Key(WarpJson::Utf8ToWide(v.asString())) : NormalizeRaw(v.asString()));
     }
     const int64_t now = NowUtc();
-    std::vector<EntityScore> scores = m_deps.entities->Score(keys, "blend", now, false);
+    std::vector<EntityScore> scores = m_deps.entities->Score(keys, "blend", now, false, identityVersion.asInt64(2) == 1);
 
     std::string out;
     Writer w(out);
@@ -893,6 +903,10 @@ std::string ApiServer::GetInferenceDeltas(const Value& req)
 
 std::string ApiServer::ScoreEntities(const Value& req, const ApiClient& c)
 {
+    const auto& identityVersion = req.get("identity_version");
+    if (!identityVersion.isNull() && (!identityVersion.isInteger() ||
+        (identityVersion.asInt64() != 1 && identityVersion.asInt64() != 2)))
+        return Error("invalid_request", "'identity_version' must be 1 (legacy keys) or 2 (case-safe keys)");
     if (!m_deps.entities) return Error("unavailable", "entity store is not running");
     const Value& keysV = req.has("keys") ? req.get("keys") : req.get("paths");
     if (!keysV.isArray()) return Error("invalid_request", "'keys' must be an array of strings");
@@ -907,10 +921,12 @@ std::string ApiServer::ScoreEntities(const Value& req, const ApiClient& c)
     for (const Value& v : keysV.items())
     {
         raw.push_back(v.isString() ? v.asString() : std::string());
-        keys.push_back(v.isString() ? NormalizeRaw(v.asString()) : std::string());
+        keys.push_back(v.isString() ? (identityVersion.asInt64(2) == 1
+            ? EntityKey::Key(WarpJson::Utf8ToWide(v.asString())) : NormalizeRaw(v.asString())) : std::string());
     }
     const int64_t now = NowUtc();
-    std::vector<EntityScore> scores = m_deps.entities->Score(keys, horizon, now, withReasons);
+    std::vector<EntityScore> scores = m_deps.entities->Score(keys, horizon, now, withReasons, identityVersion.asInt64(2) == 1);
+    for (size_t i = 0; i < scores.size(); ++i) if (scores[i].found) keys[i] = scores[i].rec.entityKey;
     std::vector<double> boost;
     if (withContext) boost = m_deps.history->ContextBoost(keys, now);
 
@@ -1100,8 +1116,12 @@ std::string ApiServer::QueryTimeline(const Value& req)
         w.Key("focus").BeginArray();
         for (const AppFocusActivity& f : rows)
         {
-            w.BeginObject().KV("id", f.id).KV("start_ts", f.startTs).KV("end_ts", f.endTs).KV("active_secs", (int64_t)f.activeSecs)
-             .KV("exe_name", f.exeName).KV("window_title", f.windowTitle);
+            w.BeginObject().KV("id", f.id).KV("start_ts", f.startTs).KV("end_ts", f.endTs)
+             .KV("exe_name", f.exeName).KV("exe_path", f.exePath).KV("aumid", f.aumid).KV("window_title", f.windowTitle)
+             .KV("attention_status", f.attentionStatus).KV("unknown_attention_secs", f.unknownSecs).KV("doc_resolution", f.docResolution);
+            w.Key("active_secs"); if (f.activeSecs < 0) w.Null(); else w.Int(f.activeSecs);
+            w.Key("passive_secs"); if (f.passiveSecs < 0) w.Null(); else w.Int(f.passiveSecs);
+            w.Key("idle_secs"); if (f.idleSecs < 0) w.Null(); else w.Int(f.idleSecs);
             if (!f.docKey.empty()) w.KV("doc_key", f.docKey).KV("doc_display", f.docDisplay).KV("doc_type", f.docType);
             w.EndObject();
         }
@@ -1123,7 +1143,8 @@ std::string ApiServer::QueryTimeline(const Value& req)
         w.Key("sessions").BeginArray();
         for (const WorkSessionInfo& s : m_deps.history->GetSessions(start, end, 500))
             w.BeginObject().KV("id", s.id).KV("start_ts", s.startTs).KV("end_ts", s.endTs)
-             .KV("active_secs", (int64_t)s.activeSecs).KV("passive_secs", (int64_t)s.passiveSecs).EndObject();
+             .KV("active_secs", (int64_t)s.activeSecs).KV("passive_secs", (int64_t)s.passiveSecs)
+             .KV("accounting_version", s.accountingVersion).EndObject();
         w.EndArray();
     }
     if (threads && m_deps.history)

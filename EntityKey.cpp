@@ -410,12 +410,20 @@ std::string AppKey(const std::wstring& exePathOrAumid)
 
 std::string UrlKey(const std::wstring& canonicalUrl)
 {
-    return Key(canonicalUrl);
+    const size_t scheme = canonicalUrl.find(L"://");
+    if (scheme == std::wstring::npos) return ToUtf8(canonicalUrl);
+    const size_t end = canonicalUrl.find_first_of(L"/?#", scheme + 3);
+    const size_t authorityEnd = end == std::wstring::npos ? canonicalUrl.size() : end;
+    return Key(canonicalUrl.substr(0, authorityEnd)) + ToUtf8(canonicalUrl.substr(authorityEnd));
 }
 
 std::string DocKey(const std::wstring& docId)
 {
-    return Key(docId);
+    const size_t colon = docId.find(L':');
+    if (colon == std::wstring::npos) return ToUtf8(docId);
+    // Provider-specific normalization belongs in UrlCanonicalizer. Opaque payloads
+    // (Google/YouTube/Figma IDs, for example) must never be case-folded here.
+    return Key(docId.substr(0, colon + 1)) + ToUtf8(docId.substr(colon + 1));
 }
 
 std::wstring BaseName(const std::wstring& path)

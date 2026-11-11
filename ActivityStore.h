@@ -91,11 +91,17 @@ struct AppFocusActivity
     std::wstring exeName;
     std::wstring exePath;
     std::wstring windowTitle;
+    std::wstring aumid;
     int          durationSecs = 0;  // wall-clock length (legacy field)
-    int          activeSecs = 0;    // excludes idle/away time
+    int          activeSecs = -1;   // interaction-active; -1 = unknown, never wall time
+    int          passiveSecs = -1;  // device-wide passive presence, not proven document attention
+    int          idleSecs = -1;
+    int          unknownSecs = 0;
+    std::string  attentionStatus;  // measured | unknown | legacy_combined
     std::string  docKey;            // resolved document/URL entity key ("" if unresolved)
     std::wstring docDisplay;
     std::string  docType;           // file | url | webdoc | ""
+    std::string  docResolution;     // unresolved | ambiguous | filename_candidate | browser_window
     double       confidence = 1.0;
 };
 
@@ -160,11 +166,14 @@ struct FocusEventRecord
     std::wstring windowClass;
     std::wstring desktopId;
     std::wstring aumid;
-    int          activeSecs = 0;
+    int          activeSecs = -1;
     int          idleSecs = 0;
+    int          passiveSecs = 0;
+    int          unknownSecs = 0;
     std::string  docKey;            // entity key of the document/URL this session was about
     std::wstring docDisplay;
     std::string  docType;           // file | url | webdoc
+    std::string  docResolution = "unresolved";
     std::string  presence;
     EventContext ctx;               // captured at session START
 };
@@ -324,6 +333,8 @@ private:
     bool OpenConnection(sqlite3** db, bool writer);
     bool CheckIntegrityOrQuarantine();
     bool Migrate();
+    bool MigrateV3();
+    bool RekeyWebIdentities();
     void WriterLoop();
     void RunBatch(std::vector<Job>& batch);
     void ReleaseReader(sqlite3* db);

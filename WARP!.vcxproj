@@ -267,6 +267,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="ActivityStore.h" />
+    <ClInclude Include="Attention.h" />
     <ClInclude Include="AddressBarReader.h" />
     <ClInclude Include="ApiServer.h" />
     <ClInclude Include="ClipboardMonitor.h" />

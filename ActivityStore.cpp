@@ -1,10 +1,12 @@
 #include "framework.h"
 #include "ActivityStore.h"
+#include "Attention.h"
 #include "sqlite3.h"
 #include "EntityKey.h"
 #include "EntityStore.h"
 #include "UrlCanonicalizer.h"
 #include "Logger.h"
+#include "Json.h"
 
 #include <ctime>
 #include <cmath>
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <utility>
 
@@ -191,6 +194,35 @@ namespace
         EntityKey::RegisterSqliteFunctions(db);
         sqlite3_create_function_v2(db, "warp_canon_url", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr, SqlCanonUrl, nullptr, nullptr, nullptr);
         sqlite3_create_function_v2(db, "warp_url_excluded", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr, SqlUrlExcluded, nullptr, nullptr, nullptr);
+        sqlite3_create_function_v2(db, "warp_snapshot_has_key", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr,
+            [](sqlite3_context* context, int, sqlite3_value** args) {
+                try
+                {
+                    const auto* json = sqlite3_value_text(args[0]);
+                    const auto* key = sqlite3_value_text(args[1]);
+                    if (!json || !key) { sqlite3_result_int(context, 0); return; }
+                    const auto parsed = WarpJson::Parse(std::string(reinterpret_cast<const char*>(json), sqlite3_value_bytes(args[0])));
+                    const std::string target(reinterpret_cast<const char*>(key), sqlite3_value_bytes(args[1]));
+                    if (target.empty()) { sqlite3_result_int(context, 0); return; }
+                    bool caseSensitive = target.find("://") != std::string::npos;
+                    for (const char* prefix : { "doc:", "yt:", "gdoc:", "gdrive:", "spo:", "spo-path:", "od:", "gh:", "ado:", "figma:", "jira:" })
+                        if (target.compare(0, strlen(prefix), prefix) == 0) caseSensitive = true;
+                    std::function<bool(const WarpJson::Value&, bool)> contains = [&](const WarpJson::Value& v, bool identity) {
+                        if (v.isString())
+                        {
+                            if (identity) return v.asString() == target;
+                            const std::string text = caseSensitive ? v.asString() : EntityKey::Key(EntityKey::FromUtf8(v.asString()));
+                            return text.find(target) != std::string::npos; // preserve conservative deletion of references inside prose
+                        }
+                        for (const auto& member : v.members())
+                            if (contains(member.second, member.first == "entity_key" || member.first == "doc_key")) return true;
+                        for (const auto& item : v.items()) if (contains(item, false)) return true;
+                        return false;
+                    };
+                    sqlite3_result_int(context, !parsed.ok || contains(parsed.value, false));
+                }
+                catch (...) { sqlite3_result_error(context, "snapshot identity parsing failed", -1); }
+            }, nullptr, nullptr, nullptr);
     }
 
     int64_t FileSize(const std::wstring& p)
@@ -523,7 +555,7 @@ namespace
         "UPDATE browsing_activity SET url = warp_canon_url(url) WHERE url IS NOT NULL AND url <> '' AND entity_key IS NULL;",
         "UPDATE browsing_activity SET entity_key = warp_key(COALESCE(NULLIF(url, ''), title)), event_ms = COALESCE(event_ms, timestamp * 1000), source = COALESCE(source, 'uia') WHERE entity_key IS NULL;",
         "UPDATE app_focus_activity SET entity_key = warp_file_key(exe_path), event_ms = COALESCE(event_ms, timestamp * 1000), end_ts = COALESCE(end_ts, timestamp), "
-        "start_ts = COALESCE(start_ts, timestamp - duration_secs), active_secs = COALESCE(active_secs, duration_secs), idle_secs = COALESCE(idle_secs, 0), source = COALESCE(source, 'focus') WHERE entity_key IS NULL;",
+        "start_ts = COALESCE(start_ts, timestamp - duration_secs), source = COALESCE(source, 'focus') WHERE entity_key IS NULL;",
         // Re-key the per-entity store with the shared canonicalizer, merging collisions and
         // dropping sign-in / password-manager URLs that older builds stored verbatim.
         "DELETE FROM inference WHERE entity_type = 'url' AND warp_url_excluded(entity_key) = 1;",
@@ -555,7 +587,7 @@ namespace
         "FROM app_launch_activity WHERE entity_key IS NOT NULL GROUP BY 1, 2 "
         "ON CONFLICT (entity_key, day) DO UPDATE SET opens = opens + excluded.opens;",
         "INSERT INTO entity_day (entity_key, day, opens, edits, active_secs, sessions) "
-        "SELECT entity_key, CAST(julianday(timestamp, 'unixepoch', 'localtime') - 2440587.5 AS INTEGER), 0, 0, SUM(COALESCE(active_secs, duration_secs)), COUNT(*) "
+        "SELECT entity_key, CAST(julianday(timestamp, 'unixepoch', 'localtime') - 2440587.5 AS INTEGER), 0, 0, SUM(COALESCE(active_secs, 0)), COUNT(*) "
         "FROM app_focus_activity WHERE entity_key IS NOT NULL GROUP BY 1, 2 "
         "ON CONFLICT (entity_key, day) DO UPDATE SET active_secs = active_secs + excluded.active_secs, sessions = sessions + excluded.sessions;",
         "INSERT INTO entity_day (entity_key, day, opens, edits, active_secs, sessions) "
@@ -627,7 +659,7 @@ bool ActivityStore::Migrate()
 {
     int64_t ver = QueryInt(m_wdb, "PRAGMA user_version;", 0);
     if (ver >= 2)
-        return true;
+        return MigrateV3();
 
     WARP_LOG_INFO("store", "migrating schema v%lld -> v2", (long long)ver);
     std::string err;
@@ -704,7 +736,264 @@ bool ActivityStore::Migrate()
         Exec(m_wdb, "VACUUM;");
     }
     WARP_LOG_INFO("store", "schema migration to v2 complete (fts=%d)", fts ? 1 : 0);
-    return true;
+    return MigrateV3();
+}
+
+bool ActivityStore::RekeyWebIdentities()
+{
+    struct Row { int64_t id; std::string before, after; BrowseEventRecord browse; };
+    std::vector<Row> pages, documents;
+    std::map<std::string, std::set<std::string>> candidates;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(m_wdb, "SELECT id, entity_key, url, doc_id, title, browser, host, event_ms, timestamp, confidence FROM browsing_activity;",
+                           -1, &st, nullptr) != SQLITE_OK) return false;
+    while (sqlite3_step(st) == SQLITE_ROW)
+    {
+        Row row;
+        row.id = sqlite3_column_int64(st, 0);
+        row.before = ColU(st, 1);
+        row.browse.url = ColW(st, 2);
+        row.browse.docId = ColW(st, 3);
+        row.browse.title = ColW(st, 4);
+        row.browse.browser = ColW(st, 5);
+        row.browse.host = ColW(st, 6);
+        if (row.browse.docId.empty() && !row.browse.url.empty())
+        {
+            const auto canonical = UrlCanon::Canonicalize(row.browse.url);
+            row.browse.docId = canonical.docId;
+            row.browse.docKind = canonical.docKind;
+        }
+        row.browse.eventMs = sqlite3_column_type(st, 7) == SQLITE_NULL ? sqlite3_column_int64(st, 8) * 1000 : sqlite3_column_int64(st, 7);
+        row.browse.ctx.confidence = sqlite3_column_type(st, 9) == SQLITE_NULL ? 1.0 : sqlite3_column_double(st, 9);
+        row.after = StoreUtil::WebEntityKey(row.browse.url, row.browse.docId, row.browse.title);
+        if (!row.before.empty() && (!row.browse.url.empty() || !row.browse.docId.empty())) candidates[row.before].insert(row.after);
+        pages.push_back(std::move(row));
+    }
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(m_wdb, "SELECT id, doc_key, doc_display FROM app_focus_activity WHERE doc_type IN ('url','webdoc') AND doc_key IS NOT NULL;",
+                           -1, &st, nullptr) != SQLITE_OK) return false;
+    while (sqlite3_step(st) == SQLITE_ROW)
+    {
+        Row row;
+        row.id = sqlite3_column_int64(st, 0);
+        row.before = ColU(st, 1);
+        const auto display = ColW(st, 2);
+        if (UrlCanon::LooksLikeUrl(display)) row.after = EntityStore::NormalizeKey(display);
+        candidates[row.before].insert(row.after);
+        documents.push_back(std::move(row));
+    }
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(m_wdb, "SELECT entity_key, display_name FROM inference WHERE entity_type='url';", -1, &st, nullptr) != SQLITE_OK) return false;
+    while (sqlite3_step(st) == SQLITE_ROW)
+    {
+        const std::string old = ColU(st, 0);
+        const auto display = ColW(st, 1);
+        auto& keys = candidates[old];
+        if (UrlCanon::LooksLikeUrl(display)) keys.insert(EntityStore::NormalizeKey(display));
+        if (keys.empty()) keys.insert(""); // no recoverable identity, not proof of a lowercase resource
+    }
+    sqlite3_finalize(st);
+    if (!Exec(m_wdb, "CREATE TEMP TABLE web_rekey (old_key TEXT PRIMARY KEY, new_key TEXT);")) return false;
+    std::map<std::string, std::string> replacements;
+    if (sqlite3_prepare_v2(m_wdb, "INSERT INTO web_rekey VALUES (?1, ?2);", -1, &st, nullptr) != SQLITE_OK) return false;
+    for (const auto& pair : candidates)
+    {
+        const std::string next = pair.second.size() == 1 ? *pair.second.begin() : "";
+        replacements[pair.first] = next;
+        sqlite3_reset(st);
+        BindText(st, 1, pair.first);
+        BindText(st, 2, next);
+        if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return false; }
+    }
+    sqlite3_finalize(st);
+    auto updateRows = [&](const std::vector<Row>& rows, const char* sql, bool browsing = false) {
+        sqlite3_stmt* update = nullptr;
+        if (sqlite3_prepare_v2(m_wdb, sql, -1, &update, nullptr) != SQLITE_OK) return false;
+        bool ok = true;
+        for (const auto& row : rows)
+        {
+            sqlite3_reset(update);
+            sqlite3_bind_int64(update, 1, row.id);
+            BindText(update, 2, row.after);
+            if (browsing)
+            {
+                BindText(update, 3, row.browse.docId);
+                BindText(update, 4, row.browse.docKind);
+            }
+            if (sqlite3_step(update) != SQLITE_DONE) { ok = false; break; }
+        }
+        sqlite3_finalize(update);
+        return ok;
+    };
+    if (!updateRows(pages, "UPDATE browsing_activity SET entity_key=?2, doc_id=?3, doc_kind=COALESCE(NULLIF(?4,''),doc_kind) WHERE id=?1;", true) ||
+        !updateRows(documents, "UPDATE app_focus_activity SET doc_key=?2, doc_resolution=CASE WHEN ?2 IS NULL THEN 'unresolved' ELSE 'legacy_candidate' END WHERE id=?1;")) return false;
+    std::set<std::string> rebuild;
+    std::map<std::string, std::vector<std::string>> reverse;
+    for (const auto& pair : replacements)
+        if (pair.second.empty()) rebuild.insert(pair.first);
+        else reverse[pair.second].push_back(pair.first);
+    for (const auto& pair : reverse) if (pair.second.size() > 1)
+        rebuild.insert(pair.second.begin(), pair.second.end());
+    if (!Exec(m_wdb, "CREATE TEMP TABLE web_rebuild (entity_key TEXT PRIMARY KEY);")) return false;
+    if (sqlite3_prepare_v2(m_wdb, "INSERT INTO web_rebuild VALUES (?1);", -1, &st, nullptr) != SQLITE_OK) return false;
+    for (const auto& key : rebuild)
+    {
+        sqlite3_reset(st);
+        BindText(st, 1, key);
+        if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return false; }
+    }
+    sqlite3_finalize(st);
+    const char* sql[] = {
+        // Never distribute a collided aggregate across candidate identities without evidence.
+        "DELETE FROM entity_day WHERE entity_key IN (SELECT entity_key FROM web_rebuild);",
+        "DELETE FROM inference WHERE entity_key IN (SELECT entity_key FROM web_rebuild);",
+        "UPDATE work_thread SET label='', centroid=NULL, project_key='' WHERE id IN (SELECT thread_id FROM thread_member WHERE entity_key IN (SELECT entity_key FROM web_rebuild));",
+        "DELETE FROM thread_member WHERE entity_key IN (SELECT entity_key FROM web_rebuild);",
+        "DELETE FROM edge WHERE a IN (SELECT entity_key FROM web_rebuild) OR b IN (SELECT entity_key FROM web_rebuild);",
+        "INSERT INTO entity_alias(alias_key,entity_key,created_ts) SELECT old_key,new_key,CAST(strftime('%s','now') AS INTEGER) FROM web_rekey;",
+        "UPDATE inference SET entity_key=(SELECT new_key FROM web_rekey WHERE old_key=inference.entity_key) WHERE entity_key IN (SELECT old_key FROM web_rekey WHERE new_key IS NOT NULL AND old_key<>new_key);",
+        "UPDATE entity_day SET entity_key=(SELECT new_key FROM web_rekey WHERE old_key=entity_day.entity_key) WHERE entity_key IN (SELECT old_key FROM web_rekey WHERE new_key IS NOT NULL AND old_key<>new_key);",
+        "UPDATE thread_member SET entity_key=(SELECT new_key FROM web_rekey WHERE old_key=thread_member.entity_key) WHERE entity_key IN (SELECT old_key FROM web_rekey WHERE new_key IS NOT NULL AND old_key<>new_key);",
+        "CREATE TEMP TABLE rekey_edges AS SELECT COALESCE(a.new_key,e.a) AS a, COALESCE(b.new_key,e.b) AS b, e.weight,e.last_ts FROM edge e LEFT JOIN web_rekey a ON a.old_key=e.a LEFT JOIN web_rekey b ON b.old_key=e.b;",
+        "DELETE FROM edge;",
+        "INSERT INTO edge SELECT MIN(a,b),MAX(a,b),MAX(weight),MAX(last_ts) FROM rekey_edges WHERE a<>b GROUP BY MIN(a,b),MAX(a,b);",
+        "DROP TABLE rekey_edges;",
+    };
+    for (const char* q : sql) if (!Exec(m_wdb, q)) return false;
+
+    // Rebuild only collided web aggregates, using the retained original observations.
+    // History outside raw retention is not assignable to either case-sensitive identity.
+    std::atomic<int64_t> seq{ QueryInt(m_wdb, "SELECT MAX(s) FROM (SELECT MAX(change_seq) s FROM inference UNION ALL SELECT MAX(change_seq) FROM tombstone UNION ALL SELECT MAX(change_seq) FROM work_thread UNION ALL SELECT CAST(value AS INTEGER) FROM meta WHERE key IN ('reset_seq','change_seq_hw'));") };
+    WriterContext w;
+    w.db = m_wdb;
+    w.nowMs = StoreUtil::NowMs();
+    w.m_seq = &seq;
+    w.ftsAvailable = QueryText(m_wdb, "SELECT value FROM meta WHERE key='fts_available';") == "1";
+    EntityStore repair(this);
+    std::sort(pages.begin(), pages.end(), [](const Row& a, const Row& b) {
+        return a.browse.eventMs != b.browse.eventMs ? a.browse.eventMs < b.browse.eventMs : a.id < b.id;
+    });
+    for (const auto& page : pages)
+        if (rebuild.count(page.before)) repair.OnBrowseEvent(w, page.browse);
+    for (const auto& entry : w.m_cache) sqlite3_finalize(entry.second);
+    if (w.ftsAvailable)
+    {
+        if (!Exec(m_wdb, "DELETE FROM activity_fts;") ||
+            !Exec(m_wdb, "INSERT INTO activity_fts(rowid,kind,ref,ts,text) SELECT rowid,entity_type,entity_key,last_event_ts,COALESCE(display_name,'') || ' ' || COALESCE(title,'') FROM inference;")) return false;
+    }
+    std::function<WarpJson::Value(const WarpJson::Value&)> rewrite = [&](const WarpJson::Value& value) {
+        if (value.isArray())
+        {
+            auto result = WarpJson::Value::Array();
+            for (const auto& item : value.items())
+            {
+                auto next = rewrite(item);
+                if (!next.isNull()) result.push(std::move(next));
+            }
+            return result;
+        }
+        if (!value.isObject()) return value;
+        const auto match = replacements.find(value.get("entity_key").asString());
+        if (match != replacements.end() && match->second.empty()) return WarpJson::Value::Null();
+        auto result = WarpJson::Value::Object();
+        for (const auto& member : value.members()) result.set(member.first, rewrite(member.second));
+        if (match != replacements.end()) result.set("entity_key", WarpJson::Value::String(match->second));
+        return result;
+    };
+    sqlite3_stmt* update = nullptr;
+    if (sqlite3_prepare_v2(m_wdb, "SELECT id,json FROM context_snapshot;", -1, &st, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(m_wdb, "UPDATE context_snapshot SET json=?2 WHERE id=?1;", -1, &update, nullptr) != SQLITE_OK)
+    { sqlite3_finalize(st); return false; }
+    bool ok = true;
+    while (sqlite3_step(st) == SQLITE_ROW)
+    {
+        const auto parsed = WarpJson::Parse(ColU(st, 1));
+        if (!parsed.ok || !parsed.value.isObject()) continue;
+        auto value = rewrite(parsed.value);
+        value.set("attention_semantics", WarpJson::Value::String("legacy_combined"));
+        sqlite3_reset(update);
+        sqlite3_bind_int64(update, 1, sqlite3_column_int64(st, 0));
+        BindText(update, 2, WarpJson::Serialize(value));
+        if (sqlite3_step(update) != SQLITE_DONE) { ok = false; break; }
+    }
+    sqlite3_finalize(st);
+    sqlite3_finalize(update);
+    if (!ok) return false;
+    if (!candidates.empty() || QueryInt(m_wdb, "SELECT COUNT(*) FROM app_focus_activity;") > 0)
+    {
+        const std::string reset = std::to_string(++seq);
+        // Every bootstrap page must advance past the new epoch, or page two would
+        // request another reset. Put tombstones first (oldest first), so retention
+        // cannot prune a resequenced delete above the surviving bootstrap upserts.
+        const std::string renumber =
+            "CREATE TEMP TABLE feed_rekey AS SELECT kind,row_id," + reset +
+            "+ROW_NUMBER() OVER(ORDER BY kind,ts,old_seq,row_id) AS new_seq FROM ("
+            "SELECT 0 AS kind,change_seq AS row_id,ts,change_seq AS old_seq FROM tombstone "
+            "UNION ALL SELECT 1,rowid,0,change_seq FROM inference "
+            "UNION ALL SELECT 2,id,0,change_seq FROM work_thread);"
+            "CREATE UNIQUE INDEX temp.idx_feed_rekey ON feed_rekey(kind,row_id);"
+            "UPDATE tombstone SET change_seq=(SELECT new_seq FROM feed_rekey WHERE kind=0 AND row_id=tombstone.change_seq);"
+            "UPDATE inference SET change_seq=(SELECT new_seq FROM feed_rekey WHERE kind=1 AND row_id=inference.rowid);"
+            "UPDATE inference SET version=change_seq;"
+            "UPDATE work_thread SET change_seq=(SELECT new_seq FROM feed_rekey WHERE kind=2 AND row_id=work_thread.id);";
+        if (!Exec(m_wdb, renumber.c_str())) return false;
+        seq += QueryInt(m_wdb, "SELECT COUNT(*) FROM feed_rekey;");
+        if (!Exec(m_wdb, ("INSERT OR REPLACE INTO meta(key,value) VALUES ('reset_seq','" + reset +
+                           "'),('change_seq_hw','" + std::to_string(seq.load()) + "'); DROP TABLE feed_rekey;").c_str())) return false;
+    }
+    return Exec(m_wdb, "DROP TABLE web_rekey; DROP TABLE web_rebuild;");
+}
+
+bool ActivityStore::MigrateV3()
+{
+    if (QueryInt(m_wdb, "PRAGMA user_version;", 0) >= 3) return true;
+    if (!Exec(m_wdb, "BEGIN IMMEDIATE;")) return false;
+    const char* steps[] = {
+        "ALTER TABLE app_focus_activity ADD COLUMN passive_secs INTEGER;",
+        "ALTER TABLE app_focus_activity ADD COLUMN unknown_secs INTEGER;",
+        "ALTER TABLE app_focus_activity ADD COLUMN doc_resolution TEXT;",
+        "ALTER TABLE work_session ADD COLUMN accounting_version INTEGER NOT NULL DEFAULT 0;",
+        "CREATE TABLE session_attention (start_ts INTEGER PRIMARY KEY, end_ts INTEGER NOT NULL, active_rate REAL NOT NULL, passive_rate REAL NOT NULL) WITHOUT ROWID;",
+        "CREATE INDEX idx_session_attention_end ON session_attention(end_ts);",
+        "CREATE TABLE entity_alias (alias_key TEXT PRIMARY KEY, entity_key TEXT, created_ts INTEGER NOT NULL) WITHOUT ROWID;",
+        "CREATE INDEX idx_entity_alias_target ON entity_alias(entity_key);",
+        "UPDATE work_session SET active_secs = MIN(MAX(0, active_secs), MAX(0, end_ts - start_ts)), "
+        "passive_secs = MIN(MAX(0, passive_secs), MAX(0, end_ts - start_ts - MIN(MAX(0, active_secs), MAX(0, end_ts - start_ts))));",
+    };
+    bool ok = true;
+    for (const char* sql : steps) if (ok) ok = Exec(m_wdb, sql);
+    // Older session totals cannot reveal where attention occurred. Preserve only a
+    // bounded estimate, explicitly version 0; never add a new sensor's time on top.
+    std::vector<Attention::Span> old;
+    sqlite3_stmt* st = nullptr;
+    if (ok && sqlite3_prepare_v2(m_wdb, "SELECT start_ts, end_ts, active_secs, passive_secs FROM work_session WHERE end_ts > start_ts;",
+                                -1, &st, nullptr) == SQLITE_OK)
+    {
+        while (sqlite3_step(st) == SQLITE_ROW)
+        {
+            const int64_t s = sqlite3_column_int64(st, 0), e = sqlite3_column_int64(st, 1);
+            old.push_back({ s, e, sqlite3_column_double(st, 2) / (e - s), sqlite3_column_double(st, 3) / (e - s) });
+        }
+        sqlite3_finalize(st);
+        st = nullptr;
+        ok = sqlite3_prepare_v2(m_wdb, "INSERT INTO session_attention VALUES (?1, ?2, ?3, ?4);", -1, &st, nullptr) == SQLITE_OK;
+        if (ok) for (const auto& s : Attention::Union(old))
+        {
+            sqlite3_reset(st);
+            sqlite3_bind_int64(st, 1, s.start);
+            sqlite3_bind_int64(st, 2, s.end);
+            sqlite3_bind_double(st, 3, s.active);
+            sqlite3_bind_double(st, 4, s.passive);
+            if (sqlite3_step(st) != SQLITE_DONE) { ok = false; break; }
+        }
+        if (st) sqlite3_finalize(st);
+    }
+    else ok = false;
+    if (ok) ok = RekeyWebIdentities();
+    if (ok) ok = Exec(m_wdb, "PRAGMA user_version = 3;");
+    if (ok) ok = Exec(m_wdb, "COMMIT;");
+    if (!ok) Exec(m_wdb, "ROLLBACK;");
+    return ok;
 }
 
 // =====================================================================
@@ -966,8 +1255,9 @@ namespace
     const char* const kInsFocus =
         "INSERT INTO app_focus_activity (timestamp, exe_name, exe_path, window_title, duration_secs, "
         "source_pid, source_exe, foreground_pid, foreground_exe, ms_since_input, parent_pid, parent_exe, created_window_ms, confidence, "
-        "entity_key, event_ms, source, start_ts, end_ts, active_secs, idle_secs, doc_key, doc_display, doc_type, window_class, desktop_id, aumid, presence) "
-        "VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+        "entity_key, event_ms, source, start_ts, end_ts, active_secs, idle_secs, doc_key, doc_display, doc_type, window_class, desktop_id, aumid, presence, "
+        "passive_secs, unknown_secs, doc_resolution) "
+        "VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?);";
     const char* const kInsPresence = "INSERT INTO presence_interval (start_ts, end_ts, state) VALUES (?,?,?);";
     const char* const kInsClip = "INSERT INTO clipboard_activity (timestamp, event_ms, owner_exe, formats) VALUES (?,?,?,?);";
     const char* const kInsPrint = "INSERT INTO print_activity (timestamp, event_ms, document, printer, pages) VALUES (?,?,?,?,?);";
@@ -1247,11 +1537,23 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
 {
     return EnqueueRecord([this, r = std::move(r)](WriterContext& w)
     {
-        auto insert = [this, &w](const FocusEventRecord& f, int64_t startMs, int64_t endMs)
+        auto insert = [this, &w](FocusEventRecord f, int64_t startMs, int64_t endMs)
         {
             sqlite3_stmt* st = w.Stmt(kInsFocus);
             if (!st) return;
-            int duration = (int)((endMs - startMs) / 1000);
+            int duration = (int)((std::max)(int64_t(0), endMs - startMs) / 1000);
+            f.activeSecs = f.activeSecs < 0 ? -1 : (std::min)(duration, f.activeSecs);
+            int remaining = duration - (std::max)(0, f.activeSecs);
+            f.passiveSecs = (std::max)(0, (std::min)(remaining, f.passiveSecs));
+            remaining -= f.passiveSecs;
+            f.idleSecs = (std::max)(0, (std::min)(remaining, f.idleSecs));
+            f.unknownSecs = remaining - f.idleSecs;
+            if (f.docResolution == "ambiguous")
+            {
+                f.docKey.clear();
+                f.docDisplay.clear();
+                f.docType.clear();
+            }
             sqlite3_bind_int64(st, 1, endMs / 1000);
             BindText(st, 2, f.exeName);
             BindText(st, 3, f.exePath);
@@ -1263,7 +1565,8 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             BindText(st, 17, std::string("focus"));
             sqlite3_bind_int64(st, 18, startMs / 1000);
             sqlite3_bind_int64(st, 19, endMs / 1000);
-            sqlite3_bind_int(st, 20, f.activeSecs);
+            if (f.activeSecs < 0) sqlite3_bind_null(st, 20);
+            else sqlite3_bind_int(st, 20, f.activeSecs);
             sqlite3_bind_int(st, 21, f.idleSecs);
             BindText(st, 22, f.docKey);
             BindText(st, 23, f.docDisplay);
@@ -1272,6 +1575,9 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             BindText(st, 26, f.desktopId);
             BindText(st, 27, f.aumid);
             BindText(st, 28, f.presence);
+            sqlite3_bind_int(st, 29, f.passiveSecs);
+            sqlite3_bind_int(st, 30, f.unknownSecs);
+            BindText(st, 31, f.docResolution);
             if (sqlite3_step(st) != SQLITE_DONE)
                 WARP_LOG_WARN("store", "focus insert failed: %s", sqlite3_errmsg(w.db));
             FocusEventRecord copy = f;
@@ -1304,13 +1610,13 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             return;
         }
         // A session that was still open during a purge keeps only its parts outside what was purged.
-        const double total = (double)(std::max)((int64_t)1, endMs - startMs);
         for (const auto& p : parts)
         {
-            const double share = (double)(p.second - p.first) / total;
             FocusEventRecord piece = r;
-            piece.activeSecs = (int)(r.activeSecs * share + 0.5);
-            piece.idleSecs = (int)(r.idleSecs * share + 0.5);
+            piece.activeSecs = Attention::Clip(r.activeSecs, startMs, endMs, p.first, p.second);
+            piece.idleSecs = Attention::Clip(r.idleSecs, startMs, endMs, p.first, p.second);
+            piece.passiveSecs = Attention::Clip(r.passiveSecs, startMs, endMs, p.first, p.second);
+            piece.unknownSecs = Attention::Clip(r.unknownSecs, startMs, endMs, p.first, p.second);
             insert(piece, p.first, p.second);
         }
     });
@@ -1545,7 +1851,8 @@ std::vector<AppFocusActivity> ActivityStore::QueryFocus(int64_t startUtc, int64_
     if (!rl) return out;
     const char* sql =
         "SELECT id, timestamp, COALESCE(start_ts, timestamp - duration_secs), COALESCE(end_ts, timestamp), exe_name, exe_path, window_title, "
-        "duration_secs, COALESCE(active_secs, duration_secs), doc_key, doc_display, doc_type, COALESCE(confidence, 1.0) FROM app_focus_activity "
+        "duration_secs, active_secs, doc_key, doc_display, doc_type, COALESCE(confidence, 1.0), aumid, passive_secs, idle_secs, unknown_secs, "
+        "COALESCE(doc_resolution, CASE WHEN COALESCE(doc_key,'')='' THEN 'unresolved' ELSE 'legacy_candidate' END) FROM app_focus_activity "
         "WHERE COALESCE(end_ts, timestamp) >= ?1 AND COALESCE(start_ts, timestamp - duration_secs) <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
         "AND (?3 = 0 OR COALESCE(end_ts, timestamp) < (SELECT COALESCE(end_ts, timestamp) FROM app_focus_activity WHERE id = ?3) "
         "     OR (COALESCE(end_ts, timestamp) = (SELECT COALESCE(end_ts, timestamp) FROM app_focus_activity WHERE id = ?3) AND id < ?3)) "
@@ -1564,11 +1871,20 @@ std::vector<AppFocusActivity> ActivityStore::QueryFocus(int64_t startUtc, int64_
         f.exePath = ColW(st, 5);
         f.windowTitle = ColW(st, 6);
         f.durationSecs = sqlite3_column_int(st, 7);
-        f.activeSecs = sqlite3_column_int(st, 8);
+        f.activeSecs = sqlite3_column_type(st, 8) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 8);
         f.docKey = ColU(st, 9);
         f.docDisplay = ColW(st, 10);
         f.docType = ColU(st, 11);
         f.confidence = sqlite3_column_double(st, 12);
+        f.aumid = ColW(st, 13);
+        const bool legacy = sqlite3_column_type(st, 14) == SQLITE_NULL;
+        f.passiveSecs = legacy ? -1 : sqlite3_column_int(st, 14);
+        f.idleSecs = sqlite3_column_type(st, 15) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 15);
+        if (legacy && f.activeSecs > 0) f.activeSecs = -1; // v2 combined active+passive; do not invent a split
+        f.unknownSecs = (std::max)(0, f.durationSecs - (std::max)(0, f.activeSecs) -
+                                    (std::max)(0, f.passiveSecs) - (std::max)(0, f.idleSecs));
+        f.attentionStatus = legacy ? "legacy_combined" : (f.activeSecs < 0 || f.unknownSecs > 0 ? "unknown" : "measured");
+        f.docResolution = ColU(st, 17);
         out.push_back(std::move(f));
     }
     sqlite3_finalize(st);
@@ -1660,6 +1976,9 @@ namespace
         }
         sqlite3_stmt* del = w.Stmt("DELETE FROM inference WHERE entity_key = ?;");
         if (del) { BindText(del, 1, key); sqlite3_step(del); }
+        sqlite3_stmt* alias = w.Stmt("DELETE FROM entity_alias WHERE entity_key=?1 OR "
+            "(entity_key IS NULL AND alias_key=warp_key(?1) AND NOT EXISTS(SELECT 1 FROM inference WHERE entity_type='url' AND warp_key(entity_key)=entity_alias.alias_key));");
+        if (alias) { BindText(alias, 1, key); sqlite3_step(alias); }
     }
 
     std::string EscapeLike(const std::string& s)
@@ -1719,6 +2038,8 @@ void ActivityStore::DoMaintenance(WriterContext& w)
     n += ExecDelete(w.db, "DELETE FROM entity_day WHERE day < ?1;", dayCut);
     n += ExecDelete(w.db, "DELETE FROM edge WHERE last_ts < ?1;", entCut);
     n += ExecDelete(w.db, "DELETE FROM work_session WHERE end_ts < ?1;", entCut);
+    n += ExecDelete(w.db, "DELETE FROM session_attention WHERE end_ts < ?1;", entCut);
+    n += ExecDelete(w.db, "DELETE FROM entity_alias WHERE created_ts<?1 OR (entity_key IS NOT NULL AND entity_key NOT IN (SELECT entity_key FROM inference));", entCut);
     n += ExecDelete(w.db, "DELETE FROM thread_span WHERE end_ts < ?1;", entCut);
     n += ExecDelete(w.db, "DELETE FROM thread_member WHERE thread_id IN (SELECT id FROM work_thread WHERE last_ts < ?1);", entCut);
     n += ExecDelete(w.db, "DELETE FROM work_thread WHERE last_ts < ?1;", entCut);
@@ -1768,7 +2089,7 @@ void ActivityStore::DoClearAll(WriterContext& w)
     static const char* const kTables[] = {
         "file_activity", "app_launch_activity", "browsing_activity", "app_focus_activity", "inference",
         "entity_day", "tombstone", "presence_interval", "context_snapshot", "edge", "work_session",
-        "work_thread", "thread_member", "thread_span", "clipboard_activity", "print_activity",
+        "work_thread", "thread_member", "thread_span", "clipboard_activity", "print_activity", "session_attention", "entity_alias",
     };
     for (const char* t : kTables)
     {
@@ -1848,7 +2169,7 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
     {
         const std::string& k = spec.entityKey;
         collectThreads("SELECT thread_id FROM thread_member WHERE entity_key = ?1 "
-                       "UNION SELECT thread_id FROM context_snapshot WHERE thread_id IS NOT NULL AND instr(lower(replace(json, '\\\\', '\\')), ?1) > 0;", k);
+                       "UNION SELECT thread_id FROM context_snapshot WHERE thread_id IS NOT NULL AND warp_snapshot_has_key(json, ?1)=1;", k);
         n += bindRun("DELETE FROM file_activity WHERE entity_key = ?1;", k);
         n += bindRun("DELETE FROM app_launch_activity WHERE entity_key = ?1;", k);
         n += bindRun("DELETE FROM browsing_activity WHERE entity_key = ?1;", k);
@@ -1866,7 +2187,7 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
         }
         TombstoneEntity(w, m_sinks, k, type, "purge");
         ++n;
-        n += bindRun("DELETE FROM context_snapshot WHERE instr(lower(replace(json, '\\\\', '\\')), ?1) > 0;", k);
+        n += bindRun("DELETE FROM context_snapshot WHERE warp_snapshot_has_key(json, ?1)=1;", k);
         AddFloor(w, PurgeFloor{ 1, k, 0, w.nowMs - 1 });
     }
     if (!spec.domain.empty())
@@ -2162,12 +2483,13 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
         // Focus sessions overlapping the range keep their parts outside it (seconds scaled to the kept share); what
         // the removed part had credited (to the day the session ended) comes off that day's rollups.
         {
-            struct F { int64_t id, s, e; int act, idle; std::string app, doc; };
+            struct F { int64_t id, s, e; int act, idle; std::string app, doc; int passive, unknown; };
             std::vector<F> rows;
             sqlite3_stmt* st = nullptr;
             if (sqlite3_prepare_v2(w.db,
                 "SELECT id, COALESCE(start_ts, timestamp - COALESCE(duration_secs, 0)), COALESCE(end_ts, timestamp), "
-                "COALESCE(active_secs, duration_secs, 0), COALESCE(idle_secs, 0), COALESCE(entity_key, ''), COALESCE(doc_key, '') "
+                "COALESCE(active_secs, -1), COALESCE(idle_secs, -1), COALESCE(entity_key, ''), COALESCE(doc_key, ''), "
+                "COALESCE(passive_secs, -1), COALESCE(unknown_secs, -1) "
                 "FROM app_focus_activity WHERE COALESCE(end_ts, timestamp) >= ?1 AND COALESCE(start_ts, timestamp) <= ?2;",
                 -1, &st, nullptr) == SQLITE_OK)
             {
@@ -2175,13 +2497,13 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
                 sqlite3_bind_int64(st, 2, b);
                 while (sqlite3_step(st) == SQLITE_ROW)
                     rows.push_back({ sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2),
-                                     sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), ColU(st, 5), ColU(st, 6) });
+                                     sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), ColU(st, 5), ColU(st, 6),
+                                     sqlite3_column_int(st, 7), sqlite3_column_int(st, 8) });
                 sqlite3_finalize(st);
             }
             for (const F& f : rows)
             {
                 const std::vector<std::pair<int64_t, int64_t>> keep = outside(f.s, f.e);
-                const double len = (double)(std::max)((int64_t)1, f.e - f.s);
                 // EntityStore credited the whole session (when it had 2 active seconds or more) to the day it ended;
                 // the kept parts are credited to the days they end on instead.
                 auto adjust = [&](int64_t endTs, int act, int sign)
@@ -2205,20 +2527,26 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
                 }
                 for (size_t i = 0; i < keep.size(); ++i)
                 {
-                    const double share = (double)(keep[i].second - keep[i].first) / len;
-                    const int act = (int)(f.act * share + 0.5), idle = (int)(f.idle * share + 0.5);
+                    const int act = Attention::Clip(f.act, f.s, f.e, keep[i].first, keep[i].second);
+                    const int idle = Attention::Clip(f.idle, f.s, f.e, keep[i].first, keep[i].second);
+                    const int passive = Attention::Clip(f.passive, f.s, f.e, keep[i].first, keep[i].second);
+                    const int unknown = Attention::Clip(f.unknown, f.s, f.e, keep[i].first, keep[i].second);
                     adjust(keep[i].second, act, -1);
                     // The second part (the range lies strictly inside the session) is a copy of the row.
                     execInts(i == 0
                         ? "UPDATE app_focus_activity SET timestamp = ?2, duration_secs = ?3, event_ms = ?4, start_ts = ?5, end_ts = ?2, "
-                          "active_secs = ?6, idle_secs = ?7 WHERE id = ?1;"
+                          "active_secs = CASE WHEN ?6<0 THEN NULL ELSE ?6 END, idle_secs = CASE WHEN ?7<0 THEN NULL ELSE ?7 END, "
+                          "passive_secs=CASE WHEN ?8<0 THEN NULL ELSE ?8 END, unknown_secs=CASE WHEN ?9<0 THEN NULL ELSE ?9 END WHERE id = ?1;"
                         : "INSERT INTO app_focus_activity (timestamp, exe_name, exe_path, window_title, duration_secs, source_pid, source_exe, "
                           "foreground_pid, foreground_exe, ms_since_input, parent_pid, parent_exe, created_window_ms, confidence, entity_key, "
                           "event_ms, source, start_ts, end_ts, active_secs, idle_secs, doc_key, doc_display, doc_type, window_class, desktop_id, "
-                          "aumid, presence) SELECT ?2, exe_name, exe_path, window_title, ?3, source_pid, source_exe, foreground_pid, foreground_exe, "
-                          "ms_since_input, parent_pid, parent_exe, created_window_ms, confidence, entity_key, ?4, source, ?5, ?2, ?6, ?7, doc_key, "
-                          "doc_display, doc_type, window_class, desktop_id, aumid, presence FROM app_focus_activity WHERE id = ?1;",
-                        { f.id, keep[i].second, keep[i].second - keep[i].first, keep[i].second * 1000, keep[i].first, (int64_t)act, (int64_t)idle });
+                          "aumid, presence, passive_secs, unknown_secs, doc_resolution) SELECT ?2, exe_name, exe_path, window_title, ?3, source_pid, source_exe, foreground_pid, foreground_exe, "
+                          "ms_since_input, parent_pid, parent_exe, created_window_ms, confidence, entity_key, ?4, source, ?5, ?2, "
+                          "CASE WHEN ?6<0 THEN NULL ELSE ?6 END, CASE WHEN ?7<0 THEN NULL ELSE ?7 END, doc_key, "
+                          "doc_display, doc_type, window_class, desktop_id, aumid, presence, "
+                          "CASE WHEN ?8<0 THEN NULL ELSE ?8 END, CASE WHEN ?9<0 THEN NULL ELSE ?9 END, doc_resolution FROM app_focus_activity WHERE id = ?1;",
+                        { f.id, keep[i].second, keep[i].second - keep[i].first, keep[i].second * 1000, keep[i].first,
+                          (int64_t)act, (int64_t)idle, (int64_t)passive, (int64_t)unknown });
                 }
             }
         }
@@ -2312,19 +2640,45 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
                          "first_ts = CASE WHEN first_ts BETWEEN ?1 AND ?2 THEN COALESCE((SELECT MIN(s.start_ts) FROM thread_span s WHERE s.thread_id = work_thread.id), first_ts) ELSE first_ts END, "
                          "last_ts = CASE WHEN last_ts BETWEEN ?1 AND ?2 THEN COALESCE((SELECT MAX(s.end_ts) FROM thread_span s WHERE s.thread_id = work_thread.id), last_ts) ELSE last_ts END "
                          "WHERE first_ts BETWEEN ?1 AND ?2 OR last_ts BETWEEN ?1 AND ?2;", a, b);
-        // Work sessions keep only their parts outside the range (their seconds scale with the kept share).
+        // Trim the durable attention union before deriving the surviving work-session totals.
         {
-            struct Sess { int64_t id, s, e; double act, pas; };
+            std::vector<Attention::Span> spans;
+            sqlite3_stmt* st = nullptr;
+            if (sqlite3_prepare_v2(w.db, "SELECT start_ts,end_ts,active_rate,passive_rate FROM session_attention WHERE end_ts>=?1 AND start_ts<=?2;",
+                                   -1, &st, nullptr) == SQLITE_OK)
+            {
+                sqlite3_bind_int64(st, 1, a);
+                sqlite3_bind_int64(st, 2, b);
+                while (sqlite3_step(st) == SQLITE_ROW)
+                    spans.push_back({ sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1),
+                                      sqlite3_column_double(st, 2), sqlite3_column_double(st, 3) });
+                sqlite3_finalize(st);
+            }
+            ExecDelete(w.db, "DELETE FROM session_attention WHERE end_ts>=?1 AND start_ts<=?2;", a, b);
+            for (const auto& span : spans) for (const auto& part : outside(span.start, span.end))
+            {
+                sqlite3_stmt* ins = w.Stmt("INSERT INTO session_attention(start_ts,end_ts,active_rate,passive_rate) VALUES(?1,?2,?3,?4);");
+                if (!ins) continue;
+                sqlite3_bind_int64(ins, 1, part.first);
+                sqlite3_bind_int64(ins, 2, part.second);
+                sqlite3_bind_double(ins, 3, span.active);
+                sqlite3_bind_double(ins, 4, span.passive);
+                sqlite3_step(ins);
+            }
+        }
+        // Work sessions keep only their parts outside the range, without counting their gaps.
+        {
+            struct Sess { int64_t id, s, e; int version; };
             std::vector<Sess> sessions;
             sqlite3_stmt* st = nullptr;
-            if (sqlite3_prepare_v2(w.db, "SELECT id, start_ts, end_ts, active_secs, passive_secs FROM work_session WHERE end_ts >= ?1 AND start_ts <= ?2;",
+            if (sqlite3_prepare_v2(w.db, "SELECT id, start_ts, end_ts, accounting_version FROM work_session WHERE end_ts >= ?1 AND start_ts <= ?2;",
                                    -1, &st, nullptr) == SQLITE_OK)
             {
                 sqlite3_bind_int64(st, 1, a);
                 sqlite3_bind_int64(st, 2, b);
                 while (sqlite3_step(st) == SQLITE_ROW)
                     sessions.push_back({ sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2),
-                                         sqlite3_column_double(st, 3), sqlite3_column_double(st, 4) });
+                                         sqlite3_column_int(st, 3) });
                 sqlite3_finalize(st);
             }
             for (const Sess& x : sessions)
@@ -2338,19 +2692,28 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
                     ExecDelete(w.db, "DELETE FROM work_session WHERE id = ?1;", x.id);
                     continue;
                 }
-                const double len = (double)(std::max)((int64_t)1, x.e - x.s);
                 for (size_t i = 0; i < keep.size(); ++i)
                 {
+                    double active = 0, passive = 0;
+                    sqlite3_stmt* sum = w.Stmt("SELECT COALESCE(SUM((MIN(end_ts,?2)-MAX(start_ts,?1))*active_rate),0), "
+                        "COALESCE(SUM((MIN(end_ts,?2)-MAX(start_ts,?1))*passive_rate),0) FROM session_attention WHERE end_ts>?1 AND start_ts<?2;");
+                    if (sum)
+                    {
+                        sqlite3_bind_int64(sum, 1, keep[i].first);
+                        sqlite3_bind_int64(sum, 2, keep[i].second);
+                        if (sqlite3_step(sum) == SQLITE_ROW) { active = sqlite3_column_double(sum, 0); passive = sqlite3_column_double(sum, 1); }
+                        sqlite3_reset(sum);
+                    }
                     sqlite3_stmt* up = nullptr;
                     const char* sql = i == 0 ? "UPDATE work_session SET start_ts = ?2, end_ts = ?3, active_secs = ?4, passive_secs = ?5 WHERE id = ?1;"
-                                             : "INSERT INTO work_session (start_ts, end_ts, active_secs, passive_secs) VALUES (?2, ?3, ?4, ?5);";
+                                             : "INSERT INTO work_session (start_ts, end_ts, active_secs, passive_secs, accounting_version) VALUES (?2, ?3, ?4, ?5, ?6);";
                     if (sqlite3_prepare_v2(w.db, sql, -1, &up, nullptr) != SQLITE_OK) continue;
-                    const double share = (double)(keep[i].second - keep[i].first) / len;
                     if (i == 0) sqlite3_bind_int64(up, 1, x.id);
                     sqlite3_bind_int64(up, 2, keep[i].first);
                     sqlite3_bind_int64(up, 3, keep[i].second);
-                    sqlite3_bind_int64(up, 4, (int64_t)(x.act * share));
-                    sqlite3_bind_int64(up, 5, (int64_t)(x.pas * share));
+                    sqlite3_bind_double(up, 4, active);
+                    sqlite3_bind_double(up, 5, passive);
+                    if (i != 0) sqlite3_bind_int(up, 6, x.version);
                     sqlite3_step(up);
                     sqlite3_finalize(up);
                 }

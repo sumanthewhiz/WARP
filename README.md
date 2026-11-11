@@ -14,12 +14,12 @@ Windows 11, and works entirely on the local PC:
 
 1. **Captures** what the user works with: files (opened, created, saved, downloaded,
    renamed, deleted), app launches and exits, per-document focus sessions with
-   active vs idle time, browser pages (privacy-safe canonical URLs and document
+   active / passive / idle / unknown time, browser pages (privacy-safe canonical URLs and document
    identities), presence (active / passive / away / locked / asleep) and,
    optionally, printed documents and clipboard *metadata*. Every capture source runs
    on its own threads and hands typed records to a single storage writer.
 
-2. **Remembers** it in a versioned SQLite database (schema v2): raw events for
+2. **Remembers** it in a versioned SQLite database (schema v3): raw events for
    30 days by default, a per-entity **engagement model** (decayed short- and
    long-term engagement, daily rollups, tombstones, a global change sequence, an
    FTS5 search index) and a **history layer** (work sessions, work threads,
@@ -37,8 +37,18 @@ Windows 11, and works entirely on the local PC:
 Local applications read all of this through a versioned named-pipe API (**API v2**,
 backward compatible with v1 requests) on `\\.\pipe\WarpFileActivityAPI-<SessionId>`
 (preferred) and the legacy `\\.\pipe\WarpFileActivityAPI`: ranked entities with
-human-readable reasons, full-text search, a cursor-based change feed, a timeline,
+human-readable reasons, activity-name/title search, a cursor-based change feed, a timeline,
 work threads, related items and the current context. See [API.md](API.md).
+
+**Phase A on `dev`:** measured zero stays zero; focus/presence overlap is an
+interval union; passive media is not active document time. Web identities retain
+case, AUMIDs survive context joins, ambiguous filename matches abstain, sparse
+file/web/app observations keep honest action labels, all persisted facets survive
+restart, and print capture requires a qualified own-user/local-client match.
+See [SCHEMA.md](SCHEMA.md) and the
+[on-demand quality validator](tests/SIGNAL_QUALITY.md). This tranche does not
+replace the model, implement arbitrary historical interval queries, or claim
+end-to-end search gains.
 
 WARP runs fully offline — no cloud calls, no telemetry. `WARP!.exe --install`
 copies it to `%ProgramFiles%\WARP` and registers a per-user logon scheduled task
@@ -82,12 +92,12 @@ the tray icon (status, pause, delete history) or the command line.
 | **File activity** | `FileCapture` merges a private per-session **Microsoft-Windows-Kernel-File** ETW session (Create correlated with OperationEnd, no WRITE keyword), the **NTFS/ReFS USN journal** (edits, deletes and renames, plus up to 72 h of downtime backfill from cursors stored in the database), `ReadDirectoryChangesW` on removable and network drives only, and explicit opens from **Shell Recent items** and **Office MRU** lists (OneDrive/SharePoint URLs mapped to their synced paths). Actions: `OPEN`, `CREATE`, `MODIFY`, `DELETE`, `RENAME`, `DOWNLOAD`. |
 | **Save- and download-aware renames** | Renames are decided on the destination: safe saves (`~WRL0001.tmp` → `report.docx`) become `MODIFY`, finished browser downloads (`.crdownload`, `.partial`, `.part`, …) become `DOWNLOAD` with the canonical Mark-of-the-Web origin URL, moves to the Recycle Bin become `DELETE`; repeated saves are coalesced. |
 | **App launches & exits** | `LaunchCapture` decodes **Microsoft-Windows-Kernel-Process** with TDH, maintains the process table used for attribution, waits up to 8 s for a user-facing window (also matching windows shown just before the lagging ETW event), skips helper and same-image child processes, and records the creator process, packaged-app **AUMID**, exit time and lifetime. |
-| **Per-document focus sessions** | `FocusTracker` splits foreground time per window *and* per document (1 Hz title sampling, 2 s debounce) with active vs idle seconds, closes sessions at the last input when the user goes away, locks or sleeps, and resolves which file or web page the window shows (`DocResolver`). |
-| **Browser pages** | `WebCapture` reads the address bar with **UI Automation** on a worker thread (structural, locale-independent, cached per window), canonicalizes URLs (`UrlCanonicalizer`), recognizes document identities (Google Docs/Drive, SharePoint/OneDrive, GitHub, Azure DevOps, YouTube, Figma, Jira) and records per-window page dwell. Private/InPrivate/Incognito windows and sign-in or excluded hosts are never recorded. |
+| **Per-document focus sessions** | `FocusTracker` splits foreground time per window/document (1 Hz sampling, 2 s title debounce, bounded identity rechecks), with separate active/passive/idle/unknown seconds. Away closes at last input; lock/sleep close at the transition. AUMIDs survive joins; ambiguous same-name files remain unresolved. |
+| **Browser pages** | `WebCapture` reads the address bar with **UI Automation** on a worker thread, canonicalizes URLs, recognizes provider document identities and records per-window page dwell. Privacy/exclusion gates suppress private windows and excluded hosts; browser/Windows indicator coverage still requires the runtime validation described below. |
 | **Presence** | `PresenceMonitor` classifies the user as *active*, *passive* (no input, but media playing, microphone/camera in use or a full-screen app), *away*, *locked* or *asleep*. Presence never pauses capture: it tags events, closes focus sessions and drives work sessions. |
-| **Print & clipboard (optional)** | `PrintMonitor` records printed documents from the PrintService log (event 307). `ClipboardMonitor` (off by default) records clipboard *metadata* only — owner app and coarse formats, never content. |
+| **Print & clipboard (optional)** | `PrintMonitor` admits event 307 only when its qualified owner matches this user's cached token identity and its client matches this PC. Missing/bare/foreign owners or remote clients are rejected. `ClipboardMonitor` remains metadata-only and off by default. |
 | **Confidence model** | Every event carries a `[0, 1]` confidence from `EventContextUtil::ScoreEvent` (source class, foreground match, input recency, attribution, process role, event kind, wake boundary). Noisy processes are scored down instead of silently dropped. |
-| **Single-writer storage** | `ActivityStore`: one writer thread, batched `BEGIN IMMEDIATE` transactions with per-job savepoints, bounded queue (20 000), 3 pooled readers, `PRAGMA user_version` migrations (v0/v1 → v2 with backfill), `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
+| **Single-writer storage** | `ActivityStore`: one writer thread, batched transactions with per-job savepoints, bounded queue (20 000), 3 readers, ordered transactional migrations through schema v3, `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
 | **Engagement ranking** | `EntityStore` keeps decayed short-term (τ = 3 days) and long-term (τ = 30 days) engagement per file, app and URL, computes per-type percentile scores at **read** time and explains them (*"edited today"*, *"42 min active in the last 7 days"*). Renames carry history to the new key; deletes become tombstones after a 15 s safe-save grace. |
 | **History & context** | `HistoryEngine` builds work sessions, persistent work threads (resumable for 14 days), project anchors and co-occurrence edges. `ContextInference` composes the current context every 60 s (configurable; EcoQoS thread, slower on battery, skipped when nothing changed). |
 | **API v2** | Per-session + legacy named pipes with an explicit DACL, caller identification, policy allow-lists and scopes; 8 workers, deadlines, 1 MiB request limit, `api_version` on every response, structured errors. v1 requests keep working. |
@@ -102,7 +112,7 @@ the tray icon (status, pause, delete history) or the command line.
 |---|---|---|
 | **File activity** (`file_activity`) | `OPEN`, `CREATE`, `MODIFY`, `DELETE`, `RENAME`, `DOWNLOAD` of user files and folders, with the source, entity key, download origin URL, presence and confidence. | Kernel-File ETW (private per-session session), USN journal (fixed NTFS/ReFS volumes), `ReadDirectoryChangesW` (removable / network drives), Shell Recent items, Office MRU |
 | **App launch** (`app_launch_activity`) | Starts of real apps in the user's session (not helpers), with creator process, AUMID, time to the first user-facing window (`created_window_ms`) and, on exit, `exit_ts` / `lifetime_secs`. | Kernel-Process ETW (TDH) + `EVENT_OBJECT_SHOW` / `EnumWindows` window correlation |
-| **App focus** (`app_focus_activity`) | One row per window *and* document: start/end, active and idle seconds, normalized title, resolved document (`doc_key`), window class, virtual desktop, AUMID, presence. | `ForegroundChangeBroker` (`EVENT_SYSTEM_FOREGROUND`) + 1 Hz sampler + `DocResolver` |
+| **App focus** (`app_focus_activity`) | Start/end, exposure and active/passive/idle/unknown seconds, normalized title, document key and resolution status, window class, desktop, AUMID, presence. Unknown legacy attention is not inflated to wall time. | `ForegroundChangeBroker` + 1 Hz sampler + `DocResolver` |
 | **Browsing** (`browsing_activity`) | Page changes per browser window: title, canonical URL, host, document id/kind, `window_id`, and `dwell_secs` = foreground dwell of the **previous** page in the same window. | Per-browser `EVENT_OBJECT_NAMECHANGE` hook + UI Automation address bar + `UrlCanonicalizer` |
 | **Presence** (`presence_interval`) | Intervals of `active` / `passive` / `away` / `locked` / `asleep`. | `GetLastInputInfo`, WTS session and power notifications, audio sessions, microphone/camera ConsentStore, `SHQueryUserNotificationState` |
 | **Print** (`print_activity`) | Document name, printer, page count. | `Microsoft-Windows-PrintService/Operational` event 307 (`EvtSubscribe`) |
@@ -139,29 +149,29 @@ flowchart TB
     subgraph Capture ["Capture sources · own threads"]
         FC["FileCapture<br/><sub>Kernel-File ETW · USN · RDCW · Recent · Office MRU</sub>"]:::producer
         LC["LaunchCapture<br/><sub>Kernel-Process ETW · window correlation</sub>"]:::producer
-        FT["FocusTracker<br/><sub>per-document focus sessions</sub>"]:::producer
+        FT["FocusTracker<br/><sub>active / passive / idle / unknown</sub>"]:::producer
         WC["WebCapture<br/><sub>UIA address bar · page dwell</sub>"]:::producer
         PM["PresenceMonitor<br/><sub>active · passive · away · locked · asleep</sub>"]:::producer
-        CP["PrintMonitor · ClipboardMonitor<br/><sub>event 307 · metadata only</sub>"]:::producer
+        CP["PrintMonitor · ClipboardMonitor<br/><sub>own-user/local print gate · metadata only</sub>"]:::producer
     end
 
     subgraph Infra ["Cross-cutting infrastructure"]
         FCB["ForegroundChangeBroker<br/><sub>one EVENT_SYSTEM_FOREGROUND hook</sub>"]:::infra
         EC["EventContext<br/><sub>process table · ScoreEvent</sub>"]:::infra
         SPC["SystemProcessClassifier<br/><sub>multi-signal vote · cached</sub>"]:::infra
-        DR["DocResolver<br/><sub>title grammars</sub>"]:::infra
+        DR["DocResolver<br/><sub>title grammars · ambiguity abstention</sub>"]:::infra
         UC["UrlCanonicalizer<br/><sub>privacy-safe URL · doc identity</sub>"]:::infra
         CFG["Settings<br/><sub>HKCU + HKLM policy</sub>"]:::infra
     end
 
     subgraph Storage ["Storage · single writer thread"]
-        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v2 · activity.db</sub>")]:::storage
+        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v3 · activity.db</sub>")]:::storage
         ES["EntityStore<br/><sub>decayed engagement · change feed · FTS5</sub>"]:::storage
-        HE["HistoryEngine<br/><sub>sessions · threads · projects · edges</sub>"]:::storage
+        HE["HistoryEngine<br/><sub>attention union · sessions · thread heuristics</sub>"]:::storage
     end
 
     subgraph Intel ["Context inference · EcoQoS thread"]
-        CI["ContextInference<br/><sub>granite clustering · rich listing</sub>"]:::storage
+        CI["ContextInference<br/><sub>measured focus · qualified sparse observations</sub>"]:::storage
         LLM["LlmSummarizer<br/><sub>optional Qwen3 refiner · off by default</sub>"]:::storage
     end
 
@@ -520,12 +530,13 @@ and samples the foreground window once per second:
 - A session ends when focus moves, the window closes, or the window's normalized
   title changes and stays changed for 2 s — switching documents inside one window
   produces one row per document. Sessions shorter than 1 s are discarded.
-- **Active vs idle.** Each second counts as active, or as idle when there has been
-  no input for more than 2 minutes — unless presence is *passive* (media, a call,
-  a full-screen app), which counts as active.
-- **Presence-aware closing.** *Away*, *locked* and *asleep* close the session at
-  the last input time; while away there is no current session (no fictional
-  dwell).
+- **Attention, not assumed intent.** Recent input supports active time. Old input
+  with passive presence supports a separate passive component; otherwise it is
+  idle. Unavailable input information is unknown unless passive support exists.
+  Background audio therefore cannot grant active time to an unrelated document.
+- **Presence-aware closing.** Away closes at last input; lock/sleep close at the
+  transition. While away there is no current session. An autonomous foreground
+  change does not prove that the user returned.
 - The `EventContext` is captured at session **start**, not at emit time (when the
   broker already names the next app).
 - **Document resolution** (wired in `WARP!.cpp`): a browser window resolves to the
@@ -533,7 +544,12 @@ and samples the foreground window once per second:
   a document app resolves to the file whose name `DocResolver` extracts from the
   title with per-app title grammars (`"Report - Word"` → `Report`,
   `"auth.cpp - repo - Visual Studio Code"` → `auth.cpp`) and that the same process
-  opened in the last 6 h — or, failing that, a recent explicit open (24 h).
+  opened in the last 6 h — or, if no PID candidate matched, an explicit recent
+  open (24 h). Multiple distinct matching paths produce `ambiguous`, not a
+  recency winner, and an ambiguous PID result cannot fall back to a global guess.
+  Identity/redaction rechecks split changed associations even if the cached title
+  is unchanged. This depends on the page information WebCapture actually observes;
+  it does not add complete same-title browser navigation capture.
 - **Redaction callbacks:** excluded apps produce no row; private-browsing windows,
   excluded pages and excluded titles keep the app time but drop the title and
   the document.
@@ -604,7 +620,11 @@ Presence never pauses capture.
 
 - `PrintMonitor` (`CapturePrint`, on by default) subscribes with `EvtSubscribe` to
   `Microsoft-Windows-PrintService/Operational` event 307 (*document printed*) and
-  records document name, printer and page count. That log channel is disabled by
+  records document name, printer and page count only after a qualified owner
+  matches the agent user's cached SAM/UPN/SID identity and the client matches a
+  local machine name. Bare or missing owner names and unknown/remote clients
+  fail closed, including legitimate jobs whose metadata cannot establish ownership.
+  That log channel is disabled by
   default in Windows; WARP enables it (it runs elevated) and leaves it enabled.
 - `ClipboardMonitor` (`CaptureClipboardMetadata`, **off by default**) registers
   `AddClipboardFormatListener` on its own thread and coalesces bursts (250 ms).
@@ -672,8 +692,10 @@ confidence penalty; launch capture skips system processes.
   the "user-facing app window" test.
 - **`EntityKey`** — the single canonicalization of entity identity shared by every
   producer and consumer: Windows paths (`\\?\`, UNC, device paths, `.` / `..`, 8.3
-  short names, alternate data streams), case-folded UTF-8 keys, `aumid:` app keys
-  and prefixed document keys. The same functions are registered in SQLite
+  short names, alternate data streams), case-folded file/AUMID keys, and case-safe
+  URL/document keys. URL path/query and opaque ID case are preserved; provider
+  prefixes and URL scheme/authority are normalized separately. Shared path
+  functions are registered in SQLite
   (`warp_key`, `warp_file_key`) so SQL and C++ always agree.
 - **`Json`** (`WarpJson`) — a strict RFC 8259 parser (exact int64, depth limit,
   invalid UTF-8 rejected, last duplicate key wins) and a writer that always emits
@@ -698,11 +720,15 @@ The persistence layer for `%LOCALAPPDATA%\WARP\activity.db` (tables under
 - **Reads** use a pool of 3 read-only connections; in WAL mode readers never block
   the writer.
 - **Schema versioning** with `PRAGMA user_version`: v0/v1 databases (the legacy
-  four activity tables + `inference`) migrate to v2 in one transaction — new
+  four activity tables + `inference`) first migrate to v2 — new
   columns and tables, backfill of entity keys and event times, re-canonicalization
   of stored URLs (excluded URLs are deleted first), re-keying and merging of the
   old `inference` rows, daily rollups from the retained history and seeded
-  engagement. `PRAGMA quick_check` runs at open; a corrupt or unmigratable file is
+  engagement. The v3 transaction then adds attention/resolution columns, durable
+  occupancy slices and explicit legacy-key aliases; it rekeys retained web
+  evidence without guessing collided identities. Old mixed attention remains
+  qualified as legacy/unknown. See [SCHEMA.md](SCHEMA.md) for precise upgrade
+  behavior and consumer resync. `PRAGMA quick_check` runs at open; a corrupt or unmigratable file is
   quarantined (`activity.db.corrupt-<time>` / `.migrate-failed-<time>`) and
   recreated, so the agent is never left without a store.
 - **Change feed.** A global, monotonic `change_seq` is published at commit and
@@ -768,7 +794,8 @@ pre-defined topic buckets.
      starting at `max(session_start, window_start)`. This fixes the blind spot
      where a user parked >15 minutes in one window would otherwise produce zero
      focus rows in the query.
-   - Buckets activity per executable. For each exe, runs a **3-layer classifier**:
+   - Buckets focus by **app identity (AUMID when available) plus resolved document**.
+     For each app, runs a **3-layer classifier**:
      1. **Exact match** against `kAppClasses[]` (~80 entries: Visual Studio, VS
         Code, Notepad++, JetBrains IDEs, Office apps, Outlook, Teams, Slack,
         browsers, PDF readers, notes apps, terminals, design tools, media
@@ -777,14 +804,18 @@ pre-defined topic buckets.
         `\microsoft visual studio\`, `\code - insiders\`, `\microsoft office\`,
         `\microsoft\edge`, `\google\chrome`).
      3. **Fallback** — exe basename minus `.exe`, with the verb *"Working in"*.
-   - Picks the **most recent / longest-dwell title** for each exe and runs it
+   - Picks the **most recent title** for each app/document and runs it
      through `CleanTitle()`: normalises UTF-8 em-dash, en-dash, bullet, and `|`
      to ` - ` separators; strips leading status glyphs (●, `* `); pops trailing
      and leading segments matching the app's friendly name or the `kStripSuffixes`
      list (~50 noisy suffixes); and length-caps at 80 characters with a UTF-8
      ellipsis.
-   - For browsers, the *cleaned active tab title* (from `BrowsingActivity`) takes
-     precedence over the window title.
+   - An unresolved browser window does not borrow another window's page identity
+     or title. Independently captured page observations still feed the web facet.
+   - Without interaction-active focus, admitted opens/modifications/page
+     observations/launches populate combined and facet summaries, `items` and
+     `current_entities` with zero measured focus seconds. OPEN says "Opened";
+     modification says "Modification observed", not an inferred user edit.
    - **Bounded historical boost.** With the `EntityStore` connected, each item's
      in-window focus seconds are multiplied by `1 + 0.5 × short-horizon
      engagement percentile` (1.0×–1.5×): history breaks ties between equally
@@ -981,7 +1012,7 @@ The local consumer API (summary under [Query API](#query-api), full reference in
 ## Data model
 
 Everything lives in one SQLite database, `%LOCALAPPDATA%\WARP\activity.db` (WAL),
-at schema **v2** (`PRAGMA user_version = 2`); v0/v1 databases are migrated in place
+at schema **v3** (`PRAGMA user_version = 3`); older databases are migrated in place
 on first start (see [`ActivityStore`](#activitystore-activitystoreh--activitystorecpp)).
 The tables fall into four groups:
 
@@ -990,17 +1021,18 @@ The tables fall into four groups:
   `clipboard_activity`, plus `context_snapshot`.
 - **Per-entity state** — `inference` (one row per file / app / URL entity),
   `entity_day` (daily rollups), `tombstone` (deletions for the change feed) and the
-  FTS5 index `activity_fts`.
+  FTS5 index `activity_fts`, plus `entity_alias` for explicit legacy-key requests.
 - **History** — `work_session`, `work_thread`, `thread_member`, `thread_span`,
-  `edge`.
+  `edge`, and the durable `session_attention` union.
 - **Bookkeeping** — `meta` (key/value: USN and Recent/MRU cursors, `reset_seq`,
   `change_seq_hw`, `tombstone_floor_seq`, `purged_ranges` (time ranges deleted by a
   purge or clear; late records about them are refused), `fts_available`, migration time).
 
-Entity keys are produced by `EntityKey` (case-folded canonical path, `aumid:` app
-key, canonical URL or prefixed document id) and join every group together.
+Entity keys are produced by `EntityKey` (case-folded path/AUMID, case-safe canonical
+URL or prefixed document ID) and join every group together.
 Timestamps named `timestamp` / `*_ts` are Unix seconds (UTC); `event_ms` is Unix
 milliseconds.
+The detailed storage/migration contract is [SCHEMA.md](SCHEMA.md).
 
 ```mermaid
 erDiagram
@@ -1055,6 +1087,11 @@ erDiagram
         int    start_ts
         int    end_ts
         int    active_secs
+        int    passive_secs
+        int    idle_secs
+        int    unknown_secs
+        string doc_resolution
+        string aumid
         string entity_key FK "app"
         string doc_key FK "file or URL"
     }
@@ -1095,12 +1132,33 @@ erDiagram
         int    thread_id FK
         blob   embedding
     }
+    session_attention {
+        int start_ts PK
+        int end_ts
+        real active_rate
+        real passive_rate
+    }
+    work_session {
+        int id PK
+        int start_ts
+        int end_ts
+        real active_secs
+        real passive_secs
+        int accounting_version
+    }
+    entity_alias {
+        string alias_key PK
+        string entity_key "nullable: ambiguous"
+        int created_ts
+    }
 
     inference ||--o{ file_activity : "entity_key"
     inference ||--o{ app_launch_activity : "entity_key"
     inference ||--o{ app_focus_activity : "entity_key and doc_key"
     inference ||--o{ browsing_activity : "entity_key"
     inference ||--o{ entity_day : "daily rollup"
+    inference ||--o{ entity_alias : "explicit legacy lookup"
+    work_session ||--o{ session_attention : "time-bounded projection"
     inference ||--o{ edge : "co-occurrence"
     inference ||--o{ thread_member : "member of"
     work_thread ||--o{ thread_member : "members"
@@ -1137,7 +1195,7 @@ The four main activity tables (`file_activity`, `app_launch_activity`,
 |---|---|---|
 | `file_activity` | file events | `id`, `timestamp`, `event_ms`, `action`, `path`, `old_path` (renames), `is_dir`, `origin_url` (downloads), `source`, `entity_key`, `presence` + EventContext |
 | `app_launch_activity` | launches and exits | `id`, `timestamp`, `event_ms`, `exe_name`, `exe_path`, `pid`, `creator_pid`, `creator_exe`, `aumid`, `session_id`, `exit_ts`, `lifetime_secs`, `source`, `entity_key` + EventContext |
-| `app_focus_activity` | focus sessions | `id`, `timestamp` (session end), `start_ts`, `end_ts`, `duration_secs` (wall clock), `active_secs`, `idle_secs`, `exe_name`, `exe_path`, `window_title`, `window_class`, `desktop_id`, `aumid`, `doc_key`, `doc_display`, `doc_type` (`file` / `url`), `presence`, `event_ms`, `source`, `entity_key` (app) + EventContext |
+| `app_focus_activity` | focus sessions | `id`, `timestamp` (end), `start_ts`, `end_ts`, `duration_secs` (exposure), `active_secs`, `passive_secs`, `idle_secs`, `unknown_secs`, `exe_name`, `exe_path`, `window_title`, `window_class`, `desktop_id`, `aumid`, `doc_key`, `doc_display`, `doc_type`, `doc_resolution`, `presence`, `event_ms`, `source`, `entity_key` (app) + EventContext |
 | `browsing_activity` | page changes | `id`, `timestamp`, `event_ms`, `browser`, `title`, `url` (canonical), `host`, `doc_id`, `doc_kind`, `window_id`, `dwell_secs` (previous page in the same window), `presence`, `source`, `entity_key` + EventContext |
 | `presence_interval` | presence | `id`, `start_ts`, `end_ts`, `state` |
 | `print_activity` | printed documents | `id`, `timestamp`, `event_ms`, `document`, `printer`, `pages` |
@@ -1148,7 +1206,9 @@ The four main activity tables (`file_activity`, `app_launch_activity`,
 | `tombstone` | deletions for the change feed | `change_seq`, `entity_key`, `entity_type`, `ts`, `reason` (`deleted`, `renamed`, `purge`, `retention`) |
 | `activity_fts` | FTS5 search index | `rowid` (= `inference` rowid), `kind`, `ref`, `ts`, `text`; tokenizer `unicode61 remove_diacritics 2` |
 | `edge` | co-occurrence | `a`, `b`, `weight`, `last_ts` |
-| `work_session` | work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs` |
+| `work_session` | work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs`, `accounting_version` |
+| `session_attention` | non-overlapping attention union | `start_ts` (PK), `end_ts`, `active_rate`, `passive_rate` |
+| `entity_alias` | explicit v2-key compatibility | `alias_key`, nullable `entity_key` (null = unresolved/ambiguous), `created_ts` |
 | `work_thread` | work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid` (BLOB), `change_seq` |
 | `thread_member` | thread members | `thread_id`, `entity_key`, `weight`, `last_ts` |
 | `thread_span` | thread time spans | `thread_id`, `start_ts`, `end_ts`, `active_secs` |
@@ -1165,7 +1225,7 @@ is hidden while a delete waits out the safe-save grace.
 | Data | Kept | Setting |
 |---|---|---|
 | Raw activity (`file_activity`, `app_launch_activity`, `app_focus_activity`, `browsing_activity`, `presence_interval`, `print_activity`, `clipboard_activity`) and `context_snapshot` | 30 days | `RawRetentionDays` (1–3650) |
-| `entity_day`, `edge`, `work_session`, `work_thread` (with its members) and `thread_span` | 395 days | `EntityRetentionDays` (7–3650) |
+| `entity_day`, `edge`, `work_session`, `session_attention`, `entity_alias`, `work_thread` (with its members) and `thread_span` | 395 days; resolved aliases also expire with their target | `EntityRetentionDays` (7–3650) |
 | `inference` entities with no activity inside the entity window | tombstoned (`retention`) and deleted | `EntityRetentionDays` |
 | `tombstone` | 90 days — a change-feed cursor older than the pruned tombstones gets `reset` | — |
 
@@ -1249,10 +1309,10 @@ synchronous job for each context snapshot) and reads from the pool.
 
 | Concept | How it is built | Exposed through |
 |---|---|---|
-| **Work sessions** (`work_session`) | Contiguous active/passive presence or focus activity; a new session starts after an away, lock or sleep gap of **≥ 15 minutes**. Active and passive seconds are accumulated. | `QueryTimeline` (`sessions`) |
+| **Work sessions** (`work_session`) | Active/passive focus and presence are normalized into a durable interval union (`session_attention`), not added twice. Gaps contribute no time; gaps of **≥ 15 minutes** split sessions. Mixed segments are proportional estimates; migrated estimates carry `accounting_version: 0`. | `QueryTimeline` (`sessions`, whole overlapping sessions) |
 | **Work threads** (`work_thread`, `thread_member`, `thread_span`) | Every context compose passes its entity set (keys + clipped active seconds). The snapshot joins the thread with the highest **weighted-Jaccard** overlap — ≥ 0.25 to join or resume a thread, ≥ 0.12 to stay on the current one (hysteresis); the label embedding only breaks ties. Otherwise a new thread starts. A thread keeps a label (the rich listing), up to 40 members with decaying weights (τ = 2 days), time spans (a new span after a 15-minute gap) and a project; any thread active in the last **14 days** can be resumed. | `GetWorkThreads`, `QueryTimeline` (`threads`), `GetCurrentContext` (`thread`), `thread_id` in snapshots |
 | **Projects** (`project_key`) | A member-weighted vote (≥ 30 % of the weight) over stable anchors: git repositories (`.git`), solutions and workspaces (`*.sln`, `*.slnx`, `*.code-workspace`), the first folder under a OneDrive sync root, repository URLs (GitHub, GitLab, Bitbucket, Azure DevOps and `*.visualstudio.com`), SharePoint sites (`/sites/…`, `/teams/…`); otherwise a specific containing folder. | `GetWorkThreads` (`project`) |
-| **Related items** (`edge`) | Decayed co-occurrence (τ = 14 days) between the top 8 entities of each snapshot, weighted by their overlapping active time. | `GetRelated`; `ScoreEntities` with `"context": "current"` adds a `context_boost` from current-thread membership and edges |
+| **Related items** (`edge`) | Decayed snapshot co-use (τ = 14 days) between its top 8 entities, weighted by aggregate active seconds. This does **not** prove actual temporal overlap or causality. | `GetRelated`; `ScoreEntities` with `"context": "current"` adds a `context_boost` from current-thread membership and edges |
 | **Context snapshots** (`context_snapshot`) | Material changes of the periodic context, with their thread id and summary embedding, so history survives restarts. | `GetRecentContexts` |
 
 ---
@@ -1575,10 +1635,21 @@ parallel job runs the Python test layers.
 
 ## Testing
 
+Run the Phase A quality gates on demand:
+
+```powershell
+.\tests\run_signal_quality.ps1
+```
+
+This builds/runs actual native inference, replays a labeled synthetic corpus twice,
+and writes JSON/Markdown scorecards. It reports unmeasured live/SLM/search/cost
+metrics explicitly. An optional Granite run and labeled external observations
+use the same scorer. See [tests/SIGNAL_QUALITY.md](tests/SIGNAL_QUALITY.md).
+
 | Suite | Where | How to run | What it covers |
 |---|---|---|---|
 | **Python** (pytest + Hypothesis) | `tests/run_tests.py`, `tests/python/`, `tests/eval/` | `python -m pip install -r tests/requirements.txt`, then `python tests/run_tests.py` (options `--layer l1`, `l1_property`, `l2` or `l3`; `--tier python` or `scripts`; `--list`) or `.\tests\run_tests.ps1 [-Layer l1]` | **L1** deterministic tests (hallucination guard, near-copy gate, rich-listing port, sync tests that pin the Python ports to the constants in `EntityStore.cpp`, `ActivityStore.h` and `LlmSummarizer.cpp`); **L1 property** fuzzing of the engagement math and the grounding gate; **L2** model-contract and adversarial tests; **L3** eval corpus and metrics. No models or build needed. |
-| **C++ unit tests** | `tests/WarpTests.vcxproj` (not part of the solution) | `msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64`, then `build\tests\x64\Release\WarpTests.exe` (`/filter Store.`, `/list`, `/timeout <seconds>`) | `WarpJson` parser and writer; URL canonicalizer and document identities; entity keys (including the SQL functions); `DocResolver` title grammars; file path rules and rename decisions; `ActivityStore` / `EntityStore` / `HistoryEngine` on a real SQLite file — safe saves, renames including folders, tombstones, change feed and reset, scoped and time-range purges (including the thread, session and rollup scrubbing they imply), FTS search, ranking, work threads and sessions, project keys, a writer/reader **concurrency stress test** and the **v1 → v2 migration**; `ApiServer` — structured errors, scopes, ranking / search / feed / purge / timeline cursors, long poll. |
+| **C++ unit tests** | `tests/WarpTests.vcxproj` | Build with MSBuild (Release/x64 or ARM64), then run `WarpTests.exe` (`/filter`, `/list`, `/timeout`, `/report`). | Actual composer (no link stubs), identity/attention/source rules, sparse and persisted context, v1/v2 -> v3 migration, aliases and paged resync, store/FTS/ranking/history/purge/concurrency, and API scope/error/paging contracts. Models are optional; ONNX Runtime is linked. |
 | **Live integration** | `tests/python/test_live_api.py` | Runs in CI against `WARP!.exe --headless --data-dir <temp>`; locally, with WARP running in your session: `$env:WARP_LIVE_API = "1"; python -m pytest tests/python/test_live_api.py -m live -v` | The real per-session pipe, from the elevated runner and from an admin-filtered **medium-integrity** client (what a normal app gets), the server-PID check, scripted activity (an atomic temp → rename save surfacing as a ranked entity); CI also runs `WARP!.exe --status` and stops WARP through `Local\WARP-ShutdownRequest`. |
 
 See [tests/README.md](tests/README.md) for details and status, and
@@ -1791,7 +1862,9 @@ WARP!\
 |-- Json.h / .cpp                  Strict JSON parser and writer (WarpJson)
 |
 |   Storage, ranking, history, context, API
-|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v2 + migrations, purge, change feed
+|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v3 + migrations, purge, change feed
+|-- Attention.h                   Unknown-safe clipping and interval-union helpers
+|-- SCHEMA.md                     Storage, identity, migration and retention contract
 |-- EntityStore.h / .cpp           Decayed engagement, read-time percentile scores, search, change feed
 |-- HistoryEngine.h / .cpp         Work sessions, work threads, projects, co-occurrence edges
 |-- ContextInference.h / .cpp      Context composer: granite clustering, rich listing, current_entities
@@ -1819,7 +1892,9 @@ WARP!\
 |   |-- pytest.ini, requirements.txt     pytest markers and dependencies
 |   |-- WarpTests.vcxproj                C++ unit tests (-> build\tests\<platform>\<config>\WarpTests.exe)
 |   |-- WarpTests.h, WarpTests.Main.cpp  Minimal test harness and runner (/filter, /list, /timeout)
-|   |-- WarpTests.Stubs.cpp              Link stubs (no ONNX Runtime)
+|   |-- WarpTests.Context.cpp            Actual composer, upgrades, attention and replay regressions
+|   |-- run_signal_quality.ps1           On-demand native replay and quality scorecards
+|   |-- SIGNAL_QUALITY.md                Evaluation protocol, metrics, gates and limitations
 |   |-- WarpTests.Json.cpp               WarpJson
 |   |-- WarpTests.Canon.cpp              UrlCanon, EntityKey (+ SQL), DocResolver, file path rules
 |   |-- WarpTests.Store.cpp              ActivityStore, EntityStore, HistoryEngine (incl. stress + migration)
@@ -1827,7 +1902,7 @@ WARP!\
 |   |-- python\                          pytest: guards, rich listing, constant-sync tests, property,
 |   |                                    adversarial and contract tests, live API (test_live_api.py, warp_pipe.py)
 |   |-- eval\                            L3 corpus and metrics
-|   |-- fixtures\                        Adversarial title corpus
+|   |-- fixtures\                        Adversarial titles and labeled signal-quality corpus
 |   +-- schema\                          JSON schemas (stub)
 |
 +-- models\                        (git-ignored) fetched by scripts\fetch_models.ps1
@@ -1853,13 +1928,23 @@ WARP!\
   builds of `main` / `master` (`-RequirePinned`) fail until the pins are filled in
   with `fetch_models.ps1 -UpdateLock`.
 - **ETW replay fixtures** (recorded `.etl` traces) still need to be recorded;
-  capture is covered by pure rule tests and the live CI run.
+  capture is covered by rule tests, native synthetic replay and the live CI run.
+- **Phase A is not the complete evidence redesign.** Full physical/logical file
+  identity, coverage/provenance intervals, finer attention/page checkpoints,
+  arbitrary historical reconstruction, typed relations/multiple task hypotheses,
+  evidence-based SLM reasoning and query-conditioned search evaluation remain
+  later work. Mixed long intervals use proportional estimates. Snapshot co-use
+  can connect unrelated tasks; the quality suite reports this rather than
+  describing it as solved.
+- **Print metadata can be insufficient.** Qualified own-user identity and a local
+  client are required; bare usernames, missing fields and remote jobs are omitted.
 - **Needs confirmation on real machines:** Kernel-File / Kernel-Process event
   property names across Windows builds (without OperationEnd correlation, file
   capture falls back to a degraded *unconfirmed* mode at half confidence),
   UI Automation address-bar layouts per browser and version, and private-window
-  indicators (an unverifiable window is treated as private, so a normal page can
-  occasionally be skipped).
+  indicators. Private-window uncertainty can suppress normal pages, and the
+  existing incomplete-UIA-walk fallback still needs real-browser validation;
+  synthetic privacy-flag fixtures do not establish end-to-end privacy coverage.
 - Registry and policy settings are re-read every 30 s: exclusions, pause, retention,
   log level and the file-capture sources apply live; turning app-launch, web or
   focus capture on or off takes effect at the next start of WARP.

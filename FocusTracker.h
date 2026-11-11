@@ -7,9 +7,9 @@
 //          session START (not at emit time, when the broker already names the next app).
 //   APP-7  Active seconds flow into the entity store (app + resolved document).
 //   APP-8  File Explorer folder windows and Windows Search are tracked (shell chrome is not).
-//   SIG-2  Away / lock / sleep close the session at the last input time; while away there is
-//          no "current session" (no fictional dwell). Passive presence (media, meetings,
-//          full-screen) keeps counting as active.
+//   SIG-2  Away closes at last input; lock / sleep close at the transition; while away there is
+//          no "current session" (no fictional dwell). Passive presence is recorded separately;
+//          a background audio signal is not proof of interaction with the foreground document.
 //   WEB-1 / PRIV-3  A redaction hook drops titles/documents of private or excluded windows.
 
 #include <windows.h>
@@ -33,6 +33,7 @@ public:
         std::string  key;          // entity key ("" = unresolved)
         std::wstring display;      // full path / canonical URL
         std::string  type;         // file | url
+        std::string  resolution = "unresolved";
     };
     enum class Redaction { None, DropContent, DropAll };
 
@@ -48,11 +49,15 @@ public:
         std::wstring windowTitle;
         int          durationSoFarSecs = 0;
         int          activeSecsSoFar = 0;
+        int          passiveSecsSoFar = 0;
+        int          idleSecsSoFar = 0;
+        int          unknownSecsSoFar = 0;
         int64_t      startedAtUtcSecs = 0;
         std::string  docKey;
         std::wstring docDisplay;
         std::string  docType;
         std::wstring aumid;
+        std::string  docResolution;
     };
 
     FocusTracker();
@@ -70,6 +75,7 @@ public:
     bool GetCurrentSession(ActiveSession& out) const;
 
     static bool IsShellChrome(const std::wstring& exeNameLower, const std::wstring& windowClass);
+    static std::string AttentionState(const std::string& presence, DWORD msSinceInput);
 
 private:
     struct Segment
@@ -84,6 +90,7 @@ private:
         double       activeSecs = 0.0;
         double       idleSecs = 0.0;
         double       passiveSecs = 0.0;
+        double       unknownSecs = 0.0;
         EventContext ctx;                   // captured at START (APP-6)
         DocInfo      doc;
         bool         docResolved = false;

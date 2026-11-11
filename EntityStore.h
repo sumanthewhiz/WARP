@@ -94,10 +94,10 @@ public:
     static double LegacyRecencyScore(int64_t nowUtc, int64_t lastOpenTs, double openCount7d);
 
     // ---- reads (any thread) ----
-    std::vector<EntityRecord> Lookup(const std::vector<std::string>& keys, int64_t nowUtc = 0);
+    std::vector<EntityRecord> Lookup(const std::vector<std::string>& keys, int64_t nowUtc = 0, bool legacyIdentity = false);
     // horizon: "short" (days), "long" (weeks), anything else = "blend" (0.7 short + 0.3 long)
     std::vector<EntityScore>  Score(const std::vector<std::string>& keys, const std::string& horizon = "blend",
-                                    int64_t nowUtc = 0, bool withReasons = true);
+                                    int64_t nowUtc = 0, bool withReasons = true, bool legacyIdentity = false);
     // entityType: file | app | url | "" (all types merged by percentile)
     std::vector<EntityScore>  Top(const std::string& entityType, int limit, const std::string& horizon = "blend",
                                   int64_t nowUtc = 0, bool withReasons = true);

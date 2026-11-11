@@ -151,7 +151,7 @@ EntityStore::EntityStore(ActivityStore* store) : m_store(store) {}
 std::string EntityStore::NormalizeKey(const std::wstring& raw)
 {
     if (raw.empty()) return std::string();
-    // Keys WARP itself hands out round-trip unchanged (case-folded): packaged apps and document
+    // Keys WARP itself hands out round-trip unchanged: packaged apps and document
     // identities produced by UrlCanonicalizer ("yt:", "gdoc:", "gh:owner/repo#pr12", ...).
     static const wchar_t* const kOpaquePrefixes[] = {
         L"aumid:", L"doc:", L"yt:", L"gdoc:", L"gdrive:", L"spo:", L"spo-path:", L"od:", L"gh:", L"ado:", L"figma:", L"jira:",
@@ -159,7 +159,8 @@ std::string EntityStore::NormalizeKey(const std::wstring& raw)
     for (const wchar_t* p : kOpaquePrefixes)
     {
         const size_t n = wcslen(p);
-        if (raw.size() > n && _wcsnicmp(raw.c_str(), p, n) == 0) return EntityKey::Key(raw);
+        if (raw.size() > n && _wcsnicmp(raw.c_str(), p, n) == 0)
+            return _wcsicmp(p, L"aumid:") == 0 ? EntityKey::Key(raw) : EntityKey::DocKey(raw);
     }
     // Windows paths are decided before any URL heuristics.
     const bool drivePath = raw.size() >= 3 && std::iswalpha(raw[0]) && raw[1] == L':' && (raw[2] == L'\\' || raw[2] == L'/');
@@ -249,6 +250,17 @@ EntityStore::CacheEntry* EntityStore::Get(WriterContext& w, const std::string& k
 
 EntityStore::CacheEntry& EntityStore::GetOrCreate(WriterContext& w, const std::string& key, const char* type)
 {
+    if (std::strcmp(type, "url") == 0)
+    {
+        // A newly observed case variant makes a previously unique v2 alias ambiguous.
+        if (auto* alias = w.Stmt("UPDATE entity_alias SET entity_key=NULL WHERE alias_key=?1 AND entity_key<>?2;"))
+        {
+            BindU(alias, 1, EntityKey::Key(EntityKey::FromUtf8(key)));
+            BindU(alias, 2, key);
+            sqlite3_step(alias);
+            sqlite3_reset(alias);
+        }
+    }
     if (CacheEntry* e = Get(w, key))
     {
         if (e->rec.entityType.empty()) e->rec.entityType = type;
@@ -892,14 +904,17 @@ void EntityStore::Finish(EntityScore& s, const std::string& horizon, int64_t now
     if (withReasons) FillReasons(s, nowUtc);
 }
 
-std::vector<EntityRecord> EntityStore::Lookup(const std::vector<std::string>& keys, int64_t nowUtc)
+std::vector<EntityRecord> EntityStore::Lookup(const std::vector<std::string>& keys, int64_t nowUtc, bool legacyIdentity)
 {
     if (nowUtc == 0) nowUtc = NowUtc();
     std::vector<EntityRecord> out(keys.size());
     if (keys.empty()) return out;
     ActivityStore::ReadLease rl = m_store->AcquireReader();
     if (!rl) return out;
-    std::string sql = std::string("SELECT ") + kCols + " FROM inference WHERE entity_key = ?1 AND deleted = 0;";
+    std::string sql = std::string("SELECT ") + kCols + " FROM inference WHERE entity_key = " +
+        (legacyIdentity ? "CASE WHEN EXISTS(SELECT 1 FROM entity_alias WHERE alias_key=?1) "
+                          "THEN (SELECT entity_key FROM entity_alias WHERE alias_key=?1) "
+                          "WHEN (SELECT entity_type FROM inference WHERE entity_key=?1)='url' THEN NULL ELSE ?1 END" : "?1") + " AND deleted = 0;";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(rl.get(), sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
     DerivedReader dr(rl.get(), nowUtc);
@@ -919,12 +934,12 @@ std::vector<EntityRecord> EntityStore::Lookup(const std::vector<std::string>& ke
 }
 
 std::vector<EntityScore> EntityStore::Score(const std::vector<std::string>& keys, const std::string& horizon,
-                                            int64_t nowUtc, bool withReasons)
+                                            int64_t nowUtc, bool withReasons, bool legacyIdentity)
 {
     if (nowUtc == 0) nowUtc = NowUtc();
     const std::string h = HorizonOf(horizon);
     EnsureDistribution(nowUtc);
-    std::vector<EntityRecord> recs = Lookup(keys, nowUtc);
+    std::vector<EntityRecord> recs = Lookup(keys, nowUtc, legacyIdentity);
     std::vector<EntityScore> out;
     out.reserve(recs.size());
     for (size_t i = 0; i < recs.size(); ++i)

@@ -8,6 +8,15 @@
 
 ### Status update — v6.0.0 (architecture rewrite)
 
+**Phase A follow-up on `dev`:** schema v3, actual native composer coverage and
+the on-demand [signal quality runner](tests/SIGNAL_QUALITY.md) are implemented.
+It covers the reproduced time/identity/sparse-context/history defects, own-user
+printing, upgrade/purge/restart behavior, metric self-tests and repeatable
+scorecards. Labeled live, SLM, search and product-cost evidence is still required
+for claims about those outcomes; missing measurements are explicit, not passes.
+This follow-up supersedes older stub/schema descriptions below, not the
+unimplemented later-phase goals.
+
 v6.0.0 replaced several modules this plan was written against. Read the sections
 below with this mapping in mind:
 
@@ -17,7 +26,7 @@ below with this mapping in mind:
 | `AppLaunchMonitor` + `LaunchCorrelator` | `LaunchCapture` (Kernel-Process ETW, window correlation) | Live timeline check in `test_live_api.py` |
 | `ForegroundMonitor` + `IdleDetector` | `FocusTracker` + `PresenceMonitor` (presence never pauses capture) | — (needs ETW/WinEvent replay seams) |
 | `BrowsingMonitor` + `UrlExtractor` | `WebCapture` + `AddressBarReader` + `UrlCanonicalizer` | URL canonicalization / document ids in `WarpTests.Canon.cpp` |
-| `ActivityDatabase` | `ActivityStore` (single writer, schema v2) | `tests/WarpTests.Store.cpp` |
+| `ActivityDatabase` | `ActivityStore` (single writer, schema v3) | `tests/WarpTests.Store.cpp`, `WarpTests.Context.cpp` |
 | `InferenceEngine` | `EntityStore` (decayed engagement, read-time scores, change feed) + `HistoryEngine` | `WarpTests.Store.cpp`, Python property tests |
 | `QueryApi` | `ApiServer` (API v2) | `tests/WarpTests.Api.cpp`, `test_live_api.py` |
 

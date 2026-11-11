@@ -172,15 +172,14 @@ void FocusTracker::OnPresenceChanged(const std::string& state, int64_t lastInput
     std::vector<FocusEventRecord> out;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        m_presence = state;
+        AccountLocked(GetTickCount64()); // account the elapsed sample using the previous state
         const bool away = state == "away" || state == "locked" || state == "asleep";
         const int64_t now = NowMs();
         if (away && !m_away)
         {
             // SIG-2: the user left at their last input, not when the idle timer fired.
-            AccountLocked(GetTickCount64());
             int64_t end = now;
-            if (m_haveCur && lastInputUtcMs > 0)
+            if (state == "away" && m_haveCur && lastInputUtcMs > 0)
                 end = (std::max)(m_cur.startMs, (std::min)(now, lastInputUtcMs));
             EndLocked(end, out);
             m_away = true;
@@ -197,6 +196,7 @@ void FocusTracker::OnPresenceChanged(const std::string& state, int64_t lastInput
                 if (root && pid) BeginLocked(root, pid, now, out);
             }
         }
+        m_presence = state;
     }
     Emit(out);
 }
@@ -207,12 +207,11 @@ void FocusTracker::OnForegroundChanged(HWND hwnd, DWORD pid)
     std::vector<FocusEventRecord> out;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_paused.load()) return;
+        if (m_paused.load() || m_away) return;
         if (m_haveCur && m_cur.hwnd == hwnd && m_cur.pid == pid && !m_away) return;
         const int64_t now = NowMs();
         AccountLocked(GetTickCount64());
         EndLocked(now, out);
-        m_away = false;                      // a foreground change is proof of a present user
         BeginLocked(hwnd, pid, now, out);
     }
     Emit(out);
@@ -255,32 +254,34 @@ void FocusTracker::BeginLocked(HWND hwnd, DWORD pid, int64_t startMs, std::vecto
     m_haveCur = true;
 }
 
+std::string FocusTracker::AttentionState(const std::string& presence, DWORD msSinceInput)
+{
+    if (presence == "away" || presence == "locked" || presence == "asleep") return "idle";
+    if (msSinceInput == 0xFFFFFFFFu) return presence == "passive" ? "passive" : "unknown";
+    if (msSinceInput <= kIdleThresholdMs) return "active";
+    return presence == "passive" ? "passive" : "idle";
+}
+
 void FocusTracker::AccountLocked(ULONGLONG nowTick)
 {
     if (!m_haveCur) return;
     if (nowTick <= m_cur.lastSampleTick) return;
     double dt = (double)(nowTick - m_cur.lastSampleTick) / 1000.0;
     m_cur.lastSampleTick = nowTick;
-    if (m_presence == "passive")
-    {
-        m_cur.activeSecs += dt;           // watching, presenting, in a call: present without input
-        m_cur.passiveSecs += dt;
-        return;
-    }
-    DWORD idle = EventContextUtil::MsSinceInput();
-    if (idle != 0xFFFFFFFFu && idle > kIdleThresholdMs) m_cur.idleSecs += dt;
-    else m_cur.activeSecs += dt;
+    const std::string state = AttentionState(m_presence, EventContextUtil::MsSinceInput());
+    if (state == "active") m_cur.activeSecs += dt;
+    else if (state == "passive") m_cur.passiveSecs += dt;
+    else if (state == "idle") m_cur.idleSecs += dt;
+    else m_cur.unknownSecs += dt;
 }
 
 void FocusTracker::ResolveDocLocked(Segment& s)
 {
-    if (s.docResolved || s.redaction != Redaction::None || !m_docResolver) return;
+    if (s.redaction != Redaction::None || !m_docResolver) return;
     DocInfo d;
-    if (m_docResolver(s.hwnd, s.pid, s.exePath, s.title, d) && !d.key.empty())
-    {
-        s.doc = d;
-        s.docResolved = true;
-    }
+    s.docResolved = m_docResolver(s.hwnd, s.pid, s.exePath, s.title, d) && !d.key.empty();
+    if (!s.docResolved) { d.key.clear(); d.display.clear(); d.type.clear(); }
+    s.doc = std::move(d);
 }
 
 void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
@@ -290,7 +291,6 @@ void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
     Segment& s = m_cur;
     const int64_t dur = endMs - s.startMs;
     if (dur < kMinSegmentMs) return;
-    ResolveDocLocked(s);
 
     FocusEventRecord r;
     r.startMs = s.startMs;
@@ -301,9 +301,12 @@ void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
     r.desktopId = s.desktopId;
     r.aumid = s.aumid;
     const double wall = (double)dur / 1000.0;
-    const double active = (std::min)(s.activeSecs, wall);
-    r.activeSecs = (int)std::lround(active);
-    r.idleSecs = (int)std::lround((std::max)(0.0, wall - active));
+    const int whole = static_cast<int>(wall);
+    r.activeSecs = (std::min)(whole, (int)std::lround(s.activeSecs));
+    r.passiveSecs = (std::min)(whole - r.activeSecs, (int)std::lround(s.passiveSecs));
+    r.idleSecs = (std::min)(whole - r.activeSecs - r.passiveSecs, (int)std::lround(s.idleSecs));
+    r.unknownSecs = whole - r.activeSecs - r.passiveSecs - r.idleSecs;
+    r.docResolution = s.redaction == Redaction::None ? s.doc.resolution : "withheld";
     if (s.redaction == Redaction::None)
     {
         r.windowTitle = s.title;
@@ -314,7 +317,7 @@ void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
             r.docType = s.doc.type;
         }
     }
-    r.presence = s.passiveSecs > active / 2.0 ? "passive" : "active";
+    r.presence = r.passiveSecs > r.activeSecs ? "passive" : "active";
     r.ctx = s.ctx;
     out.push_back(std::move(r));
 }
@@ -398,10 +401,29 @@ void FocusTracker::SamplerThread()
                         m_cur.pendingTitle.clear();
                     }
                     // Resolve the document early so the live overlay can carry it.
-                    if (m_haveCur && !m_cur.docResolved && now - lastDocAttempt >= kDocRetryMs)
+                    if (m_haveCur && now - lastDocAttempt >= kDocRetryMs)
                     {
                         lastDocAttempt = now;
-                        ResolveDocLocked(m_cur);
+                        const Redaction redaction = m_redact
+                            ? m_redact(m_cur.hwnd, m_cur.pid, m_cur.exePath, t) : Redaction::None;
+                        Segment candidate = m_cur;
+                        candidate.redaction = redaction;
+                        if (redaction == Redaction::None) ResolveDocLocked(candidate);
+                        else { candidate.doc = DocInfo{}; candidate.docResolved = false; }
+                        if (redaction != m_cur.redaction || candidate.doc.key != m_cur.doc.key ||
+                            candidate.doc.resolution != m_cur.doc.resolution)
+                        {
+                            HWND h = m_cur.hwnd;
+                            DWORD p = m_cur.pid;
+                            const int64_t split = NowMs();
+                            EndLocked(split, out);
+                            BeginLocked(h, p, split, out);
+                            if (m_haveCur && m_cur.redaction == Redaction::None)
+                            {
+                                m_cur.doc = std::move(candidate.doc);
+                                m_cur.docResolved = candidate.docResolved;
+                            }
+                        }
                     }
                 }
             }
@@ -415,6 +437,7 @@ bool FocusTracker::GetCurrentSession(ActiveSession& out) const
 {
     std::lock_guard<std::mutex> lk(m_mtx);
     if (!m_haveCur || m_away || m_paused.load()) return false;      // SIG-2: no fictional dwell while away
+    out = ActiveSession{};
     const int64_t now = NowMs();
     out.exeName = m_cur.exeName;
     out.exePath = m_cur.exePath;
@@ -422,7 +445,11 @@ bool FocusTracker::GetCurrentSession(ActiveSession& out) const
     out.startedAtUtcSecs = m_cur.startMs / 1000;
     out.durationSoFarSecs = (int)((now - m_cur.startMs) / 1000);
     out.activeSecsSoFar = (int)std::lround((std::min)(m_cur.activeSecs, (double)out.durationSoFarSecs));
+    out.passiveSecsSoFar = (std::min)(out.durationSoFarSecs - out.activeSecsSoFar, (int)std::lround(m_cur.passiveSecs));
+    out.idleSecsSoFar = (std::min)(out.durationSoFarSecs - out.activeSecsSoFar - out.passiveSecsSoFar, (int)std::lround(m_cur.idleSecs));
+    out.unknownSecsSoFar = out.durationSoFarSecs - out.activeSecsSoFar - out.passiveSecsSoFar - out.idleSecsSoFar;
     out.aumid = m_cur.aumid;
+    out.docResolution = m_cur.redaction == Redaction::None ? m_cur.doc.resolution : "withheld";
     if (m_cur.redaction == Redaction::None && !m_cur.doc.key.empty())
     {
         out.docKey = m_cur.doc.key;

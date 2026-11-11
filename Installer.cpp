@@ -259,7 +259,7 @@ namespace
             return false;
         }
         const wchar_t* const kFiles[] = {
-            L"onnxruntime.dll", L"onnxruntime-genai.dll", L"NOTICE.md", L"API.md", L"WARP - Readme.txt", L"SHA256SUMS.txt",
+            L"onnxruntime.dll", L"onnxruntime-genai.dll", L"NOTICE.md", L"API.md", L"SCHEMA.md", L"WARP - Readme.txt", L"SHA256SUMS.txt",
         };
         const wchar_t* const kDirs[] = { L"models", L"licenses" };
 

@@ -1,5 +1,7 @@
 #include "framework.h"
 #include "HistoryEngine.h"
+#include "Attention.h"
+#include <stdexcept>
 #include "sqlite3.h"
 #include "EntityKey.h"
 #include "Json.h"
@@ -255,7 +257,6 @@ void HistoryEngine::ResetCaches()
 {
     m_threads.clear();
     m_threadsLoaded = false;
-    m_haveSession = false;
     m_spanThread = m_spanStart = m_spanEnd = 0;
 }
 
@@ -586,118 +587,97 @@ int64_t HistoryEngine::RecordSnapshot(const SnapshotInput& in, DWORD timeoutMs)
 
 void HistoryEngine::ExtendSession(WriterContext& w, int64_t startTs, int64_t endTs, double activeSecs, double passiveSecs)
 {
-    // A malformed interval (start after end) is judged by its end, as the store judged it against the purge
-    // floors: its start may lie inside a purged range.
-    if (startTs > endTs) startTs = endTs;
-    activeSecs = (std::max)(0.0, activeSecs);
-    passiveSecs = (std::max)(0.0, passiveSecs);
-    // Activity joins a session it overlaps or that is less than kSessionGapSec away from it - but never across a
-    // purged range: the time in between was deleted on purpose.
-    auto joinable = [&](const SessionState& s)
-    {
-        if (startTs - s.endTs >= kSessionGapSec || s.startTs - endTs >= kSessionGapSec) return false;
-        if (startTs > s.endTs) return !m_store->PurgedBetween(s.endTs, startTs);
-        if (s.startTs > endTs) return !m_store->PurgedBetween(endTs, s.startTs);
-        return true;
+    if (endTs <= startTs || (activeSecs <= 0 && passiveSecs <= 0)) return;
+    auto done = [&](sqlite3_stmt* st) {
+        if (!st || sqlite3_step(st) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+        sqlite3_reset(st);
     };
-    auto extend = [&](SessionState& s)
+    const double wall = static_cast<double>(endTs - startTs);
+    std::vector<Attention::Span> spans{ { startTs, endTs, activeSecs / wall, passiveSecs / wall } };
+    sqlite3_stmt* st = w.Stmt("SELECT start_ts, end_ts, active_rate, passive_rate FROM session_attention WHERE end_ts >= ?1 AND start_ts <= ?2;");
+    if (!st) throw std::runtime_error(sqlite3_errmsg(w.db));
+    sqlite3_bind_int64(st, 1, startTs);
+    sqlite3_bind_int64(st, 2, endTs);
+    while (sqlite3_step(st) == SQLITE_ROW)
+        spans.push_back({ sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1),
+                          sqlite3_column_double(st, 2), sqlite3_column_double(st, 3) });
+    sqlite3_reset(st);
+    st = w.Stmt("DELETE FROM session_attention WHERE end_ts >= ?1 AND start_ts <= ?2;");
+    sqlite3_bind_int64(st, 1, startTs);
+    sqlite3_bind_int64(st, 2, endTs);
+    done(st);
+    for (const auto& span : Attention::Union(spans))
     {
-        s.endTs = (std::max)(s.endTs, endTs);
-        s.startTs = (std::min)(s.startTs, startTs);
-        s.activeSecs += activeSecs;
-        s.passiveSecs += passiveSecs;
-        sqlite3_stmt* up = w.Stmt("UPDATE work_session SET start_ts = ?2, end_ts = ?3, active_secs = ?4, passive_secs = ?5 WHERE id = ?1;");
-        if (!up) return;
-        sqlite3_bind_int64(up, 1, s.id);
-        sqlite3_bind_int64(up, 2, s.startTs);
-        sqlite3_bind_int64(up, 3, s.endTs);
-        sqlite3_bind_int64(up, 4, (int64_t)s.activeSecs);
-        sqlite3_bind_int64(up, 5, (int64_t)s.passiveSecs);
-        sqlite3_step(up);
-    };
-    auto readRow = [](sqlite3_stmt* st)
-    {
-        SessionState s;
-        s.id = sqlite3_column_int64(st, 0);
-        s.startTs = sqlite3_column_int64(st, 1);
-        s.endTs = sqlite3_column_int64(st, 2);
-        s.activeSecs = sqlite3_column_double(st, 3);
-        s.passiveSecs = sqlite3_column_double(st, 4);
-        return s;
-    };
+        st = w.Stmt("INSERT INTO session_attention (start_ts, end_ts, active_rate, passive_rate) VALUES (?1, ?2, ?3, ?4);");
+        sqlite3_bind_int64(st, 1, span.start);
+        sqlite3_bind_int64(st, 2, span.end);
+        sqlite3_bind_double(st, 3, span.active);
+        sqlite3_bind_double(st, 4, span.passive);
+        done(st);
+    }
 
-    if (!m_haveSession)
+    // Merge every neighboring session, including a late interval bridging two sessions.
+    // The durable union makes replay, arrival order and agent restarts idempotent.
+    std::map<int64_t, int> joined;
+    int version = 1;
+    bool expanded;
+    do
     {
-        // Continue the most recent session if this activity follows it closely (e.g. agent restart).
-        sqlite3_stmt* st = w.Stmt("SELECT id, start_ts, end_ts, active_secs, passive_secs FROM work_session ORDER BY end_ts DESC LIMIT 1;");
-        if (st && sqlite3_step(st) == SQLITE_ROW)
+        expanded = false;
+        st = w.Stmt("SELECT id, start_ts, end_ts, accounting_version FROM work_session WHERE end_ts > ?1 AND start_ts < ?2;");
+        sqlite3_bind_int64(st, 1, startTs - kSessionGapSec);
+        sqlite3_bind_int64(st, 2, endTs + kSessionGapSec);
+        while (sqlite3_step(st) == SQLITE_ROW)
         {
-            SessionState s = readRow(st);
-            if (joinable(s))
-            {
-                m_session = s;
-                m_haveSession = true;
-            }
+            const int64_t id = sqlite3_column_int64(st, 0);
+            if (joined.count(id)) continue;
+            const int64_t s = sqlite3_column_int64(st, 1), e = sqlite3_column_int64(st, 2);
+            if ((startTs > e && m_store->PurgedBetween(e, startTs)) ||
+                (s > endTs && m_store->PurgedBetween(endTs, s))) continue;
+            const int v = sqlite3_column_int(st, 3);
+            joined[id] = v;
+            version = (std::min)(version, v);
+            startTs = (std::min)(startTs, s);
+            endTs = (std::max)(endTs, e);
+            expanded = true;
         }
-        if (st) sqlite3_reset(st);
-    }
-    if (m_haveSession && joinable(m_session))
-    {
-        extend(m_session);
-        return;
-    }
-    // Activity reported out of order - e.g. the earlier part of an interval that a purge split, arriving after the
-    // later part of another one - belongs to the older session next to it, not to a new one.
-    {
-        std::vector<SessionState> nearby;
-        sqlite3_stmt* st = w.Stmt("SELECT id, start_ts, end_ts, active_secs, passive_secs FROM work_session "
-                                  "WHERE end_ts > ?1 AND start_ts < ?2 ORDER BY end_ts DESC LIMIT 8;");
-        if (st)
-        {
-            sqlite3_bind_int64(st, 1, startTs - kSessionGapSec);
-            sqlite3_bind_int64(st, 2, endTs + kSessionGapSec);
-            while (sqlite3_step(st) == SQLITE_ROW) nearby.push_back(readRow(st));
-            sqlite3_reset(st);
-        }
-        for (SessionState& s : nearby)
-        {
-            if (m_haveSession && s.id == m_session.id) continue;   // already judged above
-            if (!joinable(s)) continue;
-            extend(s);
-            return;
-        }
-    }
-    sqlite3_stmt* ins = w.Stmt("INSERT INTO work_session (start_ts, end_ts, active_secs, passive_secs) VALUES (?1, ?2, ?3, ?4);");
-    if (!ins) return;
-    sqlite3_bind_int64(ins, 1, startTs);
-    sqlite3_bind_int64(ins, 2, endTs);
-    sqlite3_bind_int64(ins, 3, (int64_t)activeSecs);
-    sqlite3_bind_int64(ins, 4, (int64_t)passiveSecs);
-    if (sqlite3_step(ins) != SQLITE_DONE) return;
-    SessionState s;
-    s.id = sqlite3_last_insert_rowid(w.db);
-    s.startTs = startTs;
-    s.endTs = endTs;
-    s.activeSecs = activeSecs;
-    s.passiveSecs = passiveSecs;
-    if (!m_haveSession || endTs >= m_session.endTs)             // the newest session stays the one live activity extends
-    {
-        m_session = s;
-        m_haveSession = true;
-    }
-}
+        sqlite3_reset(st);
+    } while (expanded);
 
-void HistoryEngine::CloseSession(WriterContext&)
-{
-    m_haveSession = false;
+    st = w.Stmt("SELECT COALESCE(SUM((MIN(end_ts, ?2) - MAX(start_ts, ?1)) * active_rate), 0), "
+                "COALESCE(SUM((MIN(end_ts, ?2) - MAX(start_ts, ?1)) * passive_rate), 0) "
+                "FROM session_attention WHERE end_ts > ?1 AND start_ts < ?2;");
+    sqlite3_bind_int64(st, 1, startTs);
+    sqlite3_bind_int64(st, 2, endTs);
+    if (sqlite3_step(st) != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(w.db));
+    activeSecs = sqlite3_column_double(st, 0);
+    passiveSecs = sqlite3_column_double(st, 1);
+    sqlite3_reset(st);
+    const int64_t id = joined.empty() ? 0 : joined.begin()->first;
+    st = id ? w.Stmt("UPDATE work_session SET start_ts=?2, end_ts=?3, active_secs=?4, passive_secs=?5, accounting_version=?6 WHERE id=?1;")
+            : w.Stmt("INSERT INTO work_session (id, start_ts, end_ts, active_secs, passive_secs, accounting_version) VALUES (NULL, ?2, ?3, ?4, ?5, ?6);");
+    if (id) sqlite3_bind_int64(st, 1, id);
+    sqlite3_bind_int64(st, 2, startTs);
+    sqlite3_bind_int64(st, 3, endTs);
+    sqlite3_bind_double(st, 4, activeSecs);
+    sqlite3_bind_double(st, 5, passiveSecs);
+    sqlite3_bind_int(st, 6, version);
+    done(st);
+    for (const auto& other : joined) if (other.first != id)
+    {
+        st = w.Stmt("DELETE FROM work_session WHERE id=?1;");
+        sqlite3_bind_int64(st, 1, other.first);
+        done(st);
+    }
 }
 
 void HistoryEngine::OnFocusEvent(WriterContext& w, const FocusEventRecord& r)
 {
-    if (r.activeSecs <= 0) return;
+    if (r.activeSecs <= 0 && r.passiveSecs <= 0) return;
     int64_t endTs = r.endMs / 1000;
     int64_t startTs = r.startMs > 0 ? r.startMs / 1000 : endTs - r.activeSecs;
-    ExtendSession(w, startTs, endTs, (double)r.activeSecs, 0.0);
+    ExtendSession(w, startTs, endTs, (double)(std::max)(0, r.activeSecs), (double)(std::max)(0, r.passiveSecs));
+    if (r.activeSecs <= 0) return;
 
     int64_t cur = m_currentThread.load();
     if (cur == 0) return;
@@ -722,11 +702,9 @@ void HistoryEngine::OnPresence(WriterContext& w, const PresenceRecord& r)
         ExtendSession(w, s, e, (double)(e - s), 0.0);
     else if (r.state == "passive")
         ExtendSession(w, s, e, 0.0, (double)(e - s));
-    else if (e - s >= kSessionGapSec)                       // away / locked / asleep long enough
-        CloseSession(w);
 }
 
-void HistoryEngine::OnMaintenance(WriterContext& w, int64_t nowUtc)
+void HistoryEngine::OnMaintenance(WriterContext&, int64_t nowUtc)
 {
     for (auto it = m_threads.begin(); it != m_threads.end();)
     {
@@ -735,8 +713,6 @@ void HistoryEngine::OnMaintenance(WriterContext& w, int64_t nowUtc)
         else
             ++it;
     }
-    if (m_haveSession && nowUtc - m_session.endTs >= kSessionGapSec)
-        CloseSession(w);
 }
 
 void HistoryEngine::OnClearAll(WriterContext&)
@@ -866,7 +842,7 @@ std::vector<WorkSessionInfo> HistoryEngine::GetSessions(int64_t startUtc, int64_
     ActivityStore::ReadLease rl = m_store->AcquireReader();
     if (!rl) return out;
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(rl.get(), "SELECT id, start_ts, end_ts, active_secs, passive_secs FROM work_session "
+    if (sqlite3_prepare_v2(rl.get(), "SELECT id, start_ts, end_ts, active_secs, passive_secs, accounting_version FROM work_session "
                                      "WHERE end_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts DESC LIMIT ?3;", -1, &st, nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_int64(st, 1, startUtc);
@@ -880,6 +856,7 @@ std::vector<WorkSessionInfo> HistoryEngine::GetSessions(int64_t startUtc, int64_
         s.endTs = sqlite3_column_int64(st, 2);
         s.activeSecs = sqlite3_column_int(st, 3);
         s.passiveSecs = sqlite3_column_int(st, 4);
+        s.accountingVersion = sqlite3_column_int(st, 5);
         out.push_back(s);
     }
     sqlite3_finalize(st);

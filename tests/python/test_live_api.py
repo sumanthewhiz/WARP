@@ -63,7 +63,7 @@ def test_standard_user_client_can_connect(pipe_ready):
 def test_status_reports_store_and_capture_health(pipe_ready):
     s = warp_pipe.call({"op": "GetStatus"})
     print(s)
-    assert s["store"]["schema_version"] == 2
+    assert s["store"]["schema_version"] == 3
     assert s["store"]["write_errors"] == 0
     files = s["capture"]["files"]
     assert files["enabled"]

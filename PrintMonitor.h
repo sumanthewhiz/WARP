@@ -18,6 +18,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 struct PrintEvent
 {
@@ -48,6 +49,9 @@ public:
     void Stop();                 // idempotent; waits for an in-flight callback to finish
     bool IsActive() const;       // false after a subscription error: Stop() + Start() to resubscribe
     std::wstring Status() const;
+    static bool IsOwnLocalJob(const std::wstring& owner, const std::wstring& clientMachine,
+                             const std::vector<std::wstring>& ownQualifiedNames,
+                             const std::vector<std::wstring>& localMachineNames);
 
 private:
     friend struct PrintMonitorThunk;     // EvtSubscribe callback bridge, defined in PrintMonitor.cpp
@@ -61,6 +65,7 @@ private:
     std::mutex         m_lifecycleMutex;           // serializes Start/Stop
     std::wstring       m_status = L"not started";
     Callback           m_callback;
+    std::vector<std::wstring> m_ownNames, m_localNames;
     HANDLE             m_subscription = nullptr;   // EVT_HANDLE
     std::atomic<bool>  m_accepting{ false };       // deliver events to the callback
     std::atomic<bool>  m_healthy{ false };         // subscribed and no error reported since

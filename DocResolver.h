@@ -19,9 +19,10 @@ namespace DocResolver
     // the title carries no document.
     std::wstring DocNameFromTitle(const std::wstring& exeNameLower, const std::wstring& normalizedTitle);
 
-    // Picks the most recent candidate path whose file name (or stem, for apps that hide the
-    // extension) equals docName, case-insensitively. Candidates are newest first.
-    bool MatchPath(const std::wstring& docName, const std::vector<std::wstring>& candidates, std::wstring& out);
+    // Resolves only one distinct canonical path. Duplicate observations are harmless;
+    // different paths with the same name/stem produce ambiguity, not a recency guess.
+    bool MatchPath(const std::wstring& docName, const std::vector<std::wstring>& candidates,
+                   std::wstring& out, bool* ambiguous = nullptr);
 
     // True for apps whose windows are documents (editors, Office, PDF readers, viewers).
     bool IsDocumentApp(const std::wstring& exeNameLower);

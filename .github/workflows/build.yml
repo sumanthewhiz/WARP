@@ -110,9 +110,24 @@ jobs:
     - name: Build C++ unit tests (x64)
       run: msbuild tests\WarpTests.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.value }} /m
 
-    - name: Run C++ unit tests (x64)
+    - name: Native regressions and signal quality gates (x64)
       timeout-minutes: 20
-      run: build\tests\x64\Release\WarpTests.exe /timeout 900
+      shell: pwsh
+      run: |
+        python tests\eval\signal_quality.py --native-bin build\tests\x64\Release\WarpTests.exe --output-dir build\signal-quality
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Exercise the optional encoder path against the same evidence, using the
+        # model bundle already downloaded above. No Qwen/refiner is enabled.
+        python tests\eval\signal_quality.py --native-bin build\tests\x64\Release\WarpTests.exe --models-dir models --output-dir build\signal-quality\granite
+        exit $LASTEXITCODE
+
+    - name: Upload signal quality evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: signal-quality-x64
+        path: build/signal-quality/
+        if-no-files-found: warn
 
     # ENG-3: start the real binary headless against a temp data directory, query the live pipe
     # (including as a filtered, medium-integrity "standard user" client), drive scripted activity,
@@ -225,6 +240,7 @@ jobs:
           Copy-Item "WARP - Readme.txt" "$staging/WARP - Readme.txt" -Force
           Copy-Item "NOTICE.md" "$staging/NOTICE.md" -Force
           Copy-Item "API.md" "$staging/API.md" -Force
+          Copy-Item "SCHEMA.md" "$staging/SCHEMA.md" -Force
 
           # Upstream license files (ENG-5 / SEC-2): ONNX Runtime packages, Apache-2.0 for the models.
           $lic = "$staging/licenses"

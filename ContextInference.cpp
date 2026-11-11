@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "ContextInference.h"
+#include "Attention.h"
 #include "LlmSummarizer.h"
 #include "ActivityStore.h"
 #include "EntityStore.h"
@@ -624,16 +625,22 @@ static std::string CleanTitle(const std::string& title,
 
 // =====================================================================
 //  Per-app aggregation.  Combines focus events (from DB) + the live
-//  active session (from FocusTracker) + a browsing-title override
-//  for browser apps.
+//  active session (from FocusTracker). Unresolved browser windows keep
+//  their own observed title rather than borrowing a different page.
 // =====================================================================
 struct AppAgg
 {
     std::wstring exeName;           // canonical, kept for path fallback
     std::wstring exePath;
+    std::wstring aumid;
     std::string  friendlyName;
     std::string  verb;
     int          totalFocusSecs = 0;
+    int          exposureSecs = 0, passiveSecs = 0, idleSecs = 0, unknownSecs = 0;
+    std::vector<Attention::Span> attention;
+    std::string  action;
+    std::string  actionLabel;
+    std::string  resolution;
     // Effective focus seconds used for ranking, clustering, and
     // per-cluster theme weighting.  Defaults to totalFocusSecs but is
     // boosted by ApplyInferenceBoost() using the EntityStore's
@@ -1326,7 +1333,7 @@ bool ContextInference::ShouldAppendToHistory(const ContextSnapshot& snap) const
 // Multiplicative: zero in-window focus stays zero (history never invents presence).
 static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
                                 EntityStore*                         es,
-                                std::function<std::string(const AppAgg&)> keyOf)
+                                std::function<std::string(const AppAgg&)> keyOf, int64_t asOf)
 {
     for (auto& a : bag)
         a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
@@ -1345,7 +1352,7 @@ static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
     }
     if (keys.empty()) return;
 
-    std::vector<EntityScore> scores = es->Score(keys, "short", 0, false);
+    std::vector<EntityScore> scores = es->Score(keys, "short", asOf, false);
     for (size_t i = 0; i < scores.size() && i < keyToIdx.size(); ++i)
     {
         if (!scores[i].found) continue;
@@ -1360,7 +1367,7 @@ static std::string EntityKeyOfAgg(const AppAgg& a)
     if (!a.entityKey.empty()) return a.entityKey;
     if (!a.filePath.empty()) return EntityKey::FileKey(a.filePath);
     if (!a.webUrl.empty()) return EntityStore::NormalizeKey(a.webUrl);
-    if (!a.exePath.empty()) return StoreUtil::AppEntityKey(a.exePath, std::wstring());
+    if (!a.exePath.empty() || !a.aumid.empty()) return StoreUtil::AppEntityKey(a.exePath, a.aumid);
     return std::string();
 }
 
@@ -1596,12 +1603,12 @@ static std::vector<std::string> ComposeRichListing(
     return { "User is " + std::string(verb) + " " + body + appClause };
 }
 
-ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm)
+ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm, int64_t asOf)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
 
     ContextSnapshot snap;
-    snap.timestamp     = static_cast<int64_t>(std::time(nullptr));
+    snap.timestamp     = asOf > 0 ? asOf : static_cast<int64_t>(std::time(nullptr));
     snap.windowEndTs   = snap.timestamp;
     snap.windowStartTs = snap.timestamp - windowSecs;
     snap.windowSeconds = windowSecs;
@@ -1616,16 +1623,20 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // that ended 14 minutes ago therefore contributes 60 s to a 15-minute window, not 10,800 s.
     const int kMaxRows = 20000;
     auto focus  = m_store->QueryFocus(snap.windowStartTs, snap.windowEndTs, kMaxRows);
-    auto browse = m_store->QueryBrowsing(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
-    auto apps   = m_store->QueryLaunches(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
-    auto files  = m_store->QueryFiles(snap.windowStartTs, snap.windowEndTs + 60, kMaxRows);
+    auto browse = m_store->QueryBrowsing(snap.windowStartTs, snap.windowEndTs, kMaxRows);
+    auto apps   = m_store->QueryLaunches(snap.windowStartTs, snap.windowEndTs, kMaxRows);
+    auto files  = m_store->QueryFiles(snap.windowStartTs, snap.windowEndTs, kMaxRows);
     for (auto& f : focus)
     {
         int64_t s = (std::max)(f.startTs, snap.windowStartTs);
         int64_t e = (std::min)(f.endTs > 0 ? f.endTs : f.timestampUtc, snap.windowEndTs);
-        int64_t wall = (std::max<int64_t>)(1, (f.endTs > 0 && f.startTs > 0) ? f.endTs - f.startTs : f.durationSecs);
-        double activeFrac = f.activeSecs > 0 ? (std::min)(1.0, (double)f.activeSecs / (double)wall) : 1.0;
-        f.durationSecs = e > s ? (int)std::lround((double)(e - s) * activeFrac) : 0;
+        f.activeSecs = Attention::Clip(f.activeSecs, f.startTs, f.endTs, s, e);
+        f.passiveSecs = Attention::Clip(f.passiveSecs, f.startTs, f.endTs, s, e);
+        f.idleSecs = Attention::Clip(f.idleSecs, f.startTs, f.endTs, s, e);
+        f.unknownSecs = Attention::Clip(f.unknownSecs, f.startTs, f.endTs, s, e);
+        f.durationSecs = (int)(std::max)(int64_t(0), e - s);
+        f.startTs = s;
+        f.endTs = e;
         f.timestampUtc = e;
     }
     // A deleted / renamed-away file is not "being worked on" (INTEL-1).
@@ -1657,8 +1668,6 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
                 : (snap.timestamp - active.durationSoFarSecs);
             int64_t effectiveStart = (std::max)(startTs, snap.windowStartTs);
             int     dwellInWindow  = static_cast<int>(snap.timestamp - effectiveStart);
-            if (active.durationSoFarSecs > 0 && active.activeSecsSoFar >= 0 && active.activeSecsSoFar < active.durationSoFarSecs)
-                dwellInWindow = (int)std::lround(dwellInWindow * ((double)active.activeSecsSoFar / active.durationSoFarSecs));
             if (dwellInWindow > 0)
             {
                 AppFocusActivity virt{};
@@ -1670,7 +1679,12 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
                 virt.exePath      = active.exePath;
                 virt.windowTitle  = active.windowTitle;
                 virt.durationSecs = dwellInWindow;
-                virt.activeSecs   = dwellInWindow;
+                virt.activeSecs   = Attention::Clip(active.activeSecsSoFar, startTs, snap.timestamp, effectiveStart, snap.timestamp);
+                virt.passiveSecs  = Attention::Clip(active.passiveSecsSoFar, startTs, snap.timestamp, effectiveStart, snap.timestamp);
+                virt.idleSecs     = Attention::Clip(active.idleSecsSoFar, startTs, snap.timestamp, effectiveStart, snap.timestamp);
+                virt.unknownSecs  = Attention::Clip(active.unknownSecsSoFar, startTs, snap.timestamp, effectiveStart, snap.timestamp);
+                virt.aumid        = active.aumid;
+                virt.docResolution = active.docResolution;
                 virt.docKey       = active.docKey;
                 virt.docDisplay   = active.docDisplay;
                 virt.docType      = active.docType;
@@ -1699,13 +1713,15 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         std::wstring pathLower = ToLower(f.exePath);
         if (IsBoringExe(exeLower)) continue;
 
-        std::string key = ExeBasenameUtf8(exeLower);
+        std::string key = StoreUtil::AppEntityKey(f.exePath, f.aumid);
+        if (key.empty()) key = ExeBasenameUtf8(exeLower);
         if (!f.docKey.empty()) key += "|" + f.docKey;
         auto& agg = byExe[key];
         if (agg.exeName.empty())
         {
             agg.exeName = f.exeName;
             agg.exePath = f.exePath;
+            agg.aumid = f.aumid;
             auto cls = ClassifyApp(f.exeName, f.exePath);
             agg.friendlyName = cls.first;
             agg.verb         = cls.second;
@@ -1713,11 +1729,14 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             agg.entityKey    = f.docKey;
             agg.entityType   = f.docType == "file" ? "file" : (f.docKey.empty() ? "" : "url");
             agg.entityDisplay = f.docDisplay;
+            agg.resolution = f.docResolution;
             if (agg.entityType == "url") agg.webUrl = f.docDisplay;
             else if (agg.entityType == "file") agg.filePath = f.docDisplay;
         }
-        agg.totalFocusSecs += f.durationSecs;
-        totalFocusSecs     += f.durationSecs;
+        const double wall = (double)(std::max)(1, f.durationSecs);
+        agg.attention.push_back({ f.startTs, f.endTs, (std::max)(0, f.activeSecs) / wall,
+                                                     (std::max)(0, f.passiveSecs) / wall });
+        agg.idleSecs += (std::max)(0, f.idleSecs);
         if (f.timestampUtc > agg.lastSeenTs)
         {
             agg.lastSeenTs = f.timestampUtc;
@@ -1727,38 +1746,115 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         }
     }
 
-    // ---- Browser title fallback -----------------------------------
-    // Only for browser entries whose focus session did NOT resolve a URL, and only from the
-    // same browser (the old code gave every browser the newest title from any browser).
-    if (!browse.empty())
+    std::vector<Attention::Span> allAttention;
+    for (auto& pair : byExe)
     {
-        std::sort(browse.begin(), browse.end(),
-                  [](const BrowsingActivity& a, const BrowsingActivity& b){
-                      return a.timestampUtc > b.timestampUtc;
-                  });
-        for (auto& kv : byExe)
+        auto& a = pair.second;
+        double active = 0, passive = 0;
+        a.attention = Attention::Union(a.attention);
+        for (const auto& s : a.attention)
         {
-            AppAgg& agg = kv.second;
-            if (!agg.isBrowser || !agg.entityKey.empty()) continue;
-            std::string friendlyLower = AsciiLower(agg.friendlyName);
-            std::string exeLower = ExeBasenameUtf8(ToLower(agg.exeName));
-            for (const auto& b : browse)
+            const int wall = (int)(s.end - s.start);
+            a.exposureSecs += wall;
+            active += wall * s.active;
+            passive += wall * s.passive;
+            allAttention.push_back(s);
+        }
+        a.totalFocusSecs = (int)std::lround(active);
+        a.passiveSecs = (std::min)(a.exposureSecs - a.totalFocusSecs, (int)std::lround(passive));
+        a.idleSecs = (std::min)(a.idleSecs, a.exposureSecs - a.totalFocusSecs - a.passiveSecs);
+        a.unknownSecs = a.exposureSecs - a.totalFocusSecs - a.passiveSecs - a.idleSecs;
+        totalFocusSecs += a.totalFocusSecs;
+        snap.idleSeconds += a.idleSecs;
+    }
+    double unionActive = 0, unionPassive = 0;
+    for (const auto& s : Attention::Union(allAttention))
+    {
+        const int wall = (int)(s.end - s.start);
+        snap.exposureSeconds += wall;
+        unionActive += wall * s.active;
+        unionPassive += wall * s.passive;
+    }
+    snap.focusSeconds = (int)std::lround(unionActive);
+    snap.passiveSeconds = (std::min)(snap.exposureSeconds - snap.focusSeconds, (int)std::lround(unionPassive));
+    snap.idleSeconds = (std::min)(snap.idleSeconds, snap.exposureSeconds - snap.focusSeconds - snap.passiveSeconds);
+    snap.unknownSeconds = snap.exposureSeconds - snap.focusSeconds - snap.passiveSeconds - snap.idleSeconds;
+
+    // Sparse windows still have observations, but they have no measured focus seconds.
+    // Use typed actions rather than inventing duration or turning an OPEN into an edit.
+    if (totalFocusSecs == 0)
+    {
+        auto add = [&](AppAgg a) {
+            const std::string key = EntityKeyOfAgg(a);
+            if (!key.empty()) for (auto& existing : byExe)
             {
-                std::string br = AsciiLower(WideToUtf8(b.browser));
-                if (!br.empty() && br.find(friendlyLower) == std::string::npos && friendlyLower.find(br) == std::string::npos &&
-                    br.find(exeLower) == std::string::npos)
-                    continue;
-                std::string t = WideToUtf8(b.title);
-                if (t.empty()) continue;
-                agg.rawTitle  = t;
-                agg.bestTitle = CleanTitle(t, agg.friendlyName);
-                if (!b.url.empty()) agg.webUrl = b.url;
-                break;
+                if (EntityKeyOfAgg(existing.second) != key) continue;
+                if (a.lastSeenTs >= existing.second.lastSeenTs)
+                {
+                    if (existing.second.exposureSecs == 0) existing.second = std::move(a);
+                    else
+                    {
+                        existing.second.action = a.action;
+                        existing.second.actionLabel = a.actionLabel;
+                        existing.second.lastSeenTs = a.lastSeenTs;
+                    }
+                }
+                return;
             }
+            const std::string grouping = key.empty() ? a.action + "|" + a.rawTitle : key;
+            auto it = byExe.find(grouping);
+            if (it == byExe.end() || a.lastSeenTs > it->second.lastSeenTs) byExe[grouping] = std::move(a);
+        };
+        for (const auto& f : files)
+        {
+            if (EntityStore::IsTransientFileName(f.path)) continue;
+            AppAgg a;
+            a.entityKey = f.entityKey;
+            a.entityType = "file";
+            a.entityDisplay = a.filePath = f.path;
+            a.rawTitle = a.bestTitle = WideToUtf8(EntityKey::BaseName(f.path));
+            a.lastSeenTs = f.timestampUtc;
+            a.action = AsciiLower(WideToUtf8(f.action));
+            a.actionLabel = f.action == L"OPEN" ? "Opened" :
+                f.action == L"DOWNLOAD" ? "Download observed" :
+                f.action == L"CREATE" ? "Creation observed" : "Modification observed";
+            a.resolution = "observed_path";
+            add(std::move(a));
+        }
+        for (const auto& b : browse)
+        {
+            if (b.confidence < 0.2) continue;
+            AppAgg a;
+            a.entityKey = b.url.empty() && b.docId.empty() ? "" : b.entityKey;
+            a.entityType = "url";
+            a.entityDisplay = a.webUrl = b.url;
+            a.rawTitle = a.bestTitle = WideToUtf8(b.title.empty() ? b.url : b.title);
+            a.friendlyName = WideToUtf8(b.browser);
+            a.isBrowser = true;
+            a.lastSeenTs = b.timestampUtc;
+            a.action = "page_observed";
+            a.actionLabel = "Page observed";
+            a.resolution = a.entityKey.empty() ? "unresolved" : "browser_window";
+            add(std::move(a));
+        }
+        for (const auto& app : apps)
+        {
+            if (app.confidence < 0.2 || IsBoringExe(ToLower(app.exeName))) continue;
+            AppAgg a;
+            a.exeName = app.exeName;
+            a.exePath = app.exePath;
+            a.aumid = app.aumid;
+            a.friendlyName = ClassifyApp(app.exeName, app.exePath).first;
+            a.rawTitle = a.bestTitle = a.friendlyName;
+            a.entityType = "app";
+            a.entityDisplay = app.aumid.empty() ? app.exePath : app.aumid;
+            a.lastSeenTs = app.timestampUtc;
+            a.action = "launch";
+            a.actionLabel = "Launch observed";
+            a.resolution = "process";
+            add(std::move(a));
         }
     }
-
-    snap.focusSeconds = (std::min)(totalFocusSecs, (int)windowSecs);
 
     // ---- Score & rank apps ----------------------------------------
     std::vector<AppAgg> ranked;
@@ -1773,13 +1869,14 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         entities = m_entities;
         llm = m_llm;
     }
-    ApplyInferenceBoost(ranked, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
+    ApplyInferenceBoost(ranked, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
 
     std::sort(ranked.begin(), ranked.end(),
               [](const AppAgg& a, const AppAgg& b){
                   if (a.weightedFocusSecs != b.weightedFocusSecs)
                       return a.weightedFocusSecs > b.weightedFocusSecs;
-                  return a.lastSeenTs > b.lastSeenTs;
+                  if (a.lastSeenTs != b.lastSeenTs) return a.lastSeenTs > b.lastSeenTs;
+                  return EntityKeyOfAgg(a) < EntityKeyOfAgg(b);
               });
 
     // dominant_focus_pct stays based on RAW totalFocusSecs -- the
@@ -2598,7 +2695,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     };
 
     // ---- "All" composition (also produces the items[] thread IDs) -
-    OneLinerBuild allBuild = composeOneLinerFromBag(ranked);
+    OneLinerBuild allBuild = totalFocusSecs > 0 ? composeOneLinerFromBag(ranked) : OneLinerBuild{};
     snap.threadCount       = allBuild.threadCount;
     std::vector<int>& clusterOf = allBuild.clusterOf;
     if (clusterOf.empty()) clusterOf.assign(ranked.size(), -1);
@@ -2643,49 +2740,42 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             for (const char* c : kCommApps) if (a.friendlyName.find(c) != std::string::npos) { comm = true; break; }
             e.role = comm ? "communication" : (snap.entities.size() < 2 && a.totalFocusSecs >= 30 ? "focus" : "reference");
             e.activeSecs = a.totalFocusSecs;
-            e.lastActiveTs = a.lastSeenTs;
+            e.exposureSecs = a.exposureSecs;
+            e.passiveSecs = a.passiveSecs;
+            e.idleSecs = a.idleSecs;
+            e.unknownSecs = a.unknownSecs;
+            e.action = a.action.empty() ? "foreground" : a.action;
+            e.resolution = a.resolution;
+            if (a.totalFocusSecs == 0)
+                e.role = a.unknownSecs > 0 ? "attention_unknown" : (a.passiveSecs > 0 ? "passive" : "observed");
+            e.lastObservedTs = a.lastSeenTs;
+            e.lastActiveTs = a.totalFocusSecs > 0 ? a.lastSeenTs : 0;
             keys.push_back(e.entityKey);
             snap.entities.push_back(std::move(e));
         }
         if (entities && !keys.empty())
         {
-            std::vector<EntityScore> sc = entities->Score(keys, "long", 0, false);
+            std::vector<EntityScore> sc = entities->Score(keys, "long", snap.timestamp, false);
             for (size_t i = 0; i < sc.size() && i < snap.entities.size(); ++i)
                 if (sc[i].found) snap.entities[i].score = sc[i].score;
         }
     }
 
-    if (ranked.empty())
+    if (totalFocusSecs == 0)
     {
-        // No usable focus signal -- fall back to a recent file edit, or
-        // an app launch, or report idle.
-        if (!files.empty())
+        for (const auto& a : ranked)
         {
-            // Pick the most recent file.
-            auto it = std::max_element(files.begin(), files.end(),
-                [](const FileActivity& a, const FileActivity& b){
-                    return a.timestampUtc < b.timestampUtc;
-                });
-            std::string p = WideToUtf8(it->path);
-            size_t slash = p.find_last_of("/\\");
-            std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-            snap.summary.push_back("Editing \"" + base + "\"");
-            snap.confidence = 0.35;
+            const std::string label = a.actionLabel.empty() ? "Foreground observed" : a.actionLabel;
+            const std::string line = label + " \"" + (a.bestTitle.empty() ? a.friendlyName : a.bestTitle) + "\"";
+            if (snap.summary.size() < 3) snap.summary.push_back(line);
+            auto& facet = a.isBrowser || a.entityType == "url" ? snap.summaryWebsites :
+                (a.entityType != "app" && (a.entityType == "file" || IsFileAppFriendlyName(a.friendlyName)) ? snap.summaryFiles : snap.summaryApps);
+            if (facet.size() < 3) facet.push_back(line);
         }
-        else if (!apps.empty())
-        {
-            auto it = std::max_element(apps.begin(), apps.end(),
-                [](const AppLaunchActivity& a, const AppLaunchActivity& b){
-                    return a.timestampUtc < b.timestampUtc;
-                });
-            auto cls = ClassifyApp(it->exeName, it->exePath);
-            snap.summary.push_back("Launched " + cls.first);
-            snap.confidence = 0.25;
-        }
-        else
+        snap.confidence = ranked.empty() ? 0.0 : (snap.unknownSeconds > 0 ? 0.15 : 0.25);
+        if (ranked.empty())
         {
             snap.summary.push_back("(no recent user activity)");
-            snap.confidence = 0.0;
         }
         return snap;
     }
@@ -2914,7 +3004,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             // Apply the bounded EntityStore boost across the whole rankedFiles
             // bag (real focused-file entries + the file-activity virtuals just
             // added), keyed by resolved document / file path / app.
-            ApplyInferenceBoost(rankedFiles, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
+            ApplyInferenceBoost(rankedFiles, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
             std::sort(rankedFiles.begin(), rankedFiles.end(),
                       [](const AppAgg& a, const AppAgg& b){
                           if (a.weightedFocusSecs != b.weightedFocusSecs)
@@ -2999,7 +3089,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         rankedWeb.reserve(webByTitle.size());
         for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
 
-        ApplyInferenceBoost(rankedWeb, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); });
+        ApplyInferenceBoost(rankedWeb, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
 
         std::sort(rankedWeb.begin(), rankedWeb.end(),
                   [](const AppAgg& a, const AppAgg& b){
@@ -3179,6 +3269,11 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     }
     w.KV("activity_count", (int64_t)s.activityCount)
      .KV("focus_seconds", (int64_t)s.focusSeconds)
+     .KV("foreground_exposure_seconds", (int64_t)s.exposureSeconds)
+     .KV("passive_seconds", (int64_t)s.passiveSeconds)
+     .KV("idle_seconds", (int64_t)s.idleSeconds)
+     .KV("unknown_attention_seconds", (int64_t)s.unknownSeconds)
+     .KV("attention_semantics", "interaction_active_v1")
      .KV("dominant_focus_pct", (int64_t)s.dominantPct)
      .KV("confidence", s.confidence)
      .KV("thread_count", (int64_t)s.threadCount)
@@ -3207,7 +3302,11 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
     {
         w.BeginObject().KV("entity_key", e.entityKey).KV("entity_type", e.entityType).KV("display", e.display)
          .KV("title", e.title).KV("app", e.app).KV("role", e.role).KV("active_secs_in_window", (int64_t)e.activeSecs)
-         .KV("last_active_ts", e.lastActiveTs).KV("score", e.score).KV("thread_id", s.threadId).EndObject();
+         .KV("foreground_exposure_secs", e.exposureSecs).KV("passive_secs", e.passiveSecs)
+         .KV("idle_secs", e.idleSecs).KV("unknown_attention_secs", e.unknownSecs)
+         .KV("observed_action", e.action).KV("resolution", e.resolution)
+         .KV("last_active_ts", e.lastActiveTs).KV("last_observed_ts", e.lastObservedTs)
+         .KV("score", e.score).KV("thread_id", s.threadId).EndObject();
     }
     w.EndArray();
     w.EndObject();
@@ -3327,9 +3426,9 @@ std::string ContextInference::GetRecentContexts(int                count,
             oldestInMemory = it->timestamp;
         }
     }
-    // History persisted by earlier runs (INTEL-6): fill the remainder for the "all" view.
+    // Project the same persisted snapshot for every facet, just as the in-memory path does.
     int persisted = 0;
-    if ((int)rows.size() < count && hist && cat == "all")
+    if ((int)rows.size() < count && hist)
     {
         for (const std::string& j : hist->ContextSnapshotsJson(count, cutoff))
         {
@@ -3337,7 +3436,26 @@ std::string ContextInference::GetRecentContexts(int                count,
             WarpJson::ParseResult pr = WarpJson::Parse(j);
             if (!pr.ok || !pr.value.isObject()) continue;
             if (pr.value.get("timestamp").asInt64(0) >= oldestInMemory) continue;   // already served from memory
-            rows.push_back(j);
+            std::string projected;
+            WarpJson::Writer pw(projected);
+            pw.BeginObject();
+            for (const auto& member : pr.value.members())
+            {
+                if (member.first == "category" || member.first == "summary" || member.first == "summary_embedding") continue;
+                if (cat != "all" && (member.first == "summary_files" || member.first == "summary_websites" || member.first == "summary_apps")) continue;
+                pw.Key(member.first).Value(member.second);
+            }
+            pw.KV("category", cat).Key("summary");
+            const auto& summary = pr.value.get(cat == "all" ? "summary" : "summary_" + cat);
+            if (summary.isArray()) pw.Value(summary); else pw.BeginArray().EndArray();
+            if (includeVector)
+            {
+                pw.Key("summary_embedding");
+                const auto& vector = pr.value.get("summary_embedding");
+                if (vector.isArray()) pw.Value(vector); else pw.BeginArray().EndArray();
+            }
+            pw.EndObject();
+            rows.push_back(std::move(projected));
             ++persisted;
         }
     }
@@ -3369,7 +3487,10 @@ std::string ContextInference::GetCurrentContextJson(bool includeVector)
     if (haveActive)
     {
         w.BeginObject().KV("exe_name", active.exeName).KV("exe_path", active.exePath).KV("window_title", active.windowTitle)
-         .KV("since", active.startedAtUtcSecs).KV("active_secs", (int64_t)active.activeSecsSoFar);
+         .KV("since", active.startedAtUtcSecs).KV("active_secs", (int64_t)active.activeSecsSoFar)
+         .KV("passive_secs", active.passiveSecsSoFar).KV("idle_secs", active.idleSecsSoFar)
+         .KV("unknown_attention_secs", active.unknownSecsSoFar).KV("aumid", active.aumid)
+         .KV("resolution", active.docResolution);
         if (!active.docKey.empty())
             w.KV("entity_key", active.docKey).KV("entity_type", active.docType == "file" ? "file" : "url").KV("display", active.docDisplay);
         w.EndObject();

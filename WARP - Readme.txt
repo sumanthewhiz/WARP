@@ -15,12 +15,27 @@ documents; optionally (off by default) clipboard metadata - which app
 copied what kind of data. It never records file contents, keystrokes,
 screenshots or clipboard content.
 
+PHASE A SIGNAL CORRECTNESS (DEV)
+------------------------------
+  Storage schema 3 separates active, passive, idle and unknown focus time.
+  Zero active time stays zero; overlapping focus/presence is counted once.
+  URL paths and opaque document IDs preserve case. Ambiguous file names
+  do not identify a specific file. Sparse opens/pages/launches remain useful
+  context observations without invented duration or edits.
+  Print jobs require a qualified own-user owner and a local client; missing
+  or bare owner names are omitted rather than attributed by guesswork.
+  Existing data migrates automatically. API clients must honor feed resets
+  and must not lowercase arbitrary web keys. See SCHEMA.md and API.md.
+  Developers can run tests\run_signal_quality.ps1 from a source checkout.
+
 
 PRIVACY
 -------
   * On first start WARP asks for consent. If you decline, it starts
     paused and records nothing until you choose "Resume recording".
-  * Private / InPrivate / Incognito browser windows are never recorded.
+  * Privacy gates suppress Private / InPrivate / Incognito windows.
+    Detection depends on browser/Windows UI indicators; see the runtime
+    coverage limitations in the project's README.
   * Sign-in, password-manager, banking and patient-portal web sites are
     never recorded. Web addresses are stored without query strings,
     fragments or tokens.

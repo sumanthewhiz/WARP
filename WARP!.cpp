@@ -1832,19 +1832,28 @@ namespace
             out.key = StoreUtil::WebEntityKey(page.url, page.docId, page.title);
             out.display = page.url;
             out.type = "url";
+            out.resolution = "browser_window";
             return !out.key.empty();
         }
         std::wstring exeLower = EntityKey::FromUtf8(EntityKey::Key(EntityKey::BaseName(exePath)));
         std::wstring docName = DocResolver::DocNameFromTitle(exeLower, title);
         if (docName.empty()) return false;
         std::wstring path;
-        if (!DocResolver::MatchPath(docName, g_files.RecentPathsForPid(pid, 6 * 3600 * 1000, 16), path) &&
-            !DocResolver::MatchPath(docName, g_files.RecentExplicitOpens(24 * 3600 * 1000, 64), path))
-            return false;
+        bool ambiguous = false;
+        if (!DocResolver::MatchPath(docName, g_files.RecentPathsForPid(pid, 6 * 3600 * 1000, 16), path, &ambiguous))
+        {
+            if (ambiguous) { out.resolution = "ambiguous"; return false; }
+            if (!DocResolver::MatchPath(docName, g_files.RecentExplicitOpens(24 * 3600 * 1000, 64), path, &ambiguous))
+            {
+                if (ambiguous) out.resolution = "ambiguous";
+                return false;
+            }
+        }
         if (Settings::Instance().IsExcludedPath(path)) return false;
         out.key = EntityKey::FileKey(path);
         out.display = path;
         out.type = "file";
+        out.resolution = "filename_candidate";
         return !out.key.empty();
     }
 

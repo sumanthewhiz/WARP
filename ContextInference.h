@@ -108,7 +108,11 @@ struct ContextSnapshot
     // the embedding model is not loaded or the summary is empty.
     std::vector<float> summaryEmbedding;
     int           activityCount  = 0;   // Number of raw signals considered.
-    int           focusSeconds   = 0;   // Total foreground time in the window.
+    int           focusSeconds   = 0;   // Interaction-active foreground time, never an observation proxy.
+    int           exposureSeconds = 0;
+    int           passiveSeconds = 0;
+    int           idleSeconds = 0;
+    int           unknownSeconds = 0;
     double        confidence     = 0.0; // [0,1] -- signal-quality, NOT ML confidence.
     int           dominantPct    = 0;   // % of focus seconds spent in the dominant app.
     std::vector<std::string> signalTypes; // {"app_focus","browsing","app_launch","file"}
@@ -116,7 +120,7 @@ struct ContextSnapshot
     std::string   modelPolish;          // "qwen3-0.6b" or "(not loaded)"
     int           threadCount    = 0;   // Number of distinct semantic clusters.
 
-    // Bounded structured breakdown (top apps by focus seconds, capped at 5).
+    // Bounded app/document observations (active focus first, capped at 5).
     struct AppItem
     {
         std::string app;          // Friendly app name e.g. "Visual Studio".
@@ -139,9 +143,16 @@ struct ContextSnapshot
         std::string display;      // path / URL / app name
         std::string title;        // cleaned title
         std::string app;          // friendly app the entity was used in
-        std::string role;         // focus | reference | communication
+        std::string role;         // focus | reference | communication | observed | passive | attention_unknown
         int         activeSecs   = 0;   // clipped active seconds inside the window
+        int         exposureSecs = 0;
+        int         passiveSecs = 0;
+        int         idleSecs = 0;
+        int         unknownSecs = 0;
+        std::string action;             // foreground | open | modify | create | download | page_observed | launch
+        std::string resolution;
         int64_t     lastActiveTs = 0;
+        int64_t     lastObservedTs = 0;
         double      score        = 0.0; // long-horizon engagement percentile [0,1]
     };
     std::vector<EntityItem> entities;
@@ -246,6 +257,9 @@ public:
     std::vector<float> EmbedText(const std::string& text) { return Embed(text); }
 
 private:
+#ifdef WARP_UNIT_TESTS
+    friend struct ContextInferenceTestAccess;
+#endif
     ActivityStore*     m_store = nullptr;
     FocusTracker*      m_fg = nullptr;
     std::thread        m_thread;
@@ -310,7 +324,7 @@ private:
     // Compose a fresh snapshot covering the last `windowSecs` seconds of
     // activity.  Pass 0 to use the default 15-minute window.  `allowLlm` is false for
     // on-demand windows (the LLM never runs on a client's request path).
-    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true);
+    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true, int64_t asOf = 0);
 
     // Decide whether `snap` is materially different from the last-appended
     // history entry.  Used to keep `GetRecentContexts` from returning rows
