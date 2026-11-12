@@ -623,6 +623,7 @@ public:
     Impl& operator=(const Impl&) = delete;
 
     void  SetCallback(Callback cb);
+    void  SetEpisodeCallback(EpisodeCallback cb);
     void  Start();
     void  Stop();
     void  SetPaused(bool paused);
@@ -630,6 +631,10 @@ public:
     bool  LookupPage(HWND root, PageInfo& out) const;
     bool  IsPrivateWindow(HWND root) const;
     Stats GetStats() const;
+#ifdef WARP_UNIT_TESTS
+    static std::vector<EpisodeRecord> TestPageCheckpoints();
+    static bool TestStaleRequestGuards();
+#endif
 
 private:
     // Foreground-time clock of one window: At(t) = milliseconds the window was foreground (and capture
@@ -638,12 +643,14 @@ private:
     {
         struct Mark { ULONGLONG t; int64_t f; bool running; };
         std::deque<Mark> marks;
+        uint64_t generation = 0;
 
         void Set(bool run, ULONGLONG t)
         {
             if (marks.empty())
             {
                 marks.push_back(Mark{ t, 0, run });
+                ++generation;
                 return;
             }
             if (marks.back().running == run)
@@ -652,6 +659,7 @@ private:
                 t = marks.back().t;
             const int64_t f = At(t);
             marks.push_back(Mark{ t, f, run });
+            ++generation;
             while (marks.size() > kMaxClockMarks)
                 marks.pop_front();
         }
@@ -690,6 +698,11 @@ private:
         std::wstring lastEmitKey;
         FgClock      clock;
         ULONGLONG    lastSeenTick = 0;
+        ULONGLONG    lastUrlCheckTick = 0;
+        std::string  windowInstance, processInstance, pageInstance;
+        int64_t      episodeStartMs = 0, episodeClock = 0;
+        int          episodeRevision = 0;
+        EventContext pageContext;
 
         bool IsPrivate() const { return quickPrivate || uiaPrivate == 1; }
     };
@@ -705,19 +718,23 @@ private:
         std::wstring browser;
         std::wstring rawTitle;
         std::wstring normTitle;
-        int64_t      observedMs = 0;         // Unix ms of the page change (event time)
+        int64_t      observedMs = 0;         // Unix ms of the capture request, not a verified navigation time
         ULONGLONG    observedTick = 0;
         ULONGLONG    firstTick = 0;          // first enqueue of this burst (debounce cap)
         ULONGLONG    dueTick = 0;
         int          failRetries = 0;
         bool         focusRetried = false;
+        std::string  windowInstance;
+        uint64_t     foregroundGeneration = 0;
+        EventContext context;
     };
 
-    enum class Unrecorded { Placeholder, Private, Excluded };
+    enum class Unrecorded { Placeholder, Private, Excluded, Unknown };
 
     struct CmdEntry
     {
         std::wstring exe;
+        std::string processInstance;
         bool         isPrivate = false;
     };
 
@@ -760,10 +777,13 @@ private:
     void CountUia(const AddressBarReader::Result& r);
     bool HasPending(HWND root) const;
     void Requeue(Request req, ULONGLONG delayMs);
-    void ResetQueued(HWND root, const std::wstring& normTitle);
-    void RecordUiaVerdict(HWND root, int verdict, bool incomplete);
-    void MarkUnrecorded(HWND root, Unrecorded why, int64_t observedMs, ULONGLONG observedTick);
+    WindowState* CurrentRequestLocked(const Request& req);
+    void ResetQueued(const Request& req);
+    bool RecordUiaVerdict(const Request& req, int verdict, bool incomplete);
+    void MarkUnrecorded(const Request& req, Unrecorded why, int64_t observedMs, ULONGLONG observedTick);
     void Emit(BrowseEventRecord&& rec);
+    void CheckpointPageLocked(WindowState& ws, int64_t ms, ULONGLONG tick, bool open, const char* reason);
+    void DrainEpisodes();
 
     // ---- shared state (m_mtx) ----
     mutable std::mutex                       m_mtx;
@@ -780,8 +800,11 @@ private:
 
     std::mutex                               m_cbMtx;
     Callback                                 m_callback;
+    EpisodeCallback                          m_episodeCallback;
+    std::vector<EpisodeRecord>                m_episodeQueue;
 
     std::atomic<bool>                        m_running{ false };
+    std::atomic<bool>                        m_workerAlive{ false }, m_uiaReady{ false };
     std::atomic<bool>                        m_paused{ false };
     std::atomic<bool>                        m_cancel{ false };
     std::atomic<bool>                        m_dropPrivate{ true };
@@ -791,6 +814,7 @@ private:
     DWORD                                    m_uiThreadId = 0;
     size_t                                   m_brokerToken = 0;
     HWINEVENTHOOK                            m_nameHook = nullptr;
+    HWINEVENTHOOK                            m_destroyHook = nullptr;
     DWORD                                    m_hookPid = 0;
 };
 
@@ -832,6 +856,12 @@ void WebCapture::Impl::SetCallback(Callback cb)
 {
     std::lock_guard<std::mutex> lk(m_cbMtx);
     m_callback = std::move(cb);
+}
+
+void WebCapture::Impl::SetEpisodeCallback(EpisodeCallback cb)
+{
+    std::lock_guard<std::mutex> lk(m_cbMtx);
+    m_episodeCallback = std::move(cb);
 }
 
 void WebCapture::Impl::Start()
@@ -915,6 +945,12 @@ void WebCapture::Impl::Stop()
     m_cv.notify_all();
     if (m_worker.joinable() && m_worker.get_id() != std::this_thread::get_id())
         m_worker.join();
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (auto& pair : m_windows)
+            CheckpointPageLocked(pair.second, NowUnixMs(), GetTickCount64(), false, "shutdown");
+    }
+    DrainEpisodes();
 
     // Hooks and the message window belong to the UI thread.
     if (GetCurrentThreadId() == m_uiThreadId)
@@ -982,6 +1018,9 @@ void WebCapture::Impl::ApplyPause(bool paused, ULONGLONG tick)
         if (paused == m_pausedLatched)
             return;
         m_pausedLatched = paused;
+        if (paused)
+            for (auto& pair : m_windows)
+                CheckpointPageLocked(pair.second, NowUnixMs(), tick, false, "pause");
         SyncClocksLocked(tick);
         if (paused)
         {
@@ -1082,16 +1121,27 @@ void WebCapture::Impl::BrokerThunk(Impl* self, HWND hwnd, DWORD pid)
 void CALLBACK WebCapture::Impl::NameChangeProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
                                                LONG idChild, DWORD, DWORD)
 {
-    if (event != EVENT_OBJECT_NAMECHANGE || idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
+    if ((event != EVENT_OBJECT_NAMECHANGE && event != EVENT_OBJECT_DESTROY) || idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
         return;
     try
     {
         std::lock_guard<std::recursive_mutex> g(UiMutex());
         for (Impl* p : Live())
         {
-            if (p->m_nameHook == hook)
+            if (p->m_nameHook == hook || p->m_destroyHook == hook)
             {
-                p->OnNameChange(hwnd);
+                if (event==EVENT_OBJECT_DESTROY)
+                {
+                    std::lock_guard<std::mutex> lock(p->m_mtx);
+                    auto window=p->m_windows.find(hwnd);
+                    if (window!=p->m_windows.end())
+                    {
+                        p->CheckpointPageLocked(window->second,NowUnixMs(),GetTickCount64(),false,"window_closed");
+                        p->m_windows.erase(window); p->m_requests.erase(hwnd);
+                        if (p->m_fgRoot==hwnd) p->m_fgRoot=nullptr;
+                    }
+                }
+                else p->OnNameChange(hwnd);
                 break;
             }
         }
@@ -1125,6 +1175,8 @@ void WebCapture::Impl::EnsureHook(DWORD pid)
     // Scoped to the browser process: no global NAMECHANGE firehose (WEB-5).
     m_nameHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, &Impl::NameChangeProc,
                                  pid, 0, WINEVENT_OUTOFCONTEXT);
+    m_destroyHook = SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_DESTROY,nullptr,&Impl::NameChangeProc,
+                                   pid,0,WINEVENT_OUTOFCONTEXT);
     if (m_nameHook)
         m_hookPid = pid;
     else
@@ -1133,6 +1185,7 @@ void WebCapture::Impl::EnsureHook(DWORD pid)
 
 void WebCapture::Impl::RemoveHook()
 {
+    if (m_destroyHook) { UnhookWinEvent(m_destroyHook); m_destroyHook=nullptr; }
     if (m_nameHook)
     {
         UnhookWinEvent(m_nameHook);
@@ -1178,6 +1231,11 @@ void WebCapture::Impl::OnForeground(HWND hwnd, DWORD pid)
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_fgRoot && m_fgRoot != root)
+        {
+            auto old = m_windows.find(m_fgRoot);
+            if (old != m_windows.end()) CheckpointPageLocked(old->second, nowMs, tick, false, "foreground_lost");
+        }
         m_fgRoot = isBrowser ? root : nullptr;
         if (isBrowser)
         {
@@ -1266,8 +1324,9 @@ void WebCapture::Impl::EnqueueCapture(HWND root, const std::wstring& rawTitle, c
         if (it == m_windows.end() || it->second.appExcluded)
             return;
         WindowState& ws = it->second;
-        if (ws.queuedOnce && norm == ws.lastQueuedTitle)
+        if (ws.queuedOnce && norm == ws.lastQueuedTitle && tick - ws.lastUrlCheckTick < 5000)
             return;                                     // same page title (unread counters already stripped)
+        ws.lastUrlCheckTick = tick;
         ws.queuedOnce = true;
         ws.lastQueuedTitle = norm;
 
@@ -1281,6 +1340,9 @@ void WebCapture::Impl::EnqueueCapture(HWND root, const std::wstring& rawTitle, c
         r.normTitle = norm;
         r.observedMs = nowMs;
         r.observedTick = tick;
+        r.context = EventContextUtil::CaptureContext(ws.pid);
+        r.windowInstance = ws.windowInstance;
+        r.foregroundGeneration = ws.clock.generation;
         r.firstTick = tick;
         auto old = m_requests.find(root);
         if (old != m_requests.end() && old->second.kind == Kind::Capture)
@@ -1319,8 +1381,10 @@ WebCapture::Impl::WindowState& WebCapture::Impl::GetOrCreateLocked(HWND root, DW
                                                                    const std::wstring& browser, ULONGLONG tick)
 {
     auto it = m_windows.find(root);
-    if (it != m_windows.end() && it->second.pid != pid)
+    const std::string processInstance = EventContextUtil::ProcessInstanceId(pid);
+    if (it != m_windows.end() && (it->second.pid != pid || it->second.processInstance != processInstance))
     {
+        CheckpointPageLocked(it->second,NowUnixMs(),tick,false,"window_reused");
         m_windows.erase(it);                            // recycled HWND: never inherit another window's verdicts
         it = m_windows.end();
     }
@@ -1337,12 +1401,17 @@ WebCapture::Impl::WindowState& WebCapture::Impl::GetOrCreateLocked(HWND root, DW
                     victim = w;
             }
             if (victim != m_windows.end())
+            {
+                CheckpointPageLocked(victim->second,NowUnixMs(),tick,false,"state_evicted");
                 m_windows.erase(victim);
+            }
         }
         WindowState ws;
         ws.pid = pid;
         ws.exePath = exePath;
         ws.browser = browser;
+        ws.processInstance = processInstance;
+        ws.windowInstance = Evidence::NewId("window");
         it = m_windows.emplace(root, std::move(ws)).first;
     }
     it->second.lastSeenTick = tick;
@@ -1387,10 +1456,11 @@ void WebCapture::Impl::TrimRequestsLocked()
 
 bool WebCapture::Impl::CommandLinePrivate(DWORD pid, const std::wstring& exePath) const
 {
+    const auto instance=EventContextUtil::ProcessInstanceId(pid);
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto it = m_cmdCache.find(pid);
-        if (it != m_cmdCache.end() && it->second.exe == exePath)
+        if (it != m_cmdCache.end() && it->second.exe == exePath && !instance.empty() && it->second.processInstance==instance)
             return it->second.isPrivate;
     }
     const bool isPrivate = WebCapture::CommandLineMarksPrivate(ReadCommandLine(pid));
@@ -1399,6 +1469,7 @@ bool WebCapture::Impl::CommandLinePrivate(DWORD pid, const std::wstring& exePath
         m_cmdCache.clear();
     CmdEntry e;
     e.exe = exePath;
+    e.processInstance = instance;
     e.isPrivate = isPrivate;
     m_cmdCache[pid] = std::move(e);
     return isPrivate;
@@ -1408,6 +1479,7 @@ bool WebCapture::Impl::CommandLinePrivate(DWORD pid, const std::wstring& exePath
 
 void WebCapture::Impl::WorkerMain()
 {
+    m_workerAlive=true;
     try
     {
         struct ComScope
@@ -1425,6 +1497,7 @@ void WebCapture::Impl::WorkerMain()
 
         AddressBarReader reader;                        // destroyed before CoUninitialize
         const bool uiaReady = SUCCEEDED(com.hr) && reader.Init(kUiaTimeoutMs);
+        m_uiaReady=uiaReady;
         if (!uiaReady)
             WARP_LOG_ERROR("web", "UI Automation unavailable (CoInitializeEx hr=0x%08lX): browser windows cannot be "
                                   "verified as non-private, so no browsing is recorded while DropPrivateBrowsing is on",
@@ -1440,6 +1513,8 @@ void WebCapture::Impl::WorkerMain()
     {
         WARP_LOG_ERROR("web", "web capture worker terminated by an unknown exception");
     }
+    m_workerAlive=false;
+    m_uiaReady=false;
 }
 
 void WebCapture::Impl::WorkerLoop(AddressBarReader& reader, bool uiaReady)
@@ -1494,6 +1569,21 @@ void WebCapture::Impl::WorkerLoop(AddressBarReader& reader, bool uiaReady)
                 else
                     ProcessCapture(reader, uiaReady, std::move(req));
             }
+            HWND foreground = nullptr;
+            std::wstring browser;
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                auto it = m_windows.find(m_fgRoot);
+                if (it != m_windows.end())
+                {
+                    foreground = it->first; browser = it->second.browser;
+                    if (it->second.pageOpen && NowUnixMs()-it->second.episodeStartMs >= Evidence::CheckpointSeconds*1000)
+                        CheckpointPageLocked(it->second, NowUnixMs(), now, true, "checkpoint");
+                }
+            }
+            DrainEpisodes();
+            if (foreground && !have)
+                EnqueueCapture(foreground, WindowText(foreground), browser, NowUnixMs(), now);
         }
         catch (const std::exception& e)
         {
@@ -1523,6 +1613,7 @@ void WebCapture::Impl::Sweep(AddressBarReader& reader)
                 continue;
             }
             dead.push_back(it->first);
+            CheckpointPageLocked(it->second, NowUnixMs(), GetTickCount64(), false, "window_closed");
             if (m_fgRoot == it->first)
                 m_fgRoot = nullptr;
             it = m_windows.erase(it);
@@ -1591,7 +1682,7 @@ void WebCapture::Impl::Requeue(Request req, ULONGLONG delayMs)
 {
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_stop || m_pausedLatched || m_requests.count(req.root))
+        if (!CurrentRequestLocked(req) || m_requests.count(req.root))
             return;
         const ULONGLONG now = GetTickCount64();
         req.firstTick = now;
@@ -1604,53 +1695,77 @@ void WebCapture::Impl::Requeue(Request req, ULONGLONG delayMs)
 }
 
 // The request was dropped without a verdict: let the next title event re-queue the same title (WEB-7).
-void WebCapture::Impl::ResetQueued(HWND root, const std::wstring& normTitle)
+WebCapture::Impl::WindowState* WebCapture::Impl::CurrentRequestLocked(const Request& req)
 {
-    std::lock_guard<std::mutex> lk(m_mtx);
-    if (m_requests.count(root))
-        return;
-    auto it = m_windows.find(root);
-    if (it != m_windows.end() && it->second.lastQueuedTitle == normTitle)
-        it->second.queuedOnce = false;
+    auto it = m_windows.find(req.root);
+    if (m_stop || m_pausedLatched || m_fgRoot != req.root || it == m_windows.end())
+        return nullptr;
+    WindowState& ws = it->second;
+    if (ws.pid != req.pid || ws.windowInstance != req.windowInstance ||
+        ws.clock.generation != req.foregroundGeneration || ws.clock.marks.empty() || !ws.clock.marks.back().running)
+        return nullptr;
+    return &ws;
 }
 
-void WebCapture::Impl::RecordUiaVerdict(HWND root, int verdict, bool incomplete)
+void WebCapture::Impl::ResetQueued(const Request& req)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
-    auto it = m_windows.find(root);
-    if (it == m_windows.end())
+    if (m_requests.count(req.root))
         return;
-    WindowState& ws = it->second;
+    WindowState* ws = CurrentRequestLocked(req);
+    if (ws && ws->lastQueuedTitle == req.normTitle)
+        ws->queuedOnce = false;
+}
+
+bool WebCapture::Impl::RecordUiaVerdict(const Request& req, int verdict, bool incomplete)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    WindowState* current = CurrentRequestLocked(req);
+    if (!current)
+        return false;
+    WindowState& ws = *current;
     if (verdict == 1)
         ws.uiaPrivate = 1;                              // sticky: a window never stops being private
     else if (verdict == 0 && ws.uiaPrivate != 1)
         ws.uiaPrivate = 0;
     else if (verdict < 0 && incomplete)
         ++ws.incompleteWalks;
+    return true;
 }
 
 void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, Request req)
 {
     {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!CurrentRequestLocked(req))
+            return;
+    }
+    {
         DWORD pid = 0;
         if (!IsWindow(req.root) || GetWindowThreadProcessId(req.root, &pid) == 0 || pid != req.pid)
         {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_windows.erase(req.root);
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                if (auto* ws = CurrentRequestLocked(req))
+                {
+                    CheckpointPageLocked(*ws, NowUnixMs(), GetTickCount64(), false, "window_closed");
+                    m_windows.erase(req.root);
+                }
+            }
             reader.Forget(req.root);
             return;
         }
     }
     if (IsPausedNow(NowUnixMs()))
     {
-        ResetQueued(req.root, req.normTitle);
+        ResetQueued(req);
         return;
     }
     const WarpSettings settings = Settings::Instance().Get();
     m_dropPrivate.store(settings.dropPrivateBrowsing);
     if (Settings::Instance().IsExcludedApp(req.exePath))
     {
-        MarkUnrecorded(req.root, Unrecorded::Excluded, req.observedMs, req.observedTick);
+        MarkUnrecorded(req, Unrecorded::Excluded, req.observedMs, req.observedTick);
         return;
     }
 
@@ -1658,12 +1773,12 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
     int uiaPrivate = -1, incompleteWalks = 0;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        auto it = m_windows.find(req.root);
-        if (it == m_windows.end())
+        const WindowState* ws = CurrentRequestLocked(req);
+        if (!ws)
             return;
-        quickPrivate = it->second.quickPrivate;
-        uiaPrivate = it->second.uiaPrivate;
-        incompleteWalks = it->second.incompleteWalks;
+        quickPrivate = ws->quickPrivate;
+        uiaPrivate = ws->uiaPrivate;
+        incompleteWalks = ws->incompleteWalks;
     }
     const bool wantUrl = settings.captureWeb;
     bool checkPrivate = !quickPrivate && uiaPrivate < 0;
@@ -1688,13 +1803,18 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
             if (rr.status == AddressBarReader::Status::NoWindow)
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                m_windows.erase(req.root);
+                if (auto* ws = CurrentRequestLocked(req))
+                {
+                    CheckpointPageLocked(*ws, NowUnixMs(), GetTickCount64(), false, "window_closed");
+                    m_windows.erase(req.root);
+                }
                 return;
             }
             if (checkPrivate)
             {
                 const bool incomplete = rr.privateVerdict < 0 && rr.status == AddressBarReader::Status::Ok;
-                RecordUiaVerdict(req.root, rr.privateVerdict, incomplete);
+                if (!RecordUiaVerdict(req, rr.privateVerdict, incomplete))
+                    return;
                 if (rr.privateVerdict >= 0)
                 {
                     uiaPrivate = rr.privateVerdict;
@@ -1726,24 +1846,24 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
     {
         quickPrivate = true;
         std::lock_guard<std::mutex> lk(m_mtx);
-        auto it = m_windows.find(req.root);
-        if (it != m_windows.end())
-            it->second.quickPrivate = true;
+        WindowState* ws = CurrentRequestLocked(req);
+        if (!ws)
+            return;
+        ws->quickPrivate = true;
     }
     const bool isPrivate = quickPrivate || uiaPrivate == 1;
-    // An unverifiable window is treated as private (fail closed), except that after repeated walks that
-    // completed without a timeout but could not cover the whole frame, the frame is accepted as normal.
-    const bool privacyKnown = isPrivate || uiaPrivate == 0 ||
-                              (uiaReady && incompleteWalks >= kMaxIncompleteWalks && rr.status == AddressBarReader::Status::Ok);
+    // Incomplete UIA walks do not establish that a window is normal.
+    const bool privacyKnown = isPrivate || uiaPrivate == 0;
     if (!wantUrl)
         return;
     if (isPrivate && settings.dropPrivateBrowsing)
     {
-        MarkUnrecorded(req.root, Unrecorded::Private, observedMs, observedTick);
+        MarkUnrecorded(req, Unrecorded::Private, observedMs, observedTick);
         return;
     }
     if (!privacyKnown && settings.dropPrivateBrowsing)
     {
+        MarkUnrecorded(req, Unrecorded::Unknown, observedMs, observedTick);
         if (req.failRetries < kMaxFailRetries)
         {
             ++req.failRetries;
@@ -1751,7 +1871,7 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
         }
         else
         {
-            ResetQueued(req.root, req.normTitle);
+            ResetQueued(req);
         }
         return;
     }
@@ -1760,7 +1880,7 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
     const std::wstring display = WebCapture::NormalizeTitle(title, req.browser);
     if (Settings::Instance().IsExcludedTitle(title) || Settings::Instance().IsExcludedTitle(display))
     {
-        MarkUnrecorded(req.root, Unrecorded::Excluded, observedMs, observedTick);
+        MarkUnrecorded(req, Unrecorded::Excluded, observedMs, observedTick);
         return;
     }
 
@@ -1788,7 +1908,7 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
             const UrlCanon::Result cr = UrlCanon::Canonicalize(rr.value, settings.excludedDomains, settings.urlQueryAllowlist);
             if (cr.excluded)
             {
-                MarkUnrecorded(req.root, Unrecorded::Excluded, observedMs, observedTick);
+                MarkUnrecorded(req, Unrecorded::Excluded, observedMs, observedTick);
                 return;
             }
             if (!cr.canonical.empty())
@@ -1803,12 +1923,12 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
     }
     if (WebCapture::IsPlaceholderTitle(display) || IsPlaceholderUrl(url))
     {
-        MarkUnrecorded(req.root, Unrecorded::Placeholder, observedMs, observedTick);
+        MarkUnrecorded(req, Unrecorded::Placeholder, observedMs, observedTick);
         return;
     }
     if (IsPausedNow(NowUnixMs()))
     {
-        ResetQueued(req.root, req.normTitle);
+        ResetQueued(req);
         return;
     }
 
@@ -1816,24 +1936,35 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
     BrowseEventRecord rec;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
-        auto it = m_windows.find(req.root);
-        if (it == m_windows.end())
+        WindowState* current = CurrentRequestLocked(req);
+        if (!current)
             return;
-        WindowState& ws = it->second;
+        WindowState& ws = *current;
+        // A delayed UIA response establishes the page now, not at an earlier title notification.
+        observedMs = (std::max)(NowUnixMs(), ws.episodeStartMs);
+        observedTick = GetTickCount64();
+        const int64_t contextMs = req.context.evidence.observedMs > 0 ? req.context.evidence.observedMs : req.observedMs;
+        const int64_t contextDelay = (std::max)(int64_t(0), observedMs - contextMs);
+        if (req.context.evidence.contextAgeMs >= 0)
+            req.context.evidence.contextAgeMs += contextDelay;
+        if (req.context.msSinceInput != 0xFFFFFFFFu)
+            req.context.msSinceInput = (DWORD)(std::min)(int64_t(0xFFFFFFFFu), req.context.msSinceInput + contextDelay);
+        req.context.evidence.observedMs = observedMs;
         const std::wstring key = WebCapture::TitleDedupKey(display);
         bool samePage = false;
         if (ws.hasEmitted && ws.pageOpen)
         {
             if (!url.empty() && !ws.lastEmitUrl.empty())
-                samePage = url == ws.lastEmitUrl && (!lossy || key == ws.lastEmitKey);
+                samePage = WebCapture::SamePageIdentity(ws.lastEmitUrl, url, ws.lastEmitKey, key, lossy);
             else
-                samePage = key == ws.lastEmitKey;
+                samePage = ws.lastEmitUrl.empty() && url.empty() && key == ws.lastEmitKey;
         }
         ws.hasPage = true;
         if (samePage)
         {
             // Title churn on the same page (counters, timers, typing indicators): refresh, do not emit.
             ws.page.title = display;
+            ws.page.observedMs = NowUnixMs();
             if (ws.page.url.empty() && !url.empty())
             {
                 ws.page.url = url;
@@ -1846,6 +1977,7 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
 
         const int64_t f = ws.clock.At(observedTick);
         const int64_t dwellMs = ws.pageOpen ? f - ws.pageStartF : ws.pendingDwellMs;
+        CheckpointPageLocked(ws, observedMs, observedTick, false, "navigation");
         ws.pendingDwellMs = 0;
         ws.pageOpen = true;
         ws.pageStartF = f;
@@ -1863,6 +1995,14 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
         ws.page.isPrivate = isPrivate;
         ws.page.sinceMs = observedMs;
         ws.page.pid = req.pid;
+        ws.pageInstance = Evidence::NewId("page");
+        ws.episodeRevision = 0; ws.episodeStartMs = observedMs; ws.episodeClock = f;
+        if (ws.windowInstance.empty()) ws.windowInstance = Evidence::NewId("window");
+        ws.processInstance = req.context.evidence.processInstance;
+        ws.page.pageInstance = ws.pageInstance; ws.page.windowInstance = ws.windowInstance;
+        ws.page.processInstance = ws.processInstance; ws.page.privacyKnown = privacyKnown;
+        ws.page.observedMs = NowUnixMs();
+        ws.page.urlStatus = !url.empty() ? "resolved" : (rr.valueHasFocus ? "focused_omnibox" : "unavailable");
 
         rec.eventMs = observedMs;
         rec.browser = req.browser;
@@ -1874,10 +2014,20 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
         rec.dwellSecs = static_cast<int>((std::min)((std::max)(dwellMs, static_cast<int64_t>(0)) / 1000,
                                                     static_cast<int64_t>(INT_MAX)));
         rec.windowId = static_cast<int64_t>(reinterpret_cast<intptr_t>(req.root));
+        rec.ctx = req.context;
+        rec.ctx.evidence.episodeId = ws.pageInstance;
+        rec.ctx.evidence.windowInstance = ws.windowInstance;
+        rec.ctx.evidence.resolution = ws.page.urlStatus;
+        rec.ctx.evidence.timestampKind = "page_observed";
+        rec.ctx.evidence.actorMethod = "foreground_window";
+        rec.ctx.evidence.confirmation = "page_observed";
+        rec.ctx.evidence.sourceQuality = 0.9;
+        rec.ctx.evidence.actorQuality = 0.8;
+        rec.ctx.evidence.identityQuality = url.empty() ? -1 : 0.9;
+        ws.pageContext = rec.ctx;
         ++m_stats.pages;
         m_stats.lastEventMs = observedMs;
     }
-    rec.ctx = EventContextUtil::CaptureContext(req.pid);
     rec.ctx.confidence = EventContextUtil::ScoreEvent(rec.ctx, EventContextUtil::EventKind::Browse,
                                                       EventContextUtil::SourceClass::Uia);
     Emit(std::move(rec));
@@ -1885,15 +2035,17 @@ void WebCapture::Impl::ProcessCapture(AddressBarReader& reader, bool uiaReady, R
 
 // A page that is not recorded (placeholder, private, excluded) closes the dwell of the previous recorded
 // page; the window's PageInfo then carries only the browser and the flags.
-void WebCapture::Impl::MarkUnrecorded(HWND root, Unrecorded why, int64_t observedMs, ULONGLONG observedTick)
+void WebCapture::Impl::MarkUnrecorded(const Request& req, Unrecorded why, int64_t observedMs, ULONGLONG observedTick)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
-    auto it = m_windows.find(root);
-    if (it == m_windows.end())
+    WindowState* current = CurrentRequestLocked(req);
+    if (!current)
         return;
-    WindowState& ws = it->second;
+    WindowState& ws = *current;
+    const bool pageWasOpen = ws.pageOpen;
+    CheckpointPageLocked(ws, observedMs, observedTick, false, why==Unrecorded::Unknown ? "privacy_unknown" : "withheld");
     const int64_t f = ws.clock.At(observedTick);
-    if (ws.pageOpen)
+    if (pageWasOpen)
     {
         ws.pendingDwellMs = (std::max)(f - ws.pageStartF, static_cast<int64_t>(0));
         ws.pageOpen = false;
@@ -1906,6 +2058,9 @@ void WebCapture::Impl::MarkUnrecorded(HWND root, Unrecorded why, int64_t observe
     ws.page.sinceMs = observedMs;
     ws.page.isPrivate = why == Unrecorded::Private || ws.IsPrivate();
     ws.page.excluded = why == Unrecorded::Excluded;
+    ws.page.privacyKnown = why != Unrecorded::Unknown;
+    ws.page.urlStatus = why == Unrecorded::Unknown ? "privacy_unknown" : "withheld";
+    ws.page.observedMs = observedMs;
     if (why == Unrecorded::Private)
         ++m_stats.privateDropped;
     else if (why == Unrecorded::Excluded)
@@ -1919,21 +2074,118 @@ void WebCapture::Impl::Emit(BrowseEventRecord&& rec)
         std::lock_guard<std::mutex> lk(m_cbMtx);
         cb = m_callback;
     }
-    if (!cb)
-        return;
-    try
-    {
-        cb(std::move(rec));
-    }
-    catch (const std::exception& e)
-    {
-        WARP_LOG_ERROR("web", "browse callback failed: %s", e.what());
-    }
-    catch (...)
-    {
-        WARP_LOG_ERROR("web", "browse callback failed: unknown exception");
-    }
+    if (!cb) return;
+    try { cb(std::move(rec)); }
+    catch (const std::exception& e) { WARP_LOG_ERROR("web", "browse callback failed: %s", e.what()); }
+    catch (...) { WARP_LOG_ERROR("web", "browse callback failed: unknown exception"); }
 }
+
+void WebCapture::Impl::CheckpointPageLocked(WindowState& ws, int64_t ms, ULONGLONG tick, bool open, const char* reason)
+    {
+        if (!ws.pageOpen || ws.pageInstance.empty()) return;
+        ms = (std::max)(ms, ws.episodeStartMs);
+        const int64_t foreground = ws.clock.At(tick);
+        EpisodeRecord e;
+        e.id=ws.pageInstance; e.kind="page"; e.revision=++ws.episodeRevision;
+        e.startMs=ws.episodeStartMs; e.endMs=ms; e.open=open; e.boundaryReason=reason;
+        e.entityKey=StoreUtil::WebEntityKey(ws.page.url,ws.page.docId,ws.page.title);
+        e.appKey=StoreUtil::AppEntityKey(ws.exePath,L""); e.display=ws.page.url; e.title=ws.page.title;
+        e.windowInstance=ws.windowInstance; e.processInstance=ws.processInstance; e.resolution=ws.page.urlStatus;
+        e.exposureMs=(std::max)(int64_t(0),(std::min)(ms-e.startMs,foreground-ws.episodeClock));
+        // Foreground exposure is not interaction time. Focus episodes carry the latter.
+        e.unknownMs=e.exposureMs; e.evidence=ws.pageContext.evidence;
+        e.evidence.id=e.id+":"+std::to_string(e.revision);
+        e.evidence.observedMs=NowUnixMs();
+        if (m_episodeQueue.size()<256) m_episodeQueue.push_back(std::move(e));
+        else ++m_stats.queueDropped;
+        ws.episodeStartMs=ms; ws.episodeClock=foreground;
+        if (!open) ws.pageOpen=false;
+    }
+
+    void WebCapture::Impl::DrainEpisodes()
+    {
+        std::vector<EpisodeRecord> episodes;
+        { std::lock_guard<std::mutex> lk(m_mtx); episodes.swap(m_episodeQueue); }
+        EpisodeCallback callback;
+        { std::lock_guard<std::mutex> lk(m_cbMtx); callback=m_episodeCallback; }
+        if (callback) for (auto& e:episodes) callback(std::move(e));
+    }
+
+    bool WebCapture::SamePageIdentity(const std::wstring& oldUrl, const std::wstring& newUrl,
+                                      const std::wstring& oldTitleKey, const std::wstring& newTitleKey, bool lossy)
+    {
+        if (oldUrl.empty()!=newUrl.empty()) return false;
+        return oldUrl==newUrl && ((!lossy && !newUrl.empty()) || oldTitleKey==newTitleKey);
+    }
+
+#ifdef WARP_UNIT_TESTS
+std::vector<EpisodeRecord> WebCapture::Impl::TestPageCheckpoints()
+{
+    Impl capture;
+    WindowState window;
+    window.pageOpen=true; window.pageInstance="fixture:page"; window.windowInstance="fixture:window";
+    window.episodeStartMs=100000; window.episodeClock=0; window.clock.Set(true,100);
+    window.page.url=L"https://example.org/Final"; window.page.title=L"Final"; window.page.urlStatus="resolved";
+    capture.CheckpointPageLocked(window,130000,30100,true,"checkpoint");
+    capture.CheckpointPageLocked(window,140000,40100,false,"window_closed");
+    capture.CheckpointPageLocked(window,150000,50100,false,"shutdown");
+    return std::move(capture.m_episodeQueue);
+}
+
+std::vector<EpisodeRecord> WebCapture::TestPageCheckpoints()
+{
+    return Impl::TestPageCheckpoints();
+}
+
+bool WebCapture::Impl::TestStaleRequestGuards()
+{
+    Impl capture;
+    Request request;
+    request.root = reinterpret_cast<HWND>(uintptr_t(1));
+    request.pid = 42;
+    request.windowInstance = "window:old";
+    request.normTitle = L"same";
+    WindowState& window = capture.m_windows[request.root];
+    window.pid = request.pid;
+    window.windowInstance = request.windowInstance;
+    window.clock.Set(true, 100);
+    request.foregroundGeneration = window.clock.generation;
+    capture.m_fgRoot = request.root;
+    if (!capture.CurrentRequestLocked(request))
+        return false;
+    window.clock.Set(false, 100);
+    window.clock.Set(true, 100);
+    if (capture.CurrentRequestLocked(request))
+        return false; // Leaving and re-entering within one tick must invalidate the old read.
+    request.foregroundGeneration = window.clock.generation;
+    window.windowInstance = "window:new";
+    window.uiaPrivate = 0;
+    window.queuedOnce = true;
+    window.lastQueuedTitle = request.normTitle;
+    AddressBarReader reader;
+    capture.ProcessCapture(reader, false, request);
+    capture.RecordUiaVerdict(request, 1, false);
+    capture.MarkUnrecorded(request, Unrecorded::Private, 100000, 100);
+    capture.ResetQueued(request);
+    capture.Requeue(request, 0);
+    auto replacement = capture.m_windows.find(request.root);
+    if (replacement == capture.m_windows.end() || replacement->second.uiaPrivate != 0 ||
+        !replacement->second.queuedOnce || replacement->second.hasPage || !capture.m_requests.empty())
+        return false;
+    request.windowInstance = "window:new";
+    replacement->second.pageOpen = true;
+    replacement->second.pageInstance = "page:public";
+    replacement->second.episodeStartMs = 100000;
+    capture.MarkUnrecorded(request, Unrecorded::Private, 110000, 10100);
+    return capture.m_windows.at(request.root).pendingDwellMs == 10000 &&
+           !capture.m_windows.at(request.root).pageOpen && capture.m_episodeQueue.size() == 1;
+}
+
+bool WebCapture::TestStaleRequestGuards()
+{
+    return Impl::TestStaleRequestGuards();
+}
+#endif
 
 // ---- queries (any thread) --------------------------------------------------------
 
@@ -1997,7 +2249,10 @@ bool WebCapture::Impl::IsPrivateWindow(HWND root) const
 WebCapture::Stats WebCapture::Impl::GetStats() const
 {
     std::lock_guard<std::mutex> lk(m_mtx);
-    return m_stats;
+    Stats result=m_stats;
+    result.running=m_running.load() && m_workerAlive.load();
+    result.uiaAvailable=m_uiaReady.load();
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2016,6 +2271,11 @@ WebCapture::~WebCapture()
 void WebCapture::SetCallback(Callback cb)
 {
     m_impl->SetCallback(std::move(cb));
+}
+
+void WebCapture::SetEpisodeCallback(EpisodeCallback cb)
+{
+    m_impl->SetEpisodeCallback(std::move(cb));
 }
 
 void WebCapture::Start()

@@ -42,6 +42,7 @@ static const uint32_t EVENT_TYPE_ALL        = 0x0F;
 // ---------------- Read-side rows ----------------
 struct FileActivity
 {
+    ObservationEvidence evidence;
     int64_t      id = 0;
     int64_t      timestampUtc = 0;
     int64_t      eventMs = 0;
@@ -53,10 +54,13 @@ struct FileActivity
     std::string  entityKey;
     double       confidence = 1.0;
     bool         isDir = false;
+    std::wstring originUrl;
 };
 
 struct AppLaunchActivity
 {
+    ObservationEvidence evidence;
+    int64_t eventMs = 0;
     int64_t      id = 0;
     int64_t      timestampUtc = 0;
     std::wstring exeName;
@@ -69,6 +73,8 @@ struct AppLaunchActivity
 
 struct BrowsingActivity
 {
+    ObservationEvidence evidence;
+    int64_t eventMs = 0;
     int64_t      id = 0;
     int64_t      timestampUtc = 0;
     std::wstring browser;
@@ -84,6 +90,8 @@ struct BrowsingActivity
 
 struct AppFocusActivity
 {
+    ObservationEvidence evidence;
+    int64_t startMs = 0, endMs = 0;
     int64_t      id = 0;
     int64_t      timestampUtc = 0;  // legacy: session END (seconds)
     int64_t      startTs = 0;       // session start (seconds)
@@ -143,6 +151,7 @@ struct ProcessExitRecord
 
 struct BrowseEventRecord
 {
+    std::wstring source = L"uia";
     int64_t      eventMs = 0;
     std::wstring browser;
     std::wstring title;
@@ -178,7 +187,7 @@ struct FocusEventRecord
     EventContext ctx;               // captured at session START
 };
 
-struct PresenceRecord { int64_t startMs = 0; int64_t endMs = 0; std::string state; };
+struct PresenceRecord { int64_t startMs = 0; int64_t endMs = 0; std::string state; ObservationEvidence evidence; };
 struct ClipboardRecord { int64_t eventMs = 0; std::wstring ownerExe; std::wstring formats; };
 struct PrintRecord { int64_t eventMs = 0; std::wstring document; std::wstring printer; DWORD pages = 0; };
 
@@ -237,6 +246,23 @@ public:
     bool RecordPresence(PresenceRecord r);
     bool RecordClipboard(ClipboardRecord r);
     bool RecordPrint(PrintRecord r);
+    bool RecordPageEpisode(EpisodeRecord r);
+    bool RecordCoverage(SourceCoverage r);
+
+    struct EvidenceSet
+    {
+        std::vector<FileActivity> files;
+        std::vector<AppLaunchActivity> launches;
+        std::vector<BrowsingActivity> browsing;
+        std::vector<AppFocusActivity> focus;
+        std::vector<EpisodeRecord> episodes;
+        std::vector<SourceCoverage> coverage;
+        int64_t startMs = 0, endMs = 0, asOfMs = 0, watermark = 0, availableStartMs = 0;
+        bool available = false, truncated = false, partial = true, privacyRedacted = false;
+    };
+    EvidenceSet ReadEvidence(int64_t startMs, int64_t endMs, int64_t asOfMs = 0, int limitPerType = 20000);
+    static std::string EvidenceJson(const EvidenceSet& evidence, int limitPerType = 256);
+    std::vector<ArtifactAlias> ResolveFileIdentity(const std::string& key, int64_t atMs, int limit = 100);
 
     using WriteJob = std::function<void(WriterContext&)>;
     bool Enqueue(WriteJob job, bool critical = false);
@@ -262,11 +288,11 @@ public:
     ReadLease AcquireReader(DWORD timeoutMs = 10000);
 
     // limit <= 0 => unlimited (in-process callers); beforeId > 0 => rows with id < beforeId (paging)
-    std::vector<FileActivity>      QueryFiles(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0);
-    std::vector<AppLaunchActivity> QueryLaunches(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0);
-    std::vector<BrowsingActivity>  QueryBrowsing(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0);
+    std::vector<FileActivity>      QueryFiles(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
+    std::vector<AppLaunchActivity> QueryLaunches(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
+    std::vector<BrowsingActivity>  QueryBrowsing(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
     // Focus sessions OVERLAPPING [startUtc, endUtc] (by start/end), newest first.
-    std::vector<AppFocusActivity>  QueryFocus(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0);
+    std::vector<AppFocusActivity>  QueryFocus(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
 
     // Legacy convenience (now = end of window).
     std::vector<FileActivity>      QueryFilesCustomSeconds(int64_t seconds);
@@ -320,6 +346,10 @@ public:
     Stats GetStats() const;
 
 private:
+#ifdef WARP_UNIT_TESTS
+    friend struct EvidenceReadTestAccess;
+    std::function<void()> m_evidenceReadBarrier;
+#endif
     struct Job
     {
         WriteJob fn;
@@ -334,6 +364,13 @@ private:
     bool CheckIntegrityOrQuarantine();
     bool Migrate();
     bool MigrateV3();
+    bool MigrateV4();
+    bool EvidenceExists(WriterContext& w, const ObservationEvidence& e);
+    void PersistEvidence(WriterContext& w, const char* kind, int64_t rowId, int64_t eventMs, const ObservationEvidence& e);
+    void PersistEpisode(WriterContext& w, const EpisodeRecord& r, int64_t rowId = 0);
+    void ResolveArtifact(WriterContext& w, FileEventRecord& r);
+    void PruneEvidence(WriterContext& w);
+    void PurgeEvidence(WriterContext& w, const PurgeSpec& spec);
     bool RekeyWebIdentities();
     void WriterLoop();
     void RunBatch(std::vector<Job>& batch);
@@ -357,8 +394,8 @@ private:
     // again: Office MRU / Recent-items polls, held safe-saves, a focus session or presence interval that was
     // still open. kind 0: time range [fromMs, toMs] (persisted in meta 'purged_ranges'); 1 entity key; 2 web
     // host (and subdomains); 3 path prefix (file key) - scoped floors cover activity up to the purge time and
-    // stay in memory only (their value names what was purged). Writer thread only.
-    struct PurgeFloor { int kind = 0; std::string value; int64_t fromMs = 0; int64_t toMs = 0; };
+    // persist as bounded scope hashes so late replay is also blocked after restart. Writer thread only.
+    struct PurgeFloor { int kind = 0; std::string value; int64_t fromMs = 0; int64_t toMs = 0; bool hashed = false; };
     // A record's identities (empty = not applicable): entity keys, lowercase web host, file keys.
     struct RecordIds { std::string key, key2, host, fileKey, fileKey2; };
     std::vector<PurgeFloor>  m_floors;

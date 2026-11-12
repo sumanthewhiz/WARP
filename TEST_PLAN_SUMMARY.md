@@ -2,9 +2,11 @@
 
 *Case study: **WARP**, an on-device Windows activity-reasoning platform with a deterministic default path, optional local Granite embeddings and an optional Qwen3-0.6B refiner. Live capture variability and model-dependent outputs require more than summary-string assertions.*
 
-**Implemented Phase A entry point:** `.\tests\run_signal_quality.ps1`.
+**Implemented Phase B entry point (including Phase A):** `.\tests\run_signal_quality.ps1`.
 It runs actual native capture-rule/storage/inference replay and reports separate
 identity, time, correlation, grounding, search, cost and privacy/lifecycle metrics.
+Durable-evidence gates cover provenance, coverage, alias/episode lifecycle,
+consistent intervals and a controlled checkpoint-loss fixture.
 The default model-free path is deterministic. Missing live/model/search evidence
 is **not measured**, not a pass. See [the validation contract](tests/SIGNAL_QUALITY.md)
 and [current implementation status](tests/README.md); the broader techniques

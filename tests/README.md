@@ -5,7 +5,7 @@ This directory implements the test plan described in
 [`/TEST_PLAN_SUMMARY.md`](../TEST_PLAN_SUMMARY.md) for the high-level
 framework.
 
-For the implemented Phase A signal-quality contract, run
+For the implemented Phase B signal-quality contract (including Phase A), run
 `.\tests\run_signal_quality.ps1`. It builds the real native composer, runs
 regressions and labeled replay twice, and produces JSON/Markdown scorecards.
 See [SIGNAL_QUALITY.md](SIGNAL_QUALITY.md) for all metric definitions, optional
@@ -77,6 +77,7 @@ python -m pytest -c pytest.ini eval/
 | §4.2.1a Granite cosine | ⏳ TODO | Needs `tests/eval/run_eval.py` that loads the granite ONNX. Deferred to P4 of phased rollout. |
 | §4.1 Eval corpus | ✅ seed (5 scenarios) | `eval/corpus.jsonl` + `eval/test_corpus_integrity.py` validate schema + reference satisfies its own assertions. Expand to 50+ in P5. |
 | Phase A signal quality | Implemented | `fixtures/signal_quality.jsonl`, `WarpTests.Context.cpp`, `eval/signal_quality.py`: actual capture-rule/storage/context replay, time/identity/action/privacy/lifecycle invariants, correlation diagnostics, and optional labeled model/search/cost metrics. This is separate from the older five-row summary corpus. |
+| Phase B durable evidence | Implemented | `WarpTests.Evidence.cpp`: provenance/idempotency, full-width file IDs and alias validity, incremental focus/page slices, restart loss, consistent snapshots, as-of/half-open bounds, coverage, v3 -> v4 migration and deletion. The default scorer requires the new measured contract gates. |
 | §2.1 Capture layer | ✅ partial | Pure capture rules in C++ (`WarpTests.Canon.cpp`: transient/download names, anchored exclusions, rename decisions, title grammars, URL canonicalization and document ids); end-to-end capture against a live headless WARP in CI (`python/test_live_api.py`). ⏳ ETW replay fixtures (`.etl` recorded with WPR) still to be recorded. |
 | §2.3 Storage (ActivityStore / EntityStore / HistoryEngine) | ✅ via `WarpTests.Store.cpp` and `WarpTests.Context.cpp` | Existing lifecycle/concurrency tests plus v1/v2 -> v3 migration, case-collision reconstruction, explicit legacy aliases, interval union, purge/replay and restart. |
 | Consumer API (ApiServer) | ✅ via `WarpTests.Api.cpp` + `python/test_live_api.py` | Structured errors, escaped/Unicode keys, scopes, ranking/search/feed/purge/timeline cursors, long-poll; live: per-session pipe, standard-user (medium IL) client, server PID check. |
@@ -102,6 +103,7 @@ tests/
   WarpTests.h                  # minimal TEST/CHECK/REQUIRE harness + temp dirs
   WarpTests.Main.cpp           # runner (/filter, /timeout watchdog, /list)
   WarpTests.Context.cpp        # actual composer, migrations and source-record replay (ORT linked; models optional)
+  WarpTests.Evidence.cpp       # durable evidence, episodes, aliases, coverage and interval consistency
   WarpTests.Json.cpp           # WarpJson parser / writer
   WarpTests.Canon.cpp          # UrlCanon, EntityKey (+ SQL), DocResolver, FileCapture path rules
   WarpTests.Store.cpp          # ActivityStore + EntityStore + HistoryEngine on a real SQLite file

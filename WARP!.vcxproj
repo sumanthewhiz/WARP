@@ -278,6 +278,7 @@
     <ClInclude Include="EntityKey.h" />
     <ClInclude Include="EntityStore.h" />
     <ClInclude Include="EventContext.h" />
+    <ClInclude Include="Evidence.h" />
     <ClInclude Include="FileCapture.h" />
     <ClInclude Include="FocusTracker.h" />
     <ClInclude Include="ForegroundChangeBroker.h" />
@@ -317,6 +318,7 @@
     <ClCompile Include="EntityKey.cpp" />
     <ClCompile Include="EntityStore.cpp" />
     <ClCompile Include="EventContext.cpp" />
+    <ClCompile Include="Evidence.cpp" />
     <ClCompile Include="FileCapture.cpp" />
     <ClCompile Include="FocusTracker.cpp" />
     <ClCompile Include="ForegroundChangeBroker.cpp" />

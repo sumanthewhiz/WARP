@@ -30,6 +30,9 @@ struct UsnFileEvent
     std::wstring oldPath;           // Renamed only
     int64_t      utcMs = 0;         // journal record time, UTC ms since 1970-01-01
     uint64_t     fileRef = 0;       // NTFS file reference (128-bit ReFS ids folded to 64 bits)
+    uint64_t     fileIdLow = 0, fileIdHigh = 0, journalId = 0;
+    int64_t      usn = 0;
+    uint32_t     reason = 0, sourceInfo = 0;
     std::wstring volume;            // volume GUID path (\\?\Volume{...}\), same as the cursor key
     bool         isDirectory = false;
     bool         backfill = false;  // happened before Start(), replayed from the saved cursor

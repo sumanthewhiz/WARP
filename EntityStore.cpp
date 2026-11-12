@@ -520,6 +520,9 @@ void EntityStore::RenameEntity(WriterContext& w, const std::string& oldKey, cons
 
 void EntityStore::OnFileEvent(WriterContext& w, const FileEventRecord& r)
 {
+    // An untimed recency-list entry is evidence that the file is known, not a
+    // fresh open at the poll time. Keep its raw evidence without engagement credit.
+    if (r.ctx.evidence.timestampKind=="recency_observation") return;
     BeginEvent(w);
     const int64_t ts = r.eventMs / 1000;
     const double conf = Clamp01(r.ctx.confidence);
@@ -648,6 +651,7 @@ void EntityStore::OnLaunchEvent(WriterContext& w, const LaunchEventRecord& r)
 
 void EntityStore::OnBrowseEvent(WriterContext& w, const BrowseEventRecord& r)
 {
+    if (r.ctx.evidence.timestampKind=="recency_observation") return;
     BeginEvent(w);
     if (r.url.empty() && r.docId.empty()) return;   // title-only rows are too ambiguous to be ranked entities
     std::string key = WebEntityKey(r.url, r.docId, r.title);

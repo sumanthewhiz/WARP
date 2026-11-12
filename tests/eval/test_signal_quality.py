@@ -29,7 +29,7 @@ def test_default_corpus_is_frozen_labeled_and_unique():
     assert len(by_id(cases)) == len(cases) >= 20
     for case in cases:
         assert case["split"] == "test" and case["group_id"]
-        ids = {signal["id"] for signal in case["signals"] if signal["type"] not in {"purge", "clear"}}
+        ids = {signal["id"] for signal in case["signals"] if signal["type"] not in {"purge", "clear", "restart"}}
         assert ids == case["expected"]["accepted"].keys()
 
 
@@ -59,6 +59,30 @@ def test_latency_percentiles_and_micro_averaged_ratios():
     assert percentile([10, 20, 30, 40], .95) == pytest.approx(38.5)
     assert aggregate("capture.action_precision", [(1, 1), (0, 9)]) == .1
     assert aggregate("capture.action_precision", []) is None
+
+
+def test_phase_b_requires_measured_contract_and_checkpoint_evidence():
+    case = {"id": "a", "as_of": 1000, "expected": {
+        "provenance": {"f": {"replayed": True, "actor_method": "unknown"}},
+        "evidence": {"partial": True, "episode_count": 1, "coverage_states": ["disabled"]},
+        "max_checkpoint_loss_seconds": 30,
+    }}
+    observation = {"id": "a", "decisions": [{"id": "f", "provenance": {
+        "replayed": True, "actor_method": "unknown"}}],
+        "evidence": {"partial": True, "episodes": [{}], "source_coverage": [{"state": "disabled"}]},
+        "measurements": {"checkpoint_crash_loss_seconds": 12}}
+    result = evaluate([case], [observation], gate_profile="phase-b")
+    assert result["gates"]["evidence.contract_errors"] == "passed"
+    assert result["gates"]["temporal.checkpoint_overrun_seconds"] == "passed"
+    assert result["status"] == "incomplete"  # unrelated mandatory families are still unmeasured
+    observation["decisions"][0]["provenance"]["actor_method"] = "current_foreground"
+    observation["measurements"]["checkpoint_crash_loss_seconds"] = 31
+    result = evaluate([case], [observation], gate_profile="phase-b")
+    assert result["gates"]["evidence.contract_errors"] == "failed"
+    assert result["gates"]["temporal.checkpoint_overrun_seconds"] == "failed"
+    del observation["decisions"][0]["provenance"]
+    with pytest.raises(ValueError, match="persisted provenance"):
+        evaluate([case], [observation], gate_profile="phase-b")
 
 
 def test_window_schema_rejects_fabricated_time_and_wrong_types():

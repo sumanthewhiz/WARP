@@ -93,8 +93,10 @@
     <ClCompile Include="WarpTests.Store.cpp" />
     <ClCompile Include="WarpTests.Api.cpp" />
     <ClCompile Include="WarpTests.Context.cpp" />
+    <ClCompile Include="WarpTests.Evidence.cpp" />
     <!-- product code under test -->
     <ClCompile Include="..\ActivityStore.cpp" />
+    <ClCompile Include="..\AddressBarReader.cpp" />
     <ClCompile Include="..\ApiServer.cpp" />
     <ClCompile Include="..\ContextInference.cpp" />
     <ClCompile Include="..\DesktopInfo.cpp" />
@@ -102,6 +104,7 @@
     <ClCompile Include="..\EntityKey.cpp" />
     <ClCompile Include="..\EntityStore.cpp" />
     <ClCompile Include="..\EventContext.cpp" />
+    <ClCompile Include="..\Evidence.cpp" />
     <ClCompile Include="..\FileCapture.cpp" />
     <ClCompile Include="..\FocusTracker.cpp" />
     <ClCompile Include="..\ForegroundChangeBroker.cpp" />
@@ -117,6 +120,7 @@
     <ClCompile Include="..\SystemProcessClassifier.cpp" />
     <ClCompile Include="..\UrlCanonicalizer.cpp" />
     <ClCompile Include="..\UsnJournalReader.cpp" />
+    <ClCompile Include="..\WebCapture.cpp" />
     <ClCompile Include="..\ZoneIdentifier.cpp" />
     <ClCompile Include="..\sqlite3.c">
       <CompileAs>CompileAsC</CompileAs>

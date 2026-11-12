@@ -19,7 +19,7 @@ Windows 11, and works entirely on the local PC:
    optionally, printed documents and clipboard *metadata*. Every capture source runs
    on its own threads and hands typed records to a single storage writer.
 
-2. **Remembers** it in a versioned SQLite database (schema v3): raw events for
+2. **Remembers** it in a versioned SQLite database (schema v4): raw events for
    30 days by default, a per-entity **engagement model** (decayed short- and
    long-term engagement, daily rollups, tombstones, a global change sequence, an
    FTS5 search index) and a **history layer** (work sessions, work threads,
@@ -46,9 +46,16 @@ case, AUMIDs survive context joins, ambiguous filename matches abstain, sparse
 file/web/app observations keep honest action labels, all persisted facets survive
 restart, and print capture requires a qualified own-user/local-client match.
 See [SCHEMA.md](SCHEMA.md) and the
-[on-demand quality validator](tests/SIGNAL_QUALITY.md). This tranche does not
-replace the model, implement arbitrary historical interval queries, or claim
-end-to-end search gains.
+[on-demand quality validator](tests/SIGNAL_QUALITY.md).
+
+**Phase B on `dev`:** source provenance, full-width file identity and valid-time
+artifact aliases, incremental focus/presence/page checkpoints, durable source
+coverage, and a single canonical evidence selection now feed all context
+projections. `GetContextEvidence` and `GetIntervalContext` support explicit UTC
+`[start,end)` windows and an observation `as_of` cutoff. Historical queries do not
+borrow today's foreground or current task. Missing evidence is reported as
+unknown/partial, not inactivity. Typed task relations, grounded SLM hypotheses
+and measured query-conditioned search gains remain Phase C.
 
 WARP runs fully offline — no cloud calls, no telemetry. `WARP!.exe --install`
 copies it to `%ProgramFiles%\WARP` and registers a per-user logon scheduled task
@@ -97,7 +104,7 @@ the tray icon (status, pause, delete history) or the command line.
 | **Presence** | `PresenceMonitor` classifies the user as *active*, *passive* (no input, but media playing, microphone/camera in use or a full-screen app), *away*, *locked* or *asleep*. Presence never pauses capture: it tags events, closes focus sessions and drives work sessions. |
 | **Print & clipboard (optional)** | `PrintMonitor` admits event 307 only when its qualified owner matches this user's cached token identity and its client matches this PC. Missing/bare/foreign owners or remote clients are rejected. `ClipboardMonitor` remains metadata-only and off by default. |
 | **Confidence model** | Every event carries a `[0, 1]` confidence from `EventContextUtil::ScoreEvent` (source class, foreground match, input recency, attribution, process role, event kind, wake boundary). Noisy processes are scored down instead of silently dropped. |
-| **Single-writer storage** | `ActivityStore`: one writer thread, batched transactions with per-job savepoints, bounded queue (20 000), 3 readers, ordered transactional migrations through schema v3, `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
+| **Single-writer storage** | `ActivityStore`: one writer thread, batched transactions with per-job savepoints, bounded queue (20 000), 3 readers, ordered transactional migrations through schema v4, `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
 | **Engagement ranking** | `EntityStore` keeps decayed short-term (τ = 3 days) and long-term (τ = 30 days) engagement per file, app and URL, computes per-type percentile scores at **read** time and explains them (*"edited today"*, *"42 min active in the last 7 days"*). Renames carry history to the new key; deletes become tombstones after a 15 s safe-save grace. |
 | **History & context** | `HistoryEngine` builds work sessions, persistent work threads (resumable for 14 days), project anchors and co-occurrence edges. `ContextInference` composes the current context every 60 s (configurable; EcoQoS thread, slower on battery, skipped when nothing changed). |
 | **API v2** | Per-session + legacy named pipes with an explicit DACL, caller identification, policy allow-lists and scopes; 8 workers, deadlines, 1 MiB request limit, `api_version` on every response, structured errors. v1 requests keep working. |
@@ -165,7 +172,7 @@ flowchart TB
     end
 
     subgraph Storage ["Storage · single writer thread"]
-        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v3 · activity.db</sub>")]:::storage
+        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v4 · activity.db</sub>")]:::storage
         ES["EntityStore<br/><sub>decayed engagement · change feed · FTS5</sub>"]:::storage
         HE["HistoryEngine<br/><sub>attention union · sessions · thread heuristics</sub>"]:::storage
     end
@@ -592,7 +599,10 @@ and samples the foreground window once per second:
   not recorded. Placeholder pages ("New Tab", "Untitled") are skipped.
 - **Dwell.** Each window keeps a foreground clock (paused time excluded). When a
   new page is recorded, its row's `dwell_secs` is the dwell of the **previous**
-  page in the same window (`window_id`); title churn on the same page is ignored.
+  page in the same window (`window_id`), retained only for compatibility. New
+  `activity_episode` slices close the actual page on navigation/background/close
+  and checkpoint continuing exposure. Bounded URL rechecks detect same-title
+  navigation; page/window/process instances qualify identity.
 - `LookupPage()` and `IsPrivateWindow()` let the focus tracker attach the URL
   entity to focus sessions and redact private windows.
 
@@ -727,7 +737,9 @@ The persistence layer for `%LOCALAPPDATA%\WARP\activity.db` (tables under
   engagement. The v3 transaction then adds attention/resolution columns, durable
   occupancy slices and explicit legacy-key aliases; it rekeys retained web
   evidence without guessing collided identities. Old mixed attention remains
-  qualified as legacy/unknown. See [SCHEMA.md](SCHEMA.md) for precise upgrade
+  qualified as legacy/unknown. The v4 migration adds provenance, episodes,
+  source coverage, artifact aliases and hashed scoped-privacy guards without
+  inventing historical evidence. See [SCHEMA.md](SCHEMA.md) for precise upgrade
   behavior and consumer resync. `PRAGMA quick_check` runs at open; a corrupt or unmigratable file is
   quarantined (`activity.db.corrupt-<time>` / `.migrate-failed-<time>`) and
   recreated, so the agent is never left without a store.
@@ -784,7 +796,8 @@ pre-defined topic buckets.
    or battery saver) `RunOnce()` runs — unless capture is paused, or nothing new
    was committed and the same window is still in front (then it refreshes at most
    every 5 minutes):
-   - Reads the file, app-launch and browsing rows and the focus sessions
+   - Materializes the file, app-launch and browsing rows, page episodes, source
+     coverage and focus sessions in **one SQLite read snapshot**,
      **overlapping** the last **15 minutes** from `ActivityStore`, clipping each
      session's active seconds to the part inside the window (deleted, renamed-away
      and low-confidence file rows are ignored).
@@ -811,9 +824,9 @@ pre-defined topic buckets.
      list (~50 noisy suffixes); and length-caps at 80 characters with a UTF-8
      ellipsis.
    - An unresolved browser window does not borrow another window's page identity
-     or title. Independently captured page observations still feed the web facet.
-   - Without interaction-active focus, admitted opens/modifications/page
-     observations/launches populate combined and facet summaries, `items` and
+     or title. Independently captured pages remain separate evidence.
+   - With or without interaction-active focus, admitted opens/modifications/page
+     observations/launches enter the canonical selection used by combined and facet summaries, `items` and
      `current_entities` with zero measured focus seconds. OPEN says "Opened";
      modification says "Modification observed", not an inferred user edit.
    - **Bounded historical boost.** With the `EntityStore` connected, each item's
@@ -901,7 +914,8 @@ pre-defined topic buckets.
      observation in `HistoryEngine`, which returns the persistent work-thread id.
    - Computes a heuristic **confidence** score:
      `0.5 × min(1, focus_secs / 600) + 0.3 × (dominant_pct / 100) + 0.2 × min(1, signal_types / 3)`,
-     capped at 0.99.
+     capped at 0.99, then attenuated by source/identity rule weights and partial
+     coverage. It is an `uncalibrated_evidence_weight`, not a probability.
 4. Snapshots (`ContextSnapshot`: timestamp, window bounds, `summary` plus
    `summary_files` / `summary_websites` / `summary_apps`, the 384-dim
    `summary_embedding`, activity count, focus seconds, confidence, dominant
@@ -1151,6 +1165,44 @@ erDiagram
         string entity_key "nullable: ambiguous"
         int created_ts
     }
+    observation {
+        string id PK
+        string kind
+        int row_id
+        int received_ms
+        string payload "provenance envelope"
+    }
+    activity_episode {
+        string episode_id PK
+        int revision PK
+        string kind "focus presence page"
+        int start_ms
+        int end_ms
+        int exposure_ms
+        string payload
+    }
+    source_coverage {
+        string source PK
+        string instance PK
+        int start_ms PK
+        int end_ms
+        string state
+        int dropped
+    }
+    artifact_alias {
+        string path_key PK
+        int from_ms PK
+        int to_ms
+        string artifact_id
+        string physical_id
+        string evidence_id
+    }
+    privacy_scope {
+        int kind PK
+        string scope_hash PK
+        int from_ms
+        int to_ms
+    }
 
     inference ||--o{ file_activity : "entity_key"
     inference ||--o{ app_launch_activity : "entity_key"
@@ -1164,9 +1216,12 @@ erDiagram
     work_thread ||--o{ thread_member : "members"
     work_thread ||--o{ thread_span : "time spans"
     work_thread ||--o{ context_snapshot : "thread_id"
+    file_activity ||--o| observation : "typed row provenance"
+    observation ||--o{ artifact_alias : "support"
 ```
 
-The relationships are logical (no SQL foreign keys or triggers): raw rows and the
+The relationships are logical (no SQL foreign keys; schema v4 adds raw-deletion
+triggers for companion evidence cleanup): raw rows and the
 derived tables (`inference`, `entity_day`, `tombstone`, `activity_fts`, the history
 tables) are all written by the single writer thread, the derived state in the same
 transaction as the event or snapshot that caused it.
@@ -1209,6 +1264,11 @@ The four main activity tables (`file_activity`, `app_launch_activity`,
 | `work_session` | work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs`, `accounting_version` |
 | `session_attention` | non-overlapping attention union | `start_ts` (PK), `end_ts`, `active_rate`, `passive_rate` |
 | `entity_alias` | explicit v2-key compatibility | `alias_key`, nullable `entity_key` (null = unresolved/ambiguous), `created_ts` |
+| `observation` | durable source provenance | stable event ID, typed-row reference, event/receipt times, rule-versioned envelope, watermark |
+| `activity_episode` | focus/presence/page checkpoint slices | episode/revision, millisecond bounds, qualified attention/exposure, raw support and provenance |
+| `source_coverage` | capture availability | source/runtime, interval, state/reason and dropped counts; no private content |
+| `artifact_alias` | time-valid file lineage | path, validity interval, logical artifact, full physical ID and supporting observation |
+| `privacy_scope` | durable scoped replay guards | newest 64 distinct scope hashes and their purge-time bounds |
 | `work_thread` | work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid` (BLOB), `change_seq` |
 | `thread_member` | thread members | `thread_id`, `entity_key`, `weight`, `last_ts` |
 | `thread_span` | thread time spans | `thread_id`, `start_ts`, `end_ts`, `active_secs` |
@@ -1426,7 +1486,10 @@ runs WARP unelevated, without kernel (ETW / USN) file and launch capture.
    the granite encoder (and the refiner when `LlmEnabled`) and starts the API.
 6. The UI thread installs the WinEvent hooks, starts `WebCapture`, `FocusTracker`
    and `ContextInference`, and applies the pause state.
-7. Timers: supervisor every 30 s (heartbeats, pause expiry, tray health),
+7. Timers: supervisor every 30 s (heartbeats, presence/coverage checkpoints,
+   pause expiry, tray health); focus and page exposure also checkpoint at a
+   30-second target cadence. Missing checkpoint tails are not extrapolated.
+   Scheduled
    maintenance every 6 h.
 8. On sign-out / shutdown (`WM_ENDSESSION`) or *Exit*, the open focus session is
    flushed and the writer queue drained.
@@ -1635,7 +1698,7 @@ parallel job runs the Python test layers.
 
 ## Testing
 
-Run the Phase A quality gates on demand:
+Run the Phase B quality gates (including all Phase A invariants) on demand:
 
 ```powershell
 .\tests\run_signal_quality.ps1
@@ -1780,6 +1843,9 @@ fields such as `confidence`, `entity_key`, `source`, `start_ts` / `end_ts` /
 | `GetWorkThreads` | Work threads with spans, members and project (default: last 7 days) | activity |
 | `GetRelated` | Entities that co-occur with a key | activity |
 | `GetCurrentContext` | Presence, foreground app and document, latest snapshot and current thread | activity |
+| `GetContextEvidence` | Consistent bounded evidence, provenance, episodes and coverage for `[start,end)` | activity |
+| `GetIntervalContext` | Historical interval composition with explicit `as_of`, without today's state | activity |
+| `ResolveFileIdentity` | Physical/logical file aliases and their validity intervals | activity |
 | `GetRecentContext` / `GetRecentContexts` | Latest / last *N* context snapshots (`category`, `window_seconds`, `include_vector`) | activity |
 | `Purge` | Delete by `start` / `end`, `key` / `entity_key`, `domain` or `path_prefix` | control (WARP only) |
 | `Pause` / `Resume` | Pause for `minutes`, until a time or indefinitely; resume | control (WARP only) |
@@ -1862,7 +1928,8 @@ WARP!\
 |-- Json.h / .cpp                  Strict JSON parser and writer (WarpJson)
 |
 |   Storage, ranking, history, context, API
-|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v3 + migrations, purge, change feed
+|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v4 + migrations, purge, change feed
+|-- Evidence.h / .cpp              Provenance, aliases, episodes, coverage, consistent interval evidence
 |-- Attention.h                   Unknown-safe clipping and interval-union helpers
 |-- SCHEMA.md                     Storage, identity, migration and retention contract
 |-- EntityStore.h / .cpp           Decayed engagement, read-time percentile scores, search, change feed
@@ -1929,11 +1996,9 @@ WARP!\
   with `fetch_models.ps1 -UpdateLock`.
 - **ETW replay fixtures** (recorded `.etl` traces) still need to be recorded;
   capture is covered by rule tests, native synthetic replay and the live CI run.
-- **Phase A is not the complete evidence redesign.** Full physical/logical file
-  identity, coverage/provenance intervals, finer attention/page checkpoints,
-  arbitrary historical reconstruction, typed relations/multiple task hypotheses,
+- **Phase B is not proof of search value.** Typed relations/multiple task hypotheses,
   evidence-based SLM reasoning and query-conditioned search evaluation remain
-  later work. Mixed long intervals use proportional estimates. Snapshot co-use
+  Phase C. Mixed legacy intervals still use proportional estimates. Snapshot co-use
   can connect unrelated tasks; the quality suite reports this rather than
   describing it as solved.
 - **Print metadata can be insufficient.** Qualified own-user identity and a local
@@ -1943,8 +2008,15 @@ WARP!\
   capture falls back to a degraded *unconfirmed* mode at half confidence),
   UI Automation address-bar layouts per browser and version, and private-window
   indicators. Private-window uncertainty can suppress normal pages, and the
-  existing incomplete-UIA-walk fallback still needs real-browser validation;
+  incomplete UIA walks now fail closed and need real-browser coverage validation;
   synthetic privacy-flag fixtures do not establish end-to-end privacy coverage.
+- **Large-history startup and upgrades need further operational work.** Startup
+  still runs a blocking database check and schedules retention on the single
+  writer. Large databases can delay readiness and fill the event queue.
+  The current installer waits only 10 seconds for shutdown before copying;
+  a still-running old process can prevent an upgrade. These are known release
+  blockers, not fixes claimed by Phase B. Do not delete the activity database
+  to work around them.
 - Registry and policy settings are re-read every 30 s: exclusions, pause, retention,
   log level and the file-capture sources apply live; turning app-launch, web or
   focus capture on or off takes effect at the next start of WARP.
@@ -1956,8 +2028,10 @@ WARP!\
   cross the range edges are trimmed, and threads whose label came from the purged
   time get a label built from their remaining items. Co-occurrence weights between
   surviving items are not rewound (an edge last updated inside the range is
-  deleted). Late reports about purged *items* (not time ranges) are refused only
-  until WARP restarts, because the purged names are deliberately not stored.
+  deleted). Schema v4 retains the newest 64 distinct scoped purge guards as
+  hashes, so old reports are also refused after restart without keeping
+  plaintext scope names in that guard table. New activity after the purge time
+  remains eligible; this is a bounded replay guard, not an unlimited denylist.
 - Tombstones keep the deleted item's entity key (path / URL) for 90 days so API
   consumers can delete their copies; *Everything* removes them too.
 - Clipboard and print rows are stored but not yet served by the API.

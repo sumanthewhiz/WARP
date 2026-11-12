@@ -527,6 +527,7 @@ namespace
     const char* const kActivityOps[] = {
         "GetInferenceDeltas", "GetRecentContext", "GetRecentContexts", "TopEntities", "SearchActivity", "GetChanges",
         "QueryTimeline", "GetWorkThreads", "GetRelated", "GetCurrentContext",
+        "GetIntervalContext", "GetContextEvidence", "ResolveFileIdentity",
     };
     const char* const kControlOps[] = { "Purge", "Pause", "Resume" };
 
@@ -690,6 +691,49 @@ std::string ApiServer::Dispatch(const Value& req, const ApiClient& c)
     if (op == "Purge")              return Purge(req);
     if (op == "Pause")              return Pause(req, false);
     if (op == "Resume")             return Pause(req, true);
+    if (op == "ResolveFileIdentity")
+    {
+        if (!req.get("key").isString() || req.get("key").asString().size()>32768)
+            return Error("invalid_request","'key' must be a file path");
+        const auto path=WarpJson::Utf8ToWide(req.get("key").asString());
+        if (!((path.size()>=3 && path[1]==L':' && (path[2]==L'\\' || path[2]==L'/')) ||
+            (path.size()>2 && path[0]==L'\\' && path[1]==L'\\')))
+            return Error("invalid_request","'key' must be an absolute Windows file path");
+        const int64_t at=req.get("at").asInt64(NowUtc());
+        if ((req.has("at") && !req.get("at").isInteger()) || at<=0 || at>NowUtc())
+            return Error("invalid_request","'at' must be a past or current integer UTC Unix second");
+        const auto key=EntityKey::FileKey(WarpJson::Utf8ToWide(req.get("key").asString()));
+        auto aliases=m_deps.store->ResolveFileIdentity(key,at*1000,101);
+        bool more=aliases.size()>100; if (more) aliases.resize(100);
+        std::string out; Writer w(out);
+        w.BeginObject().KV("api_version",kApiVersion).KV("ok",true).KV("key",key).KV("at",at)
+         .KV("found",!aliases.empty()).KV("truncated",more).Key("aliases").BeginArray();
+        for (const auto& a:aliases)
+            w.BeginObject().KV("path_key",a.pathKey).KV("artifact_id",a.artifactId).KV("physical_id",a.physicalId)
+             .KV("valid_from_ms",a.fromMs).KV("valid_to_ms",a.toMs).KV("basis",a.basis).KV("evidence_id",a.evidenceId).EndObject();
+        w.EndArray().EndObject(); return out;
+    }
+    if (op == "GetIntervalContext" || op == "GetContextEvidence")
+    {
+        const int64_t start=req.get("start").asInt64(-1), end=req.get("end").asInt64(-1);
+        const int64_t asOf=req.get("as_of").asInt64(NowUtc());
+        if (!req.get("start").isInteger() || !req.get("end").isInteger() ||
+            (req.has("as_of") && !req.get("as_of").isInteger()) ||
+            start<0 || end<=start || end-start>30LL*86400 || end>asOf || asOf>NowUtc())
+            return Error("invalid_request","Use UTC Unix seconds: 0 <= start < end <= as_of <= now; maximum interval is 30 days.");
+        if (op=="GetIntervalContext")
+        {
+            if (!m_deps.context) return Error("unavailable","context inference is not running");
+            return WithApiVersion(m_deps.context->GetIntervalContext(start,end,asOf,
+                req.get("category").asString("all"),req.get("include_vector").asBool(false)));
+        }
+        const int limit=(int)ClampI(req.get("limit_per_type").asInt64(256),1,2000);
+        auto evidence=m_deps.store->ReadEvidence(start*1000,end*1000,asOf*1000+999,limit);
+        if (!evidence.available) return Error("unavailable","evidence snapshot could not be read");
+        auto json=WarpJson::Parse(ActivityStore::EvidenceJson(evidence,limit));
+        json.value.set("ok",Value::Bool(true));
+        return WithApiVersion(WarpJson::Serialize(json.value));
+    }
     if (op == "GetRecentContext" || op == "GetRecentContexts")
     {
         if (!m_deps.context) return Error("unavailable", "context inference is not running");
@@ -754,7 +798,8 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
         {
             w.BeginObject().KV("id", a.id).KV("timestamp", a.timestampUtc).KV("action", a.action).KV("path", a.path);
             if (!a.oldPath.empty()) w.KV("old_path", a.oldPath);
-            w.KV("source", a.source).KV("confidence", a.confidence).KV("entity_key", a.entityKey).EndObject();
+            w.KV("source", a.source).KV("confidence", a.confidence).KV("entity_key", a.entityKey)
+             .KV("event_ms",a.eventMs).KV("origin_url",a.originUrl).Key("provenance").Raw(Evidence::Json(a.evidence)).EndObject();
         }
         w.EndArray();
         if (trunc) w.KV("next_before_id", rows.back().id);
@@ -772,6 +817,7 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
              .KV("pid", (int64_t)a.pid).KV("confidence", a.confidence);
             if (!a.creatorExe.empty()) w.KV("creator_exe", a.creatorExe);
             if (!a.aumid.empty()) w.KV("aumid", a.aumid);
+            w.KV("event_ms",a.eventMs).Key("provenance").Raw(Evidence::Json(a.evidence));
             w.EndObject();
         }
         w.EndArray();
@@ -789,7 +835,9 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
             w.BeginObject().KV("id", b.id).KV("timestamp", b.timestampUtc).KV("browser", b.browser).KV("title", b.title);
             if (!b.url.empty()) w.KV("url", b.url);
             if (!b.host.empty()) w.KV("host", b.host);
-            w.KV("confidence", b.confidence).KV("entity_key", b.entityKey).EndObject();
+            w.KV("confidence", b.confidence).KV("entity_key", b.entityKey).KV("event_ms",b.eventMs)
+             .KV("previous_page_dwell_secs",b.dwellSecs).KV("window_id",b.windowId)
+             .Key("provenance").Raw(Evidence::Json(b.evidence)).EndObject();
         }
         w.EndArray();
         if (trunc) w.KV("next_before_id", rows.back().id);
@@ -811,7 +859,8 @@ std::string ApiServer::RawEvents(const Value& req, const ApiClient&)
             w.Key("passive_secs"); if (f.passiveSecs < 0) w.Null(); else w.Int(f.passiveSecs);
             w.Key("idle_secs"); if (f.idleSecs < 0) w.Null(); else w.Int(f.idleSecs);
             if (!f.docKey.empty()) w.KV("doc_key", f.docKey).KV("doc_display", f.docDisplay).KV("doc_type", f.docType);
-            w.KV("confidence", f.confidence).EndObject();
+            w.KV("confidence", f.confidence).KV("start_ms",f.startMs).KV("end_ms",f.endMs)
+             .Key("provenance").Raw(Evidence::Json(f.evidence)).EndObject();
         }
         w.EndArray();
         if (trunc) w.KV("next_before_id", rows.back().id);

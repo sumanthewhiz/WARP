@@ -29,9 +29,9 @@ struct ContextInferenceTestAccess
         c.SetHistoryEngine(&history);
         c.SetPresenceProvider([] { return std::string("active"); });
     }
-    static ContextSnapshot Compose(ContextInference& c, int64_t end, int64_t seconds = 1800)
+    static ContextSnapshot Compose(ContextInference& c, int64_t end, int64_t seconds = 1800, int64_t knowledgeMs = 0)
     {
-        return c.ComposeSnapshot(seconds, false, end);
+        return c.ComposeSnapshot(seconds, false, end, knowledgeMs);
     }
     static std::string Json(const ContextSnapshot& s) { return ContextInference::SnapshotToJsonObject(s, "all", false); }
 };
@@ -88,7 +88,8 @@ namespace
     {
         const char* table = type == "file" ? "file_activity" : type == "browse" ? "browsing_activity" :
             type == "launch" ? "app_launch_activity" : type == "focus" ? "app_focus_activity" :
-            type == "presence" ? "presence_interval" : type == "print" ? "print_activity" : nullptr;
+            type == "presence" ? "presence_interval" : type == "print" ? "print_activity" :
+            type == "page" ? "activity_episode" : type == "coverage" ? "source_coverage" : nullptr;
         if (!table) return 0;
         auto reader = store.AcquireReader();
         if (!reader) throw std::runtime_error("cannot read replay counts");
@@ -225,9 +226,64 @@ TEST(Context, UnresolvedBrowserDoesNotBorrowAnotherWindowsPage)
     browse.browser = L"Microsoft Edge";
     REQUIRE(f.store.RecordBrowse(browse));
     const auto s = f.Snapshot();
-    REQUIRE(s.entities.size() == 1);
+    REQUIRE(s.entities.size() == 2);
     CHECK_EQ(s.entities[0].entityKey, EntityKey::AppKey(focus.exePath));
     CHECK(s.entities[0].title.find("Unrelated") == std::string::npos);
+    CHECK_EQ(s.entities[1].entityKey,EntityKey::UrlKey(browse.url));
+    CHECK_EQ(s.entities[1].activeSecs,0);
+    CHECK_EQ(s.entities[1].action,std::string("page_observed"));
+}
+
+TEST(Context, CanonicalEvidenceIncludesObservationsEvenWithActiveFocus)
+{
+    Fixture f;
+    REQUIRE(f.store.RecordFocus(f.Focus(600)));
+    for (const wchar_t* path:{L"C:\\Alpha\\report.pdf",L"C:\\Beta\\report.pdf"})
+    {
+        FileEventRecord file; file.eventMs=(f.now-30)*1000; file.path=path; file.action=L"OPEN"; file.source=L"recent";
+        REQUIRE(f.store.RecordFile(file));
+    }
+    const auto snapshot=f.Snapshot();
+    REQUIRE(snapshot.entities.size()==3);
+    std::set<std::string> keys;
+    for (const auto& e:snapshot.entities)
+    {
+        keys.insert(e.entityKey);
+        CHECK(!e.evidenceRefs.empty());
+        if (e.action=="open") CHECK_EQ(e.activeSecs,0);
+    }
+    CHECK(keys.count("c:\\alpha\\report.pdf")==1);
+    CHECK(keys.count("c:\\beta\\report.pdf")==1);
+    CHECK_EQ(snapshot.focusSeconds,600);
+    CHECK(!snapshot.summaryFiles.empty());
+}
+
+TEST(Context, HistoricalIntervalNeverBorrowsCurrentThreadPresenceOrFutureRows)
+{
+    Fixture f;
+    auto old=f.Focus(600); old.startMs-=86400000; old.endMs-=86400000;
+    old.ctx.evidence.observedMs=old.endMs;
+    old.ctx.evidence.receivedMs=old.endMs+100;
+    REQUIRE(f.store.RecordFocus(old));
+    auto late=old;
+    late.docDisplay=L"C:\\WarpQuality\\Late.pdf"; late.docKey=EntityKey::FileKey(late.docDisplay);
+    late.ctx.evidence.id="late:focus"; late.ctx.evidence.episodeId="late:focus";
+    late.ctx.evidence.receivedMs=(f.now+1)*1000;
+    REQUIRE(f.store.RecordFocus(late));
+    FileEventRecord today; today.eventMs=(f.now-30)*1000; today.path=L"C:\\WarpQuality\\Future.pdf"; today.action=L"OPEN";
+    today.ctx.evidence.observedMs=today.eventMs; today.ctx.evidence.receivedMs=today.eventMs+100;
+    REQUIRE(f.store.RecordFile(today)); f.Flush();
+    const auto json=WarpJson::Parse(f.context.GetIntervalContext(f.now-86400-1800,f.now-86400,f.now));
+    REQUIRE(json.ok);
+    const auto& s=json.value["interval_context"];
+    CHECK_EQ(s["mode"].asString(),std::string("interval"));
+    CHECK_EQ(s["thread_id"].asInt64(),0);
+    CHECK(s["presence"].asString().empty());
+    CHECK_EQ(s["focus_seconds"].asInt64(),600);
+    REQUIRE(s["current_entities"].size()==1);
+    CHECK_EQ(s["current_entities"][0]["entity_key"].asString(),old.docKey);
+    CHECK_EQ(s["current_entities"][0]["score"].asDouble(),0);
+    CHECK_EQ(s["interval_semantics"].asString(),std::string("[start,end)"));
 }
 
 TEST(Context, IdleFocusDoesNotHideExplicitSparseObservations)
@@ -611,6 +667,14 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 throw std::runtime_error("signal offset exceeds replay bounds");
             bool accepted = false, ambiguous = false;
             std::string key, resolved, action = type;
+            ObservationEvidence provenance=Evidence::Parse(WarpJson::Serialize(signal["provenance"]));
+            if (provenance.id.empty()) provenance.id=request["id"].asString()+":"+signal["id"].asString();
+            const int64_t observedOffset=signal["observed_offset"].asInt64(to);
+            const int64_t receivedOffset=signal["received_offset"].asInt64((std::max)(to,observedOffset)+1);
+            if (observedOffset < -2592000 || observedOffset > 2592000 || receivedOffset < -2592000 || receivedOffset > 2592000)
+                throw std::runtime_error("receipt/observation offset exceeds replay bounds");
+            provenance.observedMs=(now+observedOffset)*1000;
+            provenance.receivedMs=(now+receivedOffset)*1000;
             if (type == "focus")
             {
                 if (to < from) throw std::runtime_error("inverted focus interval");
@@ -623,6 +687,7 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 r.docKey = r.docDisplay.empty() ? "" : EntityKey::FileKey(r.docDisplay);
                 r.docType = r.docKey.empty() ? "" : "file";
                 r.docResolution = r.docKey.empty() ? "unresolved" : "filename_candidate";
+                r.ctx.evidence=provenance;
                 if (signal["doc_candidates"].isArray())
                 {
                     std::vector<std::wstring> candidates;
@@ -642,7 +707,9 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 const auto state = signal["state"].asString();
                 if (to < from || (state != "active" && state != "passive" && state != "away" && state != "locked" && state != "asleep"))
                     throw std::runtime_error("invalid presence interval/state");
-                accepted = f.store.RecordPresence({ (now + from) * 1000, (now + to) * 1000, state });
+                PresenceRecord presence{ (now + from) * 1000, (now + to) * 1000, state };
+                presence.evidence=provenance;
+                accepted = f.store.RecordPresence(presence);
             }
             else if (type == "file")
             {
@@ -650,6 +717,8 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 r.eventMs = (now + to) * 1000; r.path = Wide(signal, "path");
                 r.action = Wide(signal, "action"); r.source = Wide(signal, "source");
                 r.ctx.confidence = signal["confidence"].asDouble(1);
+                r.ctx.evidence=provenance;
+                r.oldPath=Wide(signal,"old_path");
                 key = EntityKey::FileKey(r.path);
                 resolved = key;
                 action = EntityKey::Key(r.action);
@@ -662,6 +731,7 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 BrowseEventRecord r;
                 r.eventMs = (now + to) * 1000; r.url = url.canonical; r.docId = url.docId; r.docKind = url.docKind;
                 r.title = Wide(signal, "title"); r.browser = Wide(signal, "browser"); r.host = url.host;
+                r.ctx.evidence=provenance;
                 key = StoreUtil::WebEntityKey(r.url, r.docId, r.title);
                 resolved = key;
                 accepted = !signal["private"].asBool() && !url.excluded && !url.isInternal;
@@ -673,6 +743,7 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 LaunchEventRecord r;
                 r.eventMs = (now + to) * 1000; r.exeName = Wide(signal, "exe_name"); r.exePath = Wide(signal, "exe_path");
                 r.aumid = Wide(signal, "aumid");
+                r.ctx.evidence=provenance;
                 key = StoreUtil::AppEntityKey(r.exePath, r.aumid);
                 resolved = key;
                 accepted = f.store.RecordLaunch(r);
@@ -682,6 +753,31 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
                 accepted = PrintMonitor::IsOwnLocalJob(Wide(signal, "owner"), Wide(signal, "client"),
                     { L"CONTOSO\\Alice", L"alice@contoso.example" }, { L"WORKPC" });
                 if (accepted) accepted = f.store.RecordPrint({ (now + to) * 1000, Wide(signal, "document"), L"Fixture printer", 1 });
+            }
+            else if (type=="page")
+            {
+                EpisodeRecord r; r.id=signal["episode_id"].asString(); r.revision=(int)signal["revision"].asInt64(1);
+                r.windowInstance=signal["window_instance"].asString(); r.startMs=(now+from)*1000; r.endMs=(now+to)*1000;
+                const auto url=UrlCanon::Canonicalize(Wide(signal,"url"));
+                r.display=url.canonical; r.title=Wide(signal,"title"); r.entityKey=StoreUtil::WebEntityKey(url.canonical,url.docId,r.title);
+                r.exposureMs=signal["exposure_ms"].asInt64(r.endMs-r.startMs); r.unknownMs=r.exposureMs;
+                r.resolution="resolved"; r.boundaryReason=signal["reason"].asString("window_closed");
+                r.open=signal["open"].asBool(); r.evidence=provenance;
+                key=resolved=r.entityKey; action="page_observed";
+                accepted=!signal["private"].asBool() && !url.excluded && !url.isInternal && !r.id.empty() && r.endMs>=r.startMs;
+                if (accepted) accepted=f.store.RecordPageEpisode(r);
+            }
+            else if (type=="coverage")
+            {
+                SourceCoverage r; r.source=signal["source"].asString(); r.state=signal["state"].asString();
+                r.reason=signal["reason"].asString(); r.startMs=(now+from)*1000; r.endMs=(now+to)*1000;
+                r.receivedMs=provenance.receivedMs; r.dropped=(uint64_t)signal["dropped"].asInt64();
+                accepted=f.store.RecordCoverage(r);
+            }
+            else if (type=="restart")
+            {
+                f.Flush(); f.store.Close();
+                accepted=f.store.Open(f.dir.File(L"quality.db"));
             }
             else if (type == "purge")
             {
@@ -700,7 +796,7 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
             }
             else throw std::runtime_error("unknown replay signal type");
             f.Flush();
-            if (type != "purge" && type != "clear") accepted = accepted && RawCount(f.store, type) > beforeCount;
+            if (type != "purge" && type != "clear" && type!="restart") accepted = accepted && RawCount(f.store, type) > beforeCount;
             else if (!accepted) throw std::runtime_error("replay control operation failed");
             if (!key.empty()) seenKeys.insert(key);
             auto d = WarpJson::Value::Object();
@@ -711,11 +807,26 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
             d.set("type", WarpJson::Value::String(type));
             d.set("action", WarpJson::Value::String(action));
             d.set("ambiguous", WarpJson::Value::Bool(ambiguous));
+            {
+                auto reader=f.store.AcquireReader(); sqlite3_stmt* st=nullptr;
+                if (reader && sqlite3_prepare_v2(reader.get(),"SELECT payload FROM observation WHERE id=?1",-1,&st,nullptr)==SQLITE_OK)
+                {
+                    sqlite3_bind_text(st,1,provenance.id.c_str(),-1,SQLITE_TRANSIENT);
+                    if (sqlite3_step(st)==SQLITE_ROW)
+                        d.set("provenance",WarpJson::Parse(reinterpret_cast<const char*>(sqlite3_column_text(st,0))).value);
+                    sqlite3_finalize(st);
+                }
+            }
             decisions.push(std::move(d));
         }
         f.Flush();
         const auto begin = std::chrono::steady_clock::now();
-        auto snapshot = f.Snapshot(window);
+        const int64_t knowledgeOffset=request["query_as_of_offset"].asInt64(60);
+        if (knowledgeOffset < -2592000 || knowledgeOffset > 2592000)
+            throw std::runtime_error("knowledge cutoff exceeds replay bounds");
+        const int64_t knowledge=(now+knowledgeOffset)*1000;
+        auto snapshot = ContextInferenceTestAccess::Compose(f.context,now,window,knowledge);
+        const auto evidence=f.store.ReadEvidence((now-window)*1000,now*1000,knowledge);
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
         std::string result;
         SnapshotInput history;
@@ -744,7 +855,19 @@ int RunQualityReplay(const std::wstring& input, const std::wstring& output, cons
         for (const auto& record : f.entities.Lookup(std::vector<std::string>(seenKeys.begin(), seenKeys.end()), now))
             if (!record.entityKey.empty()) w.String(record.entityKey);
         for (const auto& e : snapshot.entities) w.String(e.entityKey);
-        w.EndArray().EndObject().Key("diagnostics").BeginObject().KV("compose_ms", elapsed)
+        w.EndArray().EndObject().Key("evidence").Raw(ActivityStore::EvidenceJson(evidence,256));
+        if (request.has("crash_offset"))
+        {
+            const int64_t crashOffset=request["crash_offset"].asInt64();
+            if (crashOffset < -window || crashOffset > 0) throw std::runtime_error("crash cut point is outside the fixture window");
+            const int64_t crashMs=(now+crashOffset)*1000;
+            const auto atCrash=f.store.ReadEvidence((now-window)*1000,crashMs,crashMs);
+            int64_t last=0;
+            for (const auto& e:atCrash.episodes) if (e.kind=="focus") last=(std::max)(last,e.endMs);
+            w.Key("measurements").BeginObject().KV("checkpoint_crash_loss_seconds",
+                last ? double(crashMs-last)/1000.0 : double(window)).EndObject();
+        }
+        w.Key("diagnostics").BeginObject().KV("compose_ms", elapsed)
          .KV("database_bytes", f.store.GetStats().dbBytes).EndObject().EndObject();
         out << result << '\n';
         if (!out) throw std::runtime_error("could not write replay output");

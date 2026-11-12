@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
+#include <set>
 
 // Default compose cadence (seconds); Settings::ContextCadenceSeconds overrides (15..3600).
 static const DWORD CONTEXT_INTERVAL_MS = 60 * 1000;
@@ -641,6 +642,8 @@ struct AppAgg
     std::string  action;
     std::string  actionLabel;
     std::string  resolution;
+    std::vector<std::string> evidenceRefs, actions;
+    double observationSalience = 0, signalQuality = 1;
     // Effective focus seconds used for ranking, clustering, and
     // per-cluster theme weighting.  Defaults to totalFocusSecs but is
     // boosted by ApplyInferenceBoost() using the EntityStore's
@@ -1024,6 +1027,9 @@ bool ContextInference::Init(const std::wstring& modelsDir)
 
     m_modelReady = true;
     m_modelName  = "granite-embedding-small-english-r2";
+    m_modelRevision = Evidence::FileSha256(modelPath);
+    m_tokenizerRevision = Evidence::FileSha256(graniteDir+L"\\vocab.txt") + ":" +
+        Evidence::FileSha256(graniteDir+L"\\merges.txt") + ":" + Evidence::FileSha256(graniteDir+L"\\special_tokens.txt");
     return true;
 }
 
@@ -1269,7 +1275,7 @@ void ContextInference::RunOnce()
         in.model = snap.model;
         in.persist = append;
         in.generation = histGeneration;
-        if (append) in.json = SnapshotToJsonObject(snap, "all", false);
+        if (append) in.json = SnapshotToJsonObject(snap, "all", true);
         if (m_epoch.load() != epoch) return;          // cleared while embedding: never persist pre-clear activity
         snap.threadId = hist->RecordSnapshot(in);
     }
@@ -1336,7 +1342,7 @@ static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
                                 std::function<std::string(const AppAgg&)> keyOf, int64_t asOf)
 {
     for (auto& a : bag)
-        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs);
+        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * a.signalQuality + a.observationSalience;
     if (!es || bag.empty()) return;
 
     std::vector<std::string> keys;
@@ -1357,7 +1363,7 @@ static void ApplyInferenceBoost(std::vector<AppAgg>&                 bag,
     {
         if (!scores[i].found) continue;
         AppAgg& a = bag[keyToIdx[i]];
-        a.weightedFocusSecs = static_cast<double>(a.totalFocusSecs) * (1.0 + 0.5 * scores[i].score);
+        a.weightedFocusSecs *= (1.0 + 0.5 * scores[i].score);
     }
 }
 
@@ -1603,7 +1609,7 @@ static std::vector<std::string> ComposeRichListing(
     return { "User is " + std::string(verb) + " " + body + appClause };
 }
 
-ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm, int64_t asOf)
+ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm, int64_t asOf, int64_t knowledgeAsOfMs, bool historical)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
 
@@ -1612,9 +1618,11 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     snap.windowEndTs   = snap.timestamp;
     snap.windowStartTs = snap.timestamp - windowSecs;
     snap.windowSeconds = windowSecs;
+    snap.generatedAt = StoreUtil::NowUtc();
+    snap.historical = historical;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        if (m_presence) snap.presence = m_presence();
+        if (m_presence && !historical) snap.presence = m_presence();
     }
 
     // ---- Gather raw signals (bounded reads, INTEL-7) ----------------
@@ -1622,10 +1630,29 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // scaling its active (non-idle) seconds to the in-window part (INTEL-3). A 3-hour session
     // that ended 14 minutes ago therefore contributes 60 s to a 15-minute window, not 10,800 s.
     const int kMaxRows = 20000;
-    auto focus  = m_store->QueryFocus(snap.windowStartTs, snap.windowEndTs, kMaxRows);
-    auto browse = m_store->QueryBrowsing(snap.windowStartTs, snap.windowEndTs, kMaxRows);
-    auto apps   = m_store->QueryLaunches(snap.windowStartTs, snap.windowEndTs, kMaxRows);
-    auto files  = m_store->QueryFiles(snap.windowStartTs, snap.windowEndTs, kMaxRows);
+    auto evidence = m_store->ReadEvidence(snap.windowStartTs*1000, snap.windowEndTs*1000, knowledgeAsOfMs, kMaxRows);
+    snap.inputWatermark = evidence.watermark; snap.asOfMs = evidence.asOfMs;
+    snap.availableStartMs = evidence.availableStartMs; snap.partial = evidence.partial;
+    snap.truncated = evidence.truncated;
+    snap.evidenceJson = ActivityStore::EvidenceJson(evidence, 0);
+    snap.modelRevision = m_modelRevision; snap.tokenizerRevision = m_tokenizerRevision;
+    auto& focus = evidence.focus;
+    auto& browse = evidence.browsing;
+    auto& apps = evidence.launches;
+    auto& files = evidence.files;
+    // A final/open page need not have another navigation row in this interval.
+    // Its checkpoint is evidence of exposure, not invented interaction-active time.
+    std::set<std::string> observedPages;
+    for (const auto& b : browse) observedPages.insert(b.evidence.episodeId);
+    for (const auto& episode : evidence.episodes)
+    {
+        if (episode.kind != "page" || episode.exposureMs <= 0 || !observedPages.insert(episode.id).second) continue;
+        BrowsingActivity b;
+        b.id = -1; b.eventMs = episode.endMs; b.timestampUtc = episode.endMs/1000;
+        b.url = episode.display; b.title = episode.title; b.entityKey = episode.entityKey;
+        b.evidence = episode.evidence; b.browser = L"Browser";
+        browse.push_back(std::move(b));
+    }
     for (auto& f : focus)
     {
         int64_t s = (std::max)(f.startTs, snap.windowStartTs);
@@ -1658,7 +1685,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // ---- Live-session overlay (critical for accuracy) -------------
     // FocusTracker only emits a row when a session ends.  Ask it for the session in
     // progress (with its resolved document) and add the in-window part as a virtual row.
-    if (m_fg)
+    if (m_fg && !historical)
     {
         FocusTracker::ActiveSession active;
         if (m_fg->GetCurrentSession(active))
@@ -1688,7 +1715,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
                 virt.docKey       = active.docKey;
                 virt.docDisplay   = active.docDisplay;
                 virt.docType      = active.docType;
+                virt.evidence.episodeId = active.episodeId;
+                virt.confidence = active.confidence;
                 focus.push_back(virt);
+                snap.liveOverlay = true;
                 if (std::find(snap.signalTypes.begin(), snap.signalTypes.end(), "app_focus") == snap.signalTypes.end())
                 {
                     snap.signalTypes.push_back("app_focus");
@@ -1737,6 +1767,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         agg.attention.push_back({ f.startTs, f.endTs, (std::max)(0, f.activeSecs) / wall,
                                                      (std::max)(0, f.passiveSecs) / wall });
         agg.idleSecs += (std::max)(0, f.idleSecs);
+        const double identityQuality = !f.docKey.empty() && f.evidence.identityQuality>=0 ? f.evidence.identityQuality : 1.0;
+        agg.signalQuality = (std::min)(agg.signalQuality, (std::max)(0.0, f.confidence*identityQuality));
+        if (agg.evidenceRefs.size()<32) agg.evidenceRefs.push_back(f.id<0 ? "live_focus:"+f.evidence.episodeId : "focus:"+std::to_string(f.id));
+        if (agg.actions.empty()) agg.actions.push_back("foreground");
         if (f.timestampUtc > agg.lastSeenTs)
         {
             agg.lastSeenTs = f.timestampUtc;
@@ -1782,26 +1816,37 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
 
     // Sparse windows still have observations, but they have no measured focus seconds.
     // Use typed actions rather than inventing duration or turning an OPEN into an edit.
-    if (totalFocusSecs == 0)
     {
         auto add = [&](AppAgg a) {
             const std::string key = EntityKeyOfAgg(a);
             if (!key.empty()) for (auto& existing : byExe)
             {
                 if (EntityKeyOfAgg(existing.second) != key) continue;
+                auto& current = existing.second;
+                current.observationSalience = (std::max)(current.observationSalience,a.observationSalience);
+                for (const auto& ref:a.evidenceRefs) if (current.evidenceRefs.size()<32) current.evidenceRefs.push_back(ref);
+                if (std::find(current.actions.begin(),current.actions.end(),a.action)==current.actions.end()) current.actions.push_back(a.action);
                 if (a.lastSeenTs >= existing.second.lastSeenTs)
                 {
-                    if (existing.second.exposureSecs == 0) existing.second = std::move(a);
+                    if (existing.second.exposureSecs == 0)
+                    {
+                        a.evidenceRefs = std::move(current.evidenceRefs); a.actions = std::move(current.actions);
+                        existing.second = std::move(a);
+                    }
                     else
                     {
-                        existing.second.action = a.action;
-                        existing.second.actionLabel = a.actionLabel;
+                        if (existing.second.totalFocusSecs == 0)
+                        {
+                            existing.second.action = a.action;
+                            existing.second.actionLabel = a.actionLabel;
+                        }
                         existing.second.lastSeenTs = a.lastSeenTs;
                     }
                 }
                 return;
             }
             const std::string grouping = key.empty() ? a.action + "|" + a.rawTitle : key;
+            a.actions.push_back(a.action);
             auto it = byExe.find(grouping);
             if (it == byExe.end() || a.lastSeenTs > it->second.lastSeenTs) byExe[grouping] = std::move(a);
         };
@@ -1818,7 +1863,12 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             a.actionLabel = f.action == L"OPEN" ? "Opened" :
                 f.action == L"DOWNLOAD" ? "Download observed" :
                 f.action == L"CREATE" ? "Creation observed" : "Modification observed";
+            if (f.evidence.timestampKind=="recency_observation")
+            { a.action="recency_observed"; a.actionLabel="Recent item observed"; }
             a.resolution = "observed_path";
+            a.observationSalience = f.confidence * (f.action==L"OPEN" || f.action==L"DOWNLOAD" ? 1.0 : 0.4);
+            if (f.evidence.timestampKind=="recency_observation") a.observationSalience=f.confidence*0.1;
+            a.evidenceRefs.push_back("file:"+std::to_string(f.id));
             add(std::move(a));
         }
         for (const auto& b : browse)
@@ -1832,9 +1882,11 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             a.friendlyName = WideToUtf8(b.browser);
             a.isBrowser = true;
             a.lastSeenTs = b.timestampUtc;
-            a.action = "page_observed";
-            a.actionLabel = "Page observed";
+            a.action = b.evidence.resolution=="cloud_mru" ? "recency_observed" : "page_observed";
+            a.actionLabel = b.evidence.resolution=="cloud_mru" ? "Cloud document observed" : "Page observed";
             a.resolution = a.entityKey.empty() ? "unresolved" : "browser_window";
+            a.observationSalience = b.confidence*0.8;
+            a.evidenceRefs.push_back(b.id<0 ? "page:"+b.evidence.episodeId : "browse:"+std::to_string(b.id));
             add(std::move(a));
         }
         for (const auto& app : apps)
@@ -1852,6 +1904,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             a.action = "launch";
             a.actionLabel = "Launch observed";
             a.resolution = "process";
+            a.observationSalience = app.confidence*0.5;
+            a.evidenceRefs.push_back("launch:"+std::to_string(app.id));
             add(std::move(a));
         }
     }
@@ -1860,13 +1914,23 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     std::vector<AppAgg> ranked;
     ranked.reserve(byExe.size());
     for (auto& kv : byExe) ranked.push_back(std::move(kv.second));
+    std::unordered_map<std::string,int> titleCounts;
+    for (const auto& a:ranked) if (a.entityType=="file") ++titleCounts[AsciiLower(a.bestTitle)];
+    for (auto& a:ranked)
+    {
+        if (a.entityType!="file" || titleCounts[AsciiLower(a.bestTitle)]<2) continue;
+        const auto path=a.filePath.empty() ? a.entityDisplay : a.filePath;
+        const auto slash=path.find_last_of(L"\\/");
+        const auto parent=slash==std::wstring::npos ? L"" : EntityKey::BaseName(path.substr(0,slash));
+        if (!parent.empty()) a.bestTitle+=" ("+WideToUtf8(parent)+")";
+    }
 
     // Bounded historical tie-breaker (INTEL-4), keyed by the resolved entity when known.
     EntityStore* entities = nullptr;
     LlmSummarizer* llm = nullptr;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        entities = m_entities;
+        entities = historical ? nullptr : m_entities;
         llm = m_llm;
     }
     ApplyInferenceBoost(ranked, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
@@ -2717,6 +2781,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
                               ? clusterOf[i] + 1
                               : 0;
         it.entityKey    = EntityKeyOfAgg(ranked[i]);
+        it.action = ranked[i].action.empty() ? "foreground" : ranked[i].action;
+        it.evidenceRefs = ranked[i].evidenceRefs;
         snap.items.push_back(std::move(it));
     }
 
@@ -2749,6 +2815,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             if (a.totalFocusSecs == 0)
                 e.role = a.unknownSecs > 0 ? "attention_unknown" : (a.passiveSecs > 0 ? "passive" : "observed");
             e.lastObservedTs = a.lastSeenTs;
+            e.evidenceRefs = a.evidenceRefs;
+            e.actions = a.actions;
             e.lastActiveTs = a.totalFocusSecs > 0 ? a.lastSeenTs : 0;
             keys.push_back(e.entityKey);
             snap.entities.push_back(std::move(e));
@@ -2775,7 +2843,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         snap.confidence = ranked.empty() ? 0.0 : (snap.unknownSeconds > 0 ? 0.15 : 0.25);
         if (ranked.empty())
         {
-            snap.summary.push_back("(no recent user activity)");
+            snap.summary.push_back(snap.partial ? "(no captured evidence; coverage is partial or unknown)" : "(no captured activity in this interval)");
         }
         return snap;
     }
@@ -2785,7 +2853,20 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // LLM topic hint (`themeAll`); the user-facing summary is the
     // richer, more grounded listing produced by ComposeRichListing.
     std::vector<std::string> themeAll = allBuild.lines;
-    snap.summary = ComposeRichListing(ranked, "all", themeAll);
+    auto canonicalListing = [&](const std::vector<AppAgg>& bag, const char* category) {
+        std::vector<AppAgg> engaged;
+        for (const auto& a:bag) if (a.totalFocusSecs>0) engaged.push_back(a);
+        auto lines = ComposeRichListing(engaged, category, std::vector<std::string>{});
+        if (lines.size()>2) lines.resize(2);
+        for (const auto& a:bag)
+        {
+            if (a.totalFocusSecs>0 || lines.size()>=3) continue;
+            lines.push_back((a.actionLabel.empty() ? "Foreground observed" : a.actionLabel) +
+                " \"" + (a.bestTitle.empty() ? a.friendlyName : a.bestTitle) + "\"");
+        }
+        return lines;
+    };
+    snap.summary = canonicalListing(ranked, "all");
 
     // -----------------------------------------------------------------
     // Per-category summaries.  Each is an *independent* projection of
@@ -2812,6 +2893,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // ranked; an app that is in one is never in another.
     // -----------------------------------------------------------------
     auto isFileApp = [](const AppAgg& a) -> bool {
+        if (a.entityType=="file") return true;
+        if (a.entityType=="app" || a.entityType=="url") return false;
         if (a.isBrowser) return false;
         if (IsAppOnlyFriendlyName(a.friendlyName)) return false;
         if (IsFileAppFriendlyName(a.friendlyName)) return true;
@@ -2831,283 +2914,14 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         else              rankedApps.push_back(a);
     }
 
-    // Augment Files with recently-touched file basenames captured by
-    // FileCapture.  Two design constraints:
-    //
-    //   (a) Strict allowlist of user-content extensions only.  The
-    //       previous "deny .dll/.log/.tmp/.bak" was too loose -- it
-    //       let through Outlook .ost/.nst/.pst mail stores, sticky
-    //       notes .sqlite, .config / .xml / .json app data, .lnk
-    //       shortcuts, etc.  Whose basenames frequently include
-    //       directory or user-identity tokens (the user's email
-    //       address, their AppData path components, etc.) that then
-    //       polluted the Files theme.
-    //
-    //   (b) Skip augmentation entirely when a real file app is
-    //       actively in focus.  When the user is sitting in Excel
-    //       editing a spreadsheet, the file-activity pool is irrelevant
-    //       background noise -- typing in Excel generates dozens of
-    //       writes to OneDrive caches, Office auto-recover files,
-    //       and similar transient artefacts that we *cannot* fully
-    //       filter at the capture layer because some of those
-    //       artefacts are real user content (e.g. Outlook .ost).
-    //       Bypassing the augmentation when there's an obvious
-    //       focused-file signal preserves correctness for the
-    //       common case without losing the "briefly-touched file"
-    //       capability for the dormant-app case.
-    {
-        // (b): refined "skip augmentation" gate.  The old gate skipped
-        // augmentation whenever any real file app had >= 30 s of focus.
-        // That backfired when Word/Excel/PowerPoint had a generic
-        // title like "Word" (no document name visible in the title
-        // bar -- happens with certain Office 365 modes), because the
-        // focused app's title yielded ZERO content tokens AND the
-        // augmentation that would have surfaced the actual filename
-        // was suppressed.
-        //
-        // Refined gate: only skip augmentation when the focused file
-        // apps already provide a usable signal -- defined as at least
-        // one extractable content token across their titles.  When
-        // they don't (titles like "Word", "Excel", "PowerPoint"
-        // alone), let augmentation through so the actual filename
-        // from FileCapture surfaces in the summary.
-        bool haveFocusedFileApp        = false;
-        bool focusedAppHasUsefulTitle  = false;
-        for (const auto& a : rankedFiles)
-        {
-            if (a.totalFocusSecs < 30) continue;
-            haveFocusedFileApp = true;
-            auto toks = ExtractContentTokens(a.bestTitle);
-            if (!toks.empty()) { focusedAppHasUsefulTitle = true; break; }
-        }
-        bool skipAugmentation = haveFocusedFileApp && focusedAppHasUsefulTitle;
-
-        if (!skipAugmentation)
-        {
-            // (a): user-content extension allowlist.  Mirrors the
-            // extension set in TitleLooksLikeFileActivity above (the
-            // two should stay in sync).  An empty/missing extension
-            // is rejected -- "anonymous" basenames are almost never
-            // user content.
-            static const std::unordered_set<std::string> kUserContentExt = {
-                "doc","docx","rtf","odt",
-                "xls","xlsx","csv","tsv","ods",
-                "ppt","pptx","odp",
-                "pdf","epub","mobi",
-                "txt","md","rst","tex","one",
-                "jpg","jpeg","png","gif","bmp","tif","tiff",
-                "webp","heic","heif","raw","dng","cr2","nef",
-                "psd","ai","eps","svg","ico",
-                "mp3","wav","flac","m4a","aac",
-                "mp4","mkv","mov","avi","webm",
-                "c","cpp","cc","cxx","h","hpp","hh","hxx",
-                "cs","java","kt","scala","groovy",
-                "py","rb","pl","php","js","mjs","cjs","jsx","ts","tsx",
-                "go","rs","swift","m","mm","dart",
-                "sh","bash","zsh","fish","ps1","psm1","psd1",
-                "html","htm","css","scss","sass","less",
-                "xml","json","yaml","yml","toml","ini","cfg","conf",
-                "sql","graphql","vue","svelte",
-                "r","jl","lua","ex","exs","erl","hs","clj",
-                "zip","rar","7z","tar","gz","tgz"
-            };
-
-            auto extensionOf = [](const std::string& name) -> std::string {
-                size_t dot = name.find_last_of('.');
-                if (dot == std::string::npos || dot + 1 >= name.size())
-                    return std::string();
-                std::string ext = name.substr(dot + 1);
-                // Lowercase ASCII.
-                for (char& c : ext)
-                    if (c >= 'A' && c <= 'Z') c = char(c + 32);
-                return ext;
-            };
-
-            std::unordered_set<std::string> seenLowered;
-            for (const auto& a : rankedFiles)
-                seenLowered.insert(AsciiLower(a.bestTitle));
-
-            // Track each unique basename + its full path so the
-            // EntityStore boost can look up the per-file record
-            // (which is keyed by the full lowercased path).  Pick the
-            // most-recently-seen full path when several map to the
-            // same basename.
-            struct FileVirt {
-                std::string  base;
-                std::wstring fullPath;
-                int64_t      ts;
-                int          hits;
-            };
-            std::unordered_map<std::string, FileVirt> byBase;
-            for (const auto& f : files)
-            {
-                std::string p = WideToUtf8(f.path);
-                if (p.empty()) continue;
-                size_t slash = p.find_last_of("/\\");
-                std::string base = (slash != std::string::npos)
-                                       ? p.substr(slash + 1) : p;
-                if (base.empty()) continue;
-                std::string baseLower = AsciiLower(base);
-
-                // Strip the Excel/Word lockfile prefix "~$" so we don't
-                // treat `~$report.xlsx` as a different file from
-                // `report.xlsx`; the user opened the file, not the
-                // lock.  Also strips a leading "~" which is the Office
-                // auto-recover prefix.
-                std::string keyBase = baseLower;
-                while (!keyBase.empty() && (keyBase[0] == '~' || keyBase[0] == '$'))
-                    keyBase.erase(0, 1);
-
-                std::string ext = extensionOf(keyBase);
-                if (ext.empty() || kUserContentExt.count(ext) == 0)
-                    continue;
-
-                if (seenLowered.count(keyBase)) continue;
-
-                auto it = byBase.find(keyBase);
-                if (it == byBase.end())
-                    byBase[keyBase] = { base, f.path, f.timestampUtc, 1 };
-                else
-                {
-                    it->second.hits += 1;
-                    if (f.timestampUtc > it->second.ts)
-                    {
-                        it->second.ts       = f.timestampUtc;
-                        it->second.fullPath = f.path;
-                    }
-                }
-            }
-            std::vector<FileVirt> fv;
-            fv.reserve(byBase.size());
-            for (auto& kv : byBase) fv.push_back(std::move(kv.second));
-            std::sort(fv.begin(), fv.end(),
-                      [](const FileVirt& a, const FileVirt& b){ return a.ts > b.ts; });
-            if (fv.size() > 6) fv.resize(6);
-            for (auto& v : fv)
-            {
-                AppAgg agg{};
-                agg.friendlyName    = "File";
-                agg.verb            = "Editing";
-                agg.bestTitle       = v.base;
-                agg.rawTitle        = v.base;
-                agg.filePath        = v.fullPath;   // for EntityStore lookup
-                // Cap synthetic focus at 15 s per virt regardless of
-                // file-activity hit volume.  Real foreground sessions
-                // (typically 30 s -- many minutes) thus dominate the
-                // theme even when several virts are present.
-                int synth = (std::min)(15, (std::max)(3, v.hits * 3));
-                agg.totalFocusSecs  = synth;
-                agg.lastSeenTs      = v.ts;
-                agg.isBrowser       = false;
-                rankedFiles.push_back(std::move(agg));
-            }
-            // Apply the bounded EntityStore boost across the whole rankedFiles
-            // bag (real focused-file entries + the file-activity virtuals just
-            // added), keyed by resolved document / file path / app.
-            ApplyInferenceBoost(rankedFiles, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
-            std::sort(rankedFiles.begin(), rankedFiles.end(),
-                      [](const AppAgg& a, const AppAgg& b){
-                          if (a.weightedFocusSecs != b.weightedFocusSecs)
-                              return a.weightedFocusSecs > b.weightedFocusSecs;
-                          return a.lastSeenTs > b.lastSeenTs;
-                      });
-        }
-    }
-
-    // rankedApps was split off `ranked` before the file-activity virt
-    // augmentation, but ApplyInferenceBoost on `ranked` already
-    // populated weightedFocusSecs on each entry (file apps and
-    // non-file apps alike).  No need to re-run the boost on
-    // rankedApps -- the values flowed in via the copy.  Re-sort just
-    // in case (cheap; rankedApps is <=20 entries) to keep the
-    // weighted ordering after the split.
-    std::sort(rankedApps.begin(), rankedApps.end(),
-              [](const AppAgg& a, const AppAgg& b){
-                  if (a.weightedFocusSecs != b.weightedFocusSecs)
-                      return a.weightedFocusSecs > b.weightedFocusSecs;
-                  return a.lastSeenTs > b.lastSeenTs;
-              });
-
-    // Build the Websites bag: real dwell from browser focus sessions that resolved a page,
-    // else WebCapture visit rows (dwell attributed per window, or a small per-visit proxy).
-    // Cap at 16 entries so we don't blow ONNX cost on hyper-active browsing windows.
     std::vector<AppAgg> rankedWeb;
-    {
-        // Real dwell first: browser focus sessions that resolved a URL entity (INTEL-1).
-        std::unordered_map<std::string, AppAgg> webByTitle;   // key: entity key, else lowercased title
-        std::unordered_set<std::string> withRealDwell;
-        for (const auto& a : ranked)
-        {
-            if (!a.isBrowser || a.entityKey.empty() || a.totalFocusSecs <= 0) continue;
-            AppAgg w = a;
-            w.friendlyName = "Browser";
-            w.verb = "Reading";
-            webByTitle[a.entityKey] = w;
-            withRealDwell.insert(a.entityKey);
-        }
-        // Visits without a focus session. WebCapture closes a page when the next one appears in the
-        // same window, so a page's on-screen time travels on the NEXT row of that window
-        // (dwellSecs). The page still open in a window, and rows from unknown windows, get a
-        // small per-visit proxy.
-        std::vector<const BrowsingActivity*> ordered;
-        ordered.reserve(browse.size());
-        for (const auto& b : browse) ordered.push_back(&b);
-        std::sort(ordered.begin(), ordered.end(), [](const BrowsingActivity* x, const BrowsingActivity* y) {
-            if (x->windowId != y->windowId) return x->windowId < y->windowId;
-            if (x->timestampUtc != y->timestampUtc) return x->timestampUtc < y->timestampUtc;
-            return x->id < y->id;
-        });
-        for (size_t i = 0; i < ordered.size(); ++i)
-        {
-            const BrowsingActivity& b = *ordered[i];
-            std::string raw = WideToUtf8(b.title);
-            if (raw.empty()) continue;
-            std::string clean = CleanTitle(raw, "Browser");
-            if (clean.empty()) continue;
-            std::string key = !b.entityKey.empty() ? b.entityKey : AsciiLower(clean);
-            auto& agg = webByTitle[key];
-            if (agg.bestTitle.empty())
-            {
-                agg.bestTitle    = clean;
-                agg.rawTitle     = raw;
-                agg.friendlyName = "Browser";
-                agg.verb         = "Reading";
-                agg.isBrowser    = true;
-                if (!b.entityKey.empty()) { agg.entityKey = b.entityKey; agg.entityType = "url"; }
-            }
-            if (b.timestampUtc > agg.lastSeenTs)
-            {
-                agg.lastSeenTs = b.timestampUtc;
-                if (!b.url.empty()) { agg.webUrl = b.url; agg.entityDisplay = b.url; }
-            }
-            if (withRealDwell.count(key)) continue;
-            int shown = 0;
-            if (b.windowId != 0 && i + 1 < ordered.size() && ordered[i + 1]->windowId == b.windowId)
-                shown = ordered[i + 1]->dwellSecs;
-            agg.totalFocusSecs += shown > 0 ? (std::min)(shown, 300) : 30;
-        }
-        rankedWeb.reserve(webByTitle.size());
-        for (auto& kv : webByTitle) rankedWeb.push_back(std::move(kv.second));
-
-        ApplyInferenceBoost(rankedWeb, entities, [](const AppAgg& a) { return EntityKeyOfAgg(a); }, snap.timestamp);
-
-        std::sort(rankedWeb.begin(), rankedWeb.end(),
-                  [](const AppAgg& a, const AppAgg& b){
-                      if (a.weightedFocusSecs != b.weightedFocusSecs)
-                          return a.weightedFocusSecs > b.weightedFocusSecs;
-                      return a.lastSeenTs > b.lastSeenTs;
-                  });
-        if (rankedWeb.size() > 16) rankedWeb.resize(16);
-    }
+    for (const auto& a : ranked) if (a.isBrowser || a.entityType=="url") rankedWeb.push_back(a);
 
     // ---- Canonical per-facet summaries: rich deterministic listing --
     // Themes are only a fallback / LLM hint now: compute a facet's theme only when the
     // listing yields nothing for a non-empty bag (INTEL-6: no embedding work thrown away).
     auto facetListing = [&](const std::vector<AppAgg>& bag, const char* cat) -> std::vector<std::string> {
-        std::vector<std::string> lst = ComposeRichListing(bag, cat, std::vector<std::string>());
-        if (lst.empty() && !bag.empty())
-            lst = ComposeRichListing(bag, cat, composeOneLinerFromBag(bag, /*categoryMode=*/true).lines);
-        return lst;
+        return canonicalListing(bag,cat);
     };
     snap.summaryFiles    = facetListing(rankedFiles, "files");
     snap.summaryWebsites = facetListing(rankedWeb,   "websites");
@@ -3226,6 +3040,10 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     double bySignals = (std::min)(1.0, snap.signalTypes.size() / 3.0);
     double conf      = 0.5 * byTime + 0.3 * byDom + 0.2 * bySignals;
     if (conf > 0.99) conf = 0.99;
+    double supported = 0;
+    for (const auto& a:ranked) supported += a.totalFocusSecs*a.signalQuality;
+    if (totalFocusSecs>0) conf *= supported/totalFocusSecs;
+    if (snap.partial) conf *= 0.7;
     snap.confidence  = conf;
 
     return snap;
@@ -3259,6 +3077,12 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
      .KV("window_start", s.windowStartTs)
      .KV("window_end", s.windowEndTs)
      .KV("window_seconds", s.windowSeconds)
+     .KV("interval_semantics", "[start,end)").KV("mode", s.historical ? "interval" : "current")
+     .KV("generated_at", s.generatedAt).KV("as_of_ms", s.asOfMs).KV("input_watermark", s.inputWatermark)
+     .KV("available_start_ms", s.availableStartMs).KV("partial", s.partial).KV("truncated", s.truncated)
+     .KV("freshness_seconds", (std::max)(int64_t(0), StoreUtil::NowUtc()-s.windowEndTs))
+     .KV("rule_version", Evidence::RuleVersion)
+     .KV("contains_volatile_overlay",s.liveOverlay)
      .KV("category", category);
     lines("summary", *topSummary);
     if (category == "all")
@@ -3276,12 +3100,17 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
      .KV("attention_semantics", "interaction_active_v1")
      .KV("dominant_focus_pct", (int64_t)s.dominantPct)
      .KV("confidence", s.confidence)
+     .KV("confidence_semantics","uncalibrated_evidence_weight")
      .KV("thread_count", (int64_t)s.threadCount)
      .KV("thread_id", s.threadId)
      .KV("presence", s.presence)
      .KV("model", s.model)
      .KV("model_polish", s.modelPolish);
+    w.Key("embedding_contract").BeginObject().KV("input_profile","summary_joined_v1")
+     .KV("model_sha256",s.modelRevision).KV("tokenizer_file_sha256s",s.tokenizerRevision)
+     .KV("dimension",(int)s.summaryEmbedding.size()).KV("normalization","l2").EndObject();
     lines("signal_types", s.signalTypes);
+    w.Key("evidence").Raw(s.evidenceJson.empty() ? "{}" : s.evidenceJson);
     if (includeVector)
     {
         w.Key("summary_embedding").BeginArray();
@@ -3294,6 +3123,8 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
         w.BeginObject().KV("app", it.app).KV("exe", it.exe).KV("title", it.title).KV("raw_title", it.rawTitle)
          .KV("focus_seconds", (int64_t)it.focusSeconds).KV("pct", (int64_t)it.pct).KV("thread_id", (int64_t)it.threadId);
         if (!it.entityKey.empty()) w.KV("entity_key", it.entityKey);
+        w.KV("observed_action", it.action);
+        lines("evidence_refs", it.evidenceRefs);
         w.EndObject();
     }
     w.EndArray();
@@ -3306,7 +3137,10 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
          .KV("idle_secs", e.idleSecs).KV("unknown_attention_secs", e.unknownSecs)
          .KV("observed_action", e.action).KV("resolution", e.resolution)
          .KV("last_active_ts", e.lastActiveTs).KV("last_observed_ts", e.lastObservedTs)
-         .KV("score", e.score).KV("thread_id", s.threadId).EndObject();
+         .KV("score", e.score).KV("thread_id", s.threadId);
+        lines("evidence_refs", e.evidenceRefs);
+        lines("observed_actions", e.actions);
+        w.EndObject();
     }
     w.EndArray();
     w.EndObject();
@@ -3321,6 +3155,19 @@ static std::string NormalizeCategory(const std::string& c)
     if (c == "files" || c == "websites" || c == "apps") return c;
     if (c == "documents") return "files";    // backward compatibility
     return "all";
+}
+
+std::string ContextInference::GetIntervalContext(int64_t startUtc, int64_t endUtc, int64_t asOfUtc,
+                                                 const std::string& category, bool includeVector)
+{
+    if (!m_store || !m_store->IsOpen())
+        return "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"Context capture is still starting\"}}";
+    std::lock_guard<std::mutex> compose(m_composeMtx);
+    const uint64_t epoch = m_epoch.load();
+    const auto snapshot = ComposeSnapshot(endUtc-startUtc, false, endUtc, asOfUtc*1000+999, true);
+    if (m_epoch.load()!=epoch)
+        return "{\"ok\":false,\"error\":{\"code\":\"context_invalidated\",\"message\":\"History changed during composition; retry\"}}";
+    return "{\"ok\":true,\"interval_context\":" + SnapshotToJsonObject(snapshot,NormalizeCategory(category),includeVector) + "}";
 }
 
 // Acceptable window lengths (seconds).  The UI dropdown surfaces
@@ -3380,7 +3227,7 @@ std::string ContextInference::GetRecentContext(const std::string& category,
         else
         {
             fresh = ComposeSnapshot(win, /*allowLlm=*/false);
-            fresh.threadId = m_historyEngine ? m_historyEngine->CurrentThreadId() : 0;
+            fresh.threadId = 0; // a trailing multi-episode window is not the current persistent thread
             if (m_epoch.load() == epoch) m_windowCache[win] = fresh;
         }
         useFresh = true;

@@ -63,7 +63,7 @@ def test_standard_user_client_can_connect(pipe_ready):
 def test_status_reports_store_and_capture_health(pipe_ready):
     s = warp_pipe.call({"op": "GetStatus"})
     print(s)
-    assert s["store"]["schema_version"] == 3
+    assert s["store"]["schema_version"] == 4
     assert s["store"]["write_errors"] == 0
     files = s["capture"]["files"]
     assert files["enabled"]
@@ -80,6 +80,34 @@ def test_control_operations_are_refused_for_other_apps(pipe_ready):
 def test_malformed_requests_get_structured_errors(pipe_ready):
     assert warp_pipe.call("not json")["error"]["code"] == "invalid_json"
     assert warp_pipe.call({"op": "NoSuchOp"})["error"]["code"] == "unknown_op"
+
+
+def test_phase_b_evidence_and_interval_contract(pipe_ready):
+    end = int(time.time()) - 1
+    bounds = {"start": end - 60, "end": end}
+    evidence = warp_pipe.call({"op": "GetContextEvidence", **bounds, "limit_per_type": 2})
+    assert evidence["ok"] and evidence["available"]
+    assert evidence["schema"] == "warp.context-evidence.v1"
+    assert evidence["interval_semantics"] == "[start,end)"
+    assert evidence["start_ms"] == bounds["start"] * 1000
+    assert evidence["end_ms"] == bounds["end"] * 1000
+    assert isinstance(evidence["partial"], bool)
+    assert {row["source"] for row in evidence["coverage_summary"]} == {
+        "files", "launch", "browser", "focus", "presence", "storage"}
+    deadline = time.monotonic() + 30
+    while True:
+        result = warp_pipe.call({"op": "GetIntervalContext", **bounds, "include_vector": False})
+        if result.get("error", {}).get("code") != "unavailable" or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    assert result["ok"]
+    context = result["interval_context"]
+    assert context["mode"] == "interval" and context["thread_id"] == 0
+    assert context["presence"] == ""
+    assert not context["contains_volatile_overlay"]
+    assert "summary_embedding" not in context
+    invalid = warp_pipe.call({"op": "GetContextEvidence", "start": 2, "end": 1})
+    assert invalid["error"]["code"] == "invalid_request"
 
 
 def _documents_dir() -> pathlib.Path:

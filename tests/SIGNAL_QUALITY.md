@@ -29,7 +29,7 @@ The default run:
    databases, with a fixed per-case clock and **models disabled**.
 4. Writes observations, native results/log, a machine-readable `scorecard.json`
    and a readable `scorecard.md` under the gitignored `eval\results\` directory.
-5. Returns **0** for passing Phase A gates, **1** for a failure/invalid input and
+5. Returns **0** for passing Phase B gates (including Phase A), **1** for a failure/invalid input and
    **2** for incomplete required measurements.
 
 No live hooks, browser/print subscriptions, personal activity database, registry
@@ -44,7 +44,7 @@ flowchart LR
     Observed --> Score
     Gold --> Score
     Score --> Report["JSON + Markdown scorecards"]
-    Report --> Gates["Phase A invariants / optional measured quality gates"]
+    Report --> Gates["Phase A/B invariants / optional measured quality gates"]
     Missing["Missing measurements"] --> NA["Explicit NOT MEASURED, never a pass"]
     NA --> Report
 ```
@@ -63,11 +63,20 @@ stability. They are not measurements of Qwen or a future evidence-reasoning SLM.
 
 Correlation diagnostics also exercise the current semantic-cluster/co-use
 implementation. The mixed work/personal fixture can expose false co-use links
-even while Phase A gates pass: replacing those heuristics is Phase C, not a fix
+even while Phase A/B gates pass: replacing those heuristics is Phase C, not a fix
 silently claimed by this tranche. No aggregate "AI quality percentage" is emitted.
 
+The Phase B corpus additionally checks persisted provenance, coverage states,
+exclusive-end/as-of membership, final-page exposure and checkpoint/restart
+idempotency. Its crash-cut fixture measures the uncheckpointed tail from a
+controlled cut point and committed slices; it is **not** a production crash or
+backlog guarantee. Native tests exercise the real page/focus checkpoint helpers,
+the running focus sampler against a hidden synthetic window, stale browser-read
+guards, cross-table snapshot consistency, schema-v3 upgrades, alias lineage and
+deletion.
+
 Search quality, trained-SLM claim support, continuous-agent CPU/battery cost,
-crash checkpoint loss and real collector accuracy require corresponding labeled
+real crash/backlog loss and real collector accuracy require corresponding labeled
 observations/measurements. They appear as **not_measured** otherwise. Empty
 denominators are also unmeasured, not perfect scores.
 
@@ -129,8 +138,9 @@ or a production search benchmark.
 }
 ```
 
-Offsets are seconds relative to `as_of`. The replay clock is test-only; the
-product API has not gained an arbitrary historical `as_of` parameter.
+Offsets are seconds relative to the fixture's `as_of` clock. This replay clock
+is test-only. Separately, Phase B's interval APIs accept a receipt-time `as_of`
+cutoff; they cannot reconstruct evidence already removed by retention or purge.
 
 | Signal type | Inputs beyond `id`, `type`, offsets |
 |---|---|
@@ -221,7 +231,10 @@ labeled, no false joins/invalid IDs/action claims, zero labeled duration/overlap
 errors, valid deterministic output and the privacy/deletion/resync invariants.
 An unmeasured required invariant makes the run **incomplete**.
 
-The default `--gate-profile phase-a` requires all Phase A invariant families.
+The default `--gate-profile phase-b` requires all Phase A invariant families
+plus zero labeled provenance/coverage contract errors and zero checkpoint-bound
+overrun in the controlled fixture. The measured crash-loss value is reported
+separately. `--gate-profile phase-a` remains available for older corpora.
 Use `--gate-profile measured` for deliberately partial external evaluations:
 only observed invariants are gated, and the report is prominently labeled
 **partial evaluation**, not a Phase A pass. An entirely empty evaluation cannot

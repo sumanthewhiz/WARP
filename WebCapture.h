@@ -29,6 +29,7 @@ class WebCapture
 {
 public:
     using Callback = std::function<void(BrowseEventRecord&& rec)>;
+    using EpisodeCallback = std::function<void(EpisodeRecord&& rec)>;
 
     struct PageInfo
     {
@@ -36,10 +37,14 @@ public:
         bool         isPrivate = false, excluded = false;
         int64_t      sinceMs = 0;          // Unix ms when this page was first seen in the window
         DWORD        pid = 0;
+        std::string  pageInstance, windowInstance, processInstance, urlStatus = "unknown";
+        int64_t      observedMs = 0;
+        bool         privacyKnown = false;
     };
 
     struct Stats
     {
+        bool running = false, uiaAvailable = false;
         uint64_t pages = 0, privateDropped = 0, excludedDropped = 0, uiaRequests = 0, uiaTimeouts = 0,
                  uiaFailures = 0, queueDropped = 0;
         int64_t  lastEventMs = 0;
@@ -51,6 +56,7 @@ public:
     WebCapture& operator=(const WebCapture&) = delete;
 
     void SetCallback(Callback cb);   // callback runs on the worker thread; do not call Stop() from it
+    void SetEpisodeCallback(EpisodeCallback cb);
     void Start();                    // call on the UI thread (it has a message pump)
     void Stop();                     // joins the worker; hooks are removed on (or posted to) the UI thread
     void SetPaused(bool paused);     // privacy pause: nothing recorded
@@ -73,6 +79,12 @@ public:
     static bool TitleMarksPrivate(const std::wstring& rawTitle);
     static bool CommandLineMarksPrivate(const std::wstring& commandLine);
     static bool IsPlaceholderTitle(const std::wstring& normalizedTitle);   // "New Tab", "Untitled", ...
+    static bool SamePageIdentity(const std::wstring& oldUrl, const std::wstring& newUrl,
+                                const std::wstring& oldTitleKey, const std::wstring& newTitleKey, bool lossy);
+#ifdef WARP_UNIT_TESTS
+    static std::vector<EpisodeRecord> TestPageCheckpoints();
+    static bool TestStaleRequestGuards();
+#endif
 
 private:
     class Impl;

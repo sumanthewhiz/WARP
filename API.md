@@ -151,7 +151,7 @@ raw event queries, `QueryInferences`, `GetInferenceDeltas`, `GetRecentContext` a
 | Sizes | 64 KB buffers; larger responses were cut off | requests up to 1 MiB; responses of any size (read until the message is complete); hard row limits with `truncated` flags and cursors |
 | Connections | one request per connection | keep-alive: up to 256 requests per connection; the server closes a kept-alive connection after any response while other clients are waiting, so clients must be ready to reconnect |
 | Server resources | unlimited instances, no deadlines | 8 workers, 64 queued connections (beyond that: a `busy` error), per-connection deadlines, at most 4 concurrent long-polls |
-| Operations | raw events + 4 ops | raw events + 18 ops: adds `ScoreEntities`, `TopEntities`, `SearchActivity`, `GetChanges`, `WaitForChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetCurrentContext`, `Ping`, `GetStatus`, `Purge`, `Pause` and `Resume` |
+| Operations | raw events + 4 ops | raw events + 21 ops: entity/search/history/control operations plus Phase B `GetContextEvidence`, `GetIntervalContext` and `ResolveFileIdentity` |
 | Raw events | file, app launch, browsing | adds `app_focus`, `confidence`, `source`, `entity_key`, `limit`, `min_confidence`, `truncated` and paging with `before_id` / `next_before_id` |
 | Inference `version` | per-entity counter | the global `change_seq` (monotonic across all entities); `GetInferenceDeltas` also returns `deleted`, `next_version`, `current_version`, `more` and `reset` |
 
@@ -159,6 +159,104 @@ raw event queries, `QueryInferences`, `GetInferenceDeltas`, `GetRecentContext` a
 separates active/passive/idle/unknown, web keys preserve case-sensitive identity,
 and persisted history supports every facet. Missing raw attention is `null`, not
 fabricated wall time. See [SCHEMA.md](SCHEMA.md) for migration/retention semantics.
+
+### Phase B additions (`dev`, storage schema 4)
+
+The transport and entity-key format remain API v2 / identity format 2.
+`GetContextEvidence`, `GetIntervalContext` and `ResolveFileIdentity` are additive,
+activity-scoped operations. Raw events add an optional/legacy-qualified
+`provenance` object, millisecond timing and download origin. Existing raw-event
+and timeline paging keep their previous semantics; the **new** interval APIs
+use half-open bounds.
+
+#### GetContextEvidence
+
+```json
+{"op":"GetContextEvidence","start":1760000000,"end":1760001800,"as_of":1760001800,"limit_per_type":256}
+```
+
+`start` and `end` are required integer UTC Unix seconds; `as_of` defaults to now.
+Require `0 <= start < end <= as_of <= now`, with at most 30 days between bounds.
+Wrong timestamp types or invalid bounds return `invalid_request`, not a silent
+default. Observation admission is `received_ms <= as_of * 1000 + 999`;
+event membership is `[start * 1000, end * 1000)`. This distinguishes an event's
+time from when WARP learned about it.
+
+The response contains `api_version:2`, `ok:true`,
+`schema:"warp.context-evidence.v1"`, `start_ms`, `end_ms`, `as_of_ms`,
+`input_watermark`, `available_start_ms`, `available`, `partial`, `truncated`,
+`projection_truncated`, `coverage_summary`, `observations`, `episodes`, and
+`source_coverage`. `privacy_redacted` distinguishes retained scoped privacy
+deletions from ordinary empty history. All inputs are read in one SQLite snapshot. Detailed
+contracts and the schema diagram are in [SCHEMA.md](SCHEMA.md#phase-b-durable-evidence).
+
+`limit_per_type` defaults to 256 and is clamped to 1-2000. It is a bounded
+evidence response, not an unbounded activity export or a paginated snapshot
+cursor. Narrow the interval when truncated. Do not treat an omitted entity or
+an uncovered source interval as evidence that nothing happened. A `healthy`
+coverage state describes collector availability, not measured recall.
+
+Observation `ref` values (`file:<id>`, `focus:<id>`, etc.) identify source rows.
+`provenance` separates event/observation/receipt semantics, source instance,
+process identity, replay, confirmation, actor/resolution quality and redaction.
+Missing legacy provenance has `available:false`; unknown quality weights and
+time-zone offsets are null. Confidence values are heuristic, not model
+certainty.
+
+Episode bounds are milliseconds. Exposure is distinct from active/passive/idle/
+unknown attention. Page exposure must not be added to focus active time.
+Continuing checkpoints have `open:true`; **never extrapolate** them after a
+crash. The 30-second checkpoint target is best effort, not a guarantee under
+write backlogs or unavailable capture.
+
+#### GetIntervalContext
+
+```json
+{"op":"GetIntervalContext","start":1760000000,"end":1760007200,"category":"all","include_vector":false}
+```
+
+Uses the same bounds and optional `as_of` contract. Returns
+`{"api_version":2,"ok":true,"interval_context":{...}}`, with the existing
+summary/facets/items/entity shape plus:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `interval`; not a claim about what the user is doing now. |
+| `interval_semantics` | `[start,end)`. |
+| `generated_at` | When this interpretation was composed (UTC seconds). |
+| `as_of_ms`, `input_watermark` | Observation cutoff and consistent store watermark. |
+| `available_start_ms`, `partial`, `truncated` | Availability/selection limits; old raw observations can still be present without v4 provenance. |
+| `presence`, `thread_id`, entity `score` | Empty/0/0 for historical intervals; today's state is not borrowed. |
+| entity `evidence_refs`, `observed_actions` | Supporting source refs and bounded action set from the canonical selection. |
+| `evidence` | Compact metadata/coverage projection; use `GetContextEvidence` for the detailed rows. |
+| `embedding_contract` | Summary input profile, model/tokenizer file hashes, dimension and normalization. |
+
+The operation does not run Qwen, persist a new work-thread assignment or silently
+substitute concatenated historical summary prose for interval evidence.
+Current/trailing contexts may include `contains_volatile_overlay:true`: their
+current focus tail is explicitly additional to the committed input watermark.
+
+`GetRecentContext` remains a trailing-window convenience; `GetRecentContexts`
+remains **snapshot history** (what was inferred at past generation times).
+These are not interchangeable. New snapshots retain the actual summary vector
+and its compatibility metadata across restart; an old label embedding is not
+silently treated as a summary vector. Do not compare vectors based only on equal
+dimension.
+
+#### ResolveFileIdentity
+
+```json
+{"op":"ResolveFileIdentity","key":"C:\\Work\\Plan.docx","at":1760001800}
+```
+
+`at` defaults to now and selects the path validity time. Returns `found`,
+`truncated`, and up to 100 `aliases` with `path_key`, `artifact_id`,
+`physical_id`, `valid_from_ms`, `valid_to_ms` (0 means not closed), `basis` and
+`evidence_id`. The result is recorded lineage through the requested time, not
+proof that any current filesystem file is unchanged. For a former path, supply
+the time when that path was observed. Raw historical paths are never rewritten.
+Missing physical IDs use a marked path fallback; unrelated copies/new creates
+are not joined by filename.
 
 ---
 
@@ -295,7 +393,7 @@ changing them.
 | Scope | Operations | Without the scope |
 |---|---|---|
 | none (any client allowed to connect) | `Ping`, `GetStatus`, `QueryInferences`, `ScoreEntities`, `WaitForChanges` | -- |
-| **activity** (`kActivityOps`, plus raw event queries) | raw event queries (no `op`), `GetInferenceDeltas`, `TopEntities`, `SearchActivity`, `GetChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetRecentContext`, `GetRecentContexts`, `GetCurrentContext` | `forbidden` |
+| **activity** (`kActivityOps`, plus raw event queries) | raw event queries (no `op`), `GetInferenceDeltas`, `TopEntities`, `SearchActivity`, `GetChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetRecentContext`, `GetRecentContexts`, `GetCurrentContext`, `GetContextEvidence`, `GetIntervalContext`, `ResolveFileIdentity` | `forbidden` |
 | **control** (`kControlOps`) | `Purge`, `Pause`, `Resume` | `forbidden` |
 
 Clients without the activity scope can still score entities they already know:
@@ -332,10 +430,12 @@ clients get the health summary (see [GetStatus](#getstatus)).
 | `GetRelated.limit` | default 20, clamped to 1-100 | clamped |
 | `GetRecentContexts.count` | default 10 (also for values <= 0), max 200 | clamped |
 | Context `window_seconds` | clamped to 0-30 days, then snapped to an allowed window | snapped |
+| New interval APIs `start`, `end`, `as_of` | integer UTC seconds; interval at most 30 days | invalid bounds/types rejected |
+| `GetContextEvidence.limit_per_type` | default 256, clamped to 1-2000 | explicit truncation; no automatic paging |
 | `Pause.minutes` | default 60, clamped to 1-10080 (7 days) | clamped |
 
-Out-of-range numbers are clamped silently; parameters of the wrong JSON type are treated as
-absent (their default applies).
+Older operations generally clamp out-of-range numbers and treat wrong types as
+absent. The new interval timestamp contracts reject invalid types/bounds.
 
 ---
 
@@ -350,7 +450,7 @@ trailing commas, single quotes, `NaN`, BOM or trailing data).
 | Unknown members | Ignored. If a member appears twice, the last one wins. |
 | Wrong types | A parameter of the wrong type falls back to its default (`"limit": "10"` is treated as absent). Exception: `paths` / `keys` must be arrays (`invalid_request`). |
 | Numbers | Integer parameters given with a fraction are truncated toward zero. |
-| Timestamps | Unix epoch **seconds**, UTC, in requests and responses. |
+| Timestamps | Unix epoch **seconds**, UTC, unless explicitly suffixed `_ms` (milliseconds). |
 | Aliases | `paths` / `keys`, `since` / `since_seq`, `window_seconds` / `window_secs` (see each operation). |
 
 ```json
@@ -1266,7 +1366,7 @@ agent's short-term memory (v1 shape: no `ok` member).
 | `count` | integer | 10 | Values <= 0 mean 10; at most 200. |
 | `category` | string | `all` | As for `GetRecentContext`, applied to every snapshot. |
 | `window_seconds` (alias `window_secs`) | integer | 900 | Only snapshots taken within the last `window_seconds` (same clamping and snapping as above). |
-| `include_vector` | bool | `true` | Include `summary_embedding` (in-memory snapshots only). |
+| `include_vector` | bool | `true` | Include the actual `summary_embedding` when available, including new persisted snapshots; unavailable historical vectors remain `[]`. |
 
 ```json
 {"op": "GetRecentContexts", "count": 20, "window_seconds": 86400, "include_vector": false}
@@ -1306,6 +1406,9 @@ agent's short-term memory (v1 shape: no `ok` member).
   when true, unavailable persisted vectors are `[]`, not a different label embedding.
   Persisted entries carry their real work-thread id. Old snapshots retain their
   historical estimates and are marked `attention_semantics: "legacy_combined"`.
+- The embedding represents the combined canonical summary (`summary_joined_v1`),
+  not a newly embedded category projection. Check its model/tokenizer metadata
+  before comparing it with another vector.
 - This lists previously generated snapshots. It is not reconstruction of a new
   arbitrary historical interval; `window_seconds` filters snapshot generation times.
 
@@ -1493,7 +1596,7 @@ settings. No parameters, no scope; answers even when the activity store is not o
   "paused_until": 0,
   "consent_acknowledged": true,
   "store": {
-    "open": true, "schema_version": 3,
+    "open": true, "schema_version": 4,
     "integrity": "ok", "db_bytes": 73400320, "wal_bytes": 4194304, "queue_depth": 0,
     "enqueued": 182311, "dropped": 0, "written": 182311, "batches": 9120, "write_errors": 0,
     "last_commit_utc": 1760003995, "change_seq": 58251, "reset_seq": 0,
@@ -1533,7 +1636,7 @@ as above):
 
 ```json
 {
-  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 3 },
+  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 4 },
   "capture": { "files": { "session": "WARP-KernelFile-1", "last_error": "" },
                "launches": { "last_event_ms": 1760003001000, "last_error": "" } },
   "presence": { "state": "active", "on_battery": false, "media_playing": false, "mic_in_use": false,

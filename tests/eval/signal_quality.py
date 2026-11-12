@@ -32,6 +32,9 @@ METRICS = {
     "temporal.overlap_excess_seconds": ("seconds", "sum"),
     "temporal.boundary_mae_ms": ("milliseconds", "mean"),
     "temporal.checkpoint_crash_loss_seconds": ("seconds", "mean"),
+    "temporal.checkpoint_overrun_seconds": ("seconds", "sum"),
+    "evidence.contract_errors": ("count", "sum"),
+    "evidence.coverage_errors": ("count", "sum"),
     "temporal.stale_context_age_seconds": ("seconds", "mean"),
     "correlation.task_boundary_f1": ("ratio", "ratio"),
     "correlation.membership_precision": ("ratio", "ratio"),
@@ -82,6 +85,12 @@ PHASE_A_GATES = {
     "privacy.excluded_inclusions": 0,
     "lifecycle.deleted_evidence_survivors": 0,
     "lifecycle.resync_correctness": 1,
+}
+PHASE_B_GATES = {
+    **PHASE_A_GATES,
+    "evidence.contract_errors": 0,
+    "evidence.coverage_errors": 0,
+    "temporal.checkpoint_overrun_seconds": 0,
 }
 
 
@@ -249,7 +258,7 @@ def evaluate(corpus, observations, repeated=None, gate_profile="phase-a"):
         decisions = by_id(observation.get("decisions", []))
         if "accepted" in gold:
             labels = gold["accepted"]
-            captured = {key: value for key, value in decisions.items() if value.get("type") not in {"purge", "clear"}}
+            captured = {key: value for key, value in decisions.items() if value.get("type") not in {"purge", "clear", "restart"}}
             if set(labels) != captured.keys() or not all(type(v) is bool for v in labels.values()):
                 raise ValueError(f"{case_id}: accepted labels must cover every non-control decision")
             if not all(type(d.get("accepted")) is bool for d in decisions.values()):
@@ -409,6 +418,36 @@ def evaluate(corpus, observations, repeated=None, gate_profile="phase-a"):
                 add("cost." + metric, int(flag))
         if "checkpoint_crash_loss_seconds" in measured:
             add("temporal.checkpoint_crash_loss_seconds", measured["checkpoint_crash_loss_seconds"])
+        if "max_checkpoint_loss_seconds" in gold:
+            if "checkpoint_crash_loss_seconds" not in measured:
+                raise ValueError(f"{case_id}: missing labeled checkpoint-loss measurement")
+            add("temporal.checkpoint_overrun_seconds", max(
+                0, number(measured["checkpoint_crash_loss_seconds"]) - number(gold["max_checkpoint_loss_seconds"])))
+        if "provenance" in gold:
+            errors = 0
+            for signal_id, fields in gold["provenance"].items():
+                actual = decisions.get(signal_id, {}).get("provenance")
+                if not isinstance(actual, dict):
+                    raise ValueError(f"{case_id}: missing persisted provenance for {signal_id}")
+                errors += sum(actual.get(key) != value for key, value in fields.items())
+            add("evidence.contract_errors", errors)
+        if "evidence" in gold:
+            actual = observation.get("evidence")
+            if not isinstance(actual, dict):
+                raise ValueError(f"{case_id}: missing labeled evidence output")
+            errors = 0
+            for field, expected in gold["evidence"].items():
+                if field == "episode_count":
+                    value = len(actual["episodes"])
+                elif field == "episode_exposure_ms":
+                    value = sum(number(e["exposure_ms"]) for e in actual["episodes"])
+                elif field == "coverage_states":
+                    value = sorted({c["state"] for c in actual["source_coverage"]})
+                    expected = sorted(expected)
+                else:
+                    value = actual.get(field)
+                errors += value != expected
+            add("evidence.coverage_errors", errors)
         per_case.append({"id": case_id, "group_id": case.get("group_id", case_id),
                          "split": case.get("split", "unspecified"), "cohort": case.get("cohort", {}),
                          "metrics": {key: aggregate(key, values) for key, values in local.items()}})
@@ -422,8 +461,8 @@ def evaluate(corpus, observations, repeated=None, gate_profile="phase-a"):
             metrics[name]["reason"] = "No eligible labeled observation/measurement supplied; not a pass."
     gates = {key: ("not_measured" if metrics[key]["value"] is None else
                    "passed" if abs(metrics[key]["value"] - expected) < 1e-9 else "failed")
-             for key, expected in PHASE_A_GATES.items()
-             if gate_profile == "phase-a" or metrics[key]["value"] is not None}
+             for key, expected in (PHASE_B_GATES if gate_profile == "phase-b" else PHASE_A_GATES).items()
+             if gate_profile in {"phase-a", "phase-b"} or metrics[key]["value"] is not None}
     for name in ("search.exact_match_overrides", "grounding.unsupported_action_rate", "grounding.unsupported_relationship_rate"):
         if metrics[name]["value"] is not None:
             gates[name] = "passed" if metrics[name]["value"] == 0 else "failed"
@@ -482,7 +521,9 @@ def paired_comparison(current, baseline, iterations=2000):
 
 def markdown(report):
     dirty = " (working tree modified)" if report.get("working_tree_dirty") else ""
-    label = "Phase A fixture gates" if report.get("gate_profile", "phase-a") == "phase-a" else "Measured-only gates (partial evaluation)"
+    profile = report.get("gate_profile", "phase-a")
+    label = {"phase-a": "Phase A fixture gates", "phase-b": "Phase B fixture gates"}.get(
+        profile, "Measured-only gates (partial evaluation)")
     lines = ["# WARP signal quality validation", "", f"**{label}: {report['status'].upper()}**",
              f"Scope: {', '.join(report['scope'])}. Revision: `{report.get('revision', 'unknown')}`{dirty}.",
              f"Model modes: {', '.join(report.get('model_modes', ['unspecified']))}.", "",
@@ -518,7 +559,7 @@ def main(argv=None):
     parser.add_argument("--min-ndcg-gain", type=float)
     parser.add_argument("--max-cohort-regression", type=float)
     parser.add_argument("--require-metric", choices=sorted(METRICS), action="append", default=[])
-    parser.add_argument("--gate-profile", choices=("phase-a", "measured"), default="phase-a")
+    parser.add_argument("--gate-profile", choices=("phase-a", "phase-b", "measured"), default="phase-b")
     args = parser.parse_args(argv)
     if args.models_dir and args.observations:
         parser.error("--models-dir applies to native replay, not precomputed observations")
@@ -585,7 +626,7 @@ def run_evaluation(args, directory):
     result["revision"] = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     result["working_tree_dirty"] = bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
                                                        capture_output=True, text=True, check=True).stdout.strip())
-    result["evaluation_rule_version"] = "phase-a-1"
+    result["evaluation_rule_version"] = "phase-b-1"
     result["metrics_code_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     if args.native_bin and not args.observations:
         with args.native_bin.open("rb") as stream:

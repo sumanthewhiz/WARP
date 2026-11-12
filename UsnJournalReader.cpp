@@ -1065,6 +1065,9 @@ void UsnJournalReader::Impl::Emit(Volume& v, UsnFileEvent::Kind kind, std::wstri
     ev.oldPath = std::move(oldPath);
     ev.utcMs = utcMs;
     ev.fileRef = FoldFileId(r.fileId);
+    ev.fileIdLow = r.fileId.lo; ev.fileIdHigh = r.fileId.hi;
+    ev.journalId = v.journalId; ev.usn = r.usn;
+    ev.reason = r.reason; ev.sourceInfo = r.sourceInfo;
     ev.volume = v.volumeKey;
     ev.isDirectory = isDirectory;
     ev.backfill = backfill;

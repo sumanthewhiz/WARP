@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <iterator>
 #include <vector>
+#include <deque>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -37,6 +38,9 @@ namespace
     // Cached foreground state (updated by ForegroundChangeBroker).
     std::atomic<HWND>  g_lastForegroundHwnd{ nullptr };
     std::atomic<DWORD> g_lastForegroundPid{ 0 };
+    struct ContextSample { int64_t ms; DWORD pid, input; std::wstring exe; std::string instance; double confidence = 1; };
+    std::mutex g_samplesMtx;
+    std::deque<ContextSample> g_samples;
 
     std::wstring ResolveExeViaPsApi(DWORD pid)
     {
@@ -257,6 +261,7 @@ namespace EventContextUtil
     {
         g_lastForegroundHwnd.store(hwnd, std::memory_order_relaxed);
         g_lastForegroundPid.store(pid,  std::memory_order_relaxed);
+        SampleContext();
     }
 
     // Tick (in GetTickCount64() units) before which all events are
@@ -272,6 +277,12 @@ namespace EventContextUtil
     EventContext CaptureContext(DWORD sourcePid)
     {
         EventContext ctx;
+        ctx.evidence.observedMs = Evidence::NowMs();
+        ctx.evidence.sessionId = (int)OwnSessionId();
+        ctx.evidence.processInstance = ProcessInstanceId(sourcePid);
+        TIME_ZONE_INFORMATION tz{};
+        const DWORD zone = GetTimeZoneInformation(&tz);
+        ctx.evidence.utcOffsetMinutes = -(tz.Bias + (zone==TIME_ZONE_ID_DAYLIGHT ? tz.DaylightBias : tz.StandardBias));
         ctx.sourcePid = sourcePid;
         if (sourcePid != 0)
             ctx.sourceExe = GetExePathByPid(sourcePid);
@@ -289,6 +300,7 @@ namespace EventContextUtil
             }
         }
         ctx.foregroundPid = fgPid;
+        ctx.evidence.foregroundInstance = ProcessInstanceId(fgPid);
         if (fgPid != 0)
             ctx.foregroundExe = GetExePathByPid(fgPid);
 
@@ -309,6 +321,80 @@ namespace EventContextUtil
                 g_wakeBoundaryUntilTick.store(0, std::memory_order_relaxed);
         }
 
+        return ctx;
+    }
+
+    std::string ProcessInstanceId(DWORD pid)
+    {
+        if (!pid) return {};
+        ProcessInfo info;
+        if (LookupProcess(pid, info) && info.startKey)
+            return std::to_string(info.sessionId) + ":" + std::to_string(pid) + ":" + std::to_string(info.startKey);
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) return {};
+        FILETIME created{}, exited{}, kernel{}, user{};
+        const bool ok = GetProcessTimes(process, &created, &exited, &kernel, &user) != FALSE;
+        CloseHandle(process);
+        if (!ok) return {};
+        const uint64_t stamp = (uint64_t(created.dwHighDateTime)<<32) | created.dwLowDateTime;
+        DWORD session = 0xFFFFFFFFu; ProcessIdToSessionId(pid, &session);
+        return std::to_string(session) + ":" + std::to_string(pid) + ":" + std::to_string(stamp);
+    }
+
+    void SampleContext()
+    {
+        DWORD pid = 0;
+        HWND hwnd = GetForegroundWindow();
+        if (hwnd) GetWindowThreadProcessId(hwnd, &pid);
+        ContextSample sample{ Evidence::NowMs(), pid, MsSinceInput(), GetExePathByPid(pid), ProcessInstanceId(pid) };
+        if (GetTickCount64()<g_wakeBoundaryUntilTick.load()) sample.confidence=0.2;
+        std::lock_guard<std::mutex> lock(g_samplesMtx);
+        if (!g_samples.empty() && sample.ms < g_samples.back().ms) g_samples.clear(); // wall-clock rollback
+        g_samples.push_back(std::move(sample));
+        while (g_samples.size() > 1800) g_samples.pop_front();
+    }
+
+    EventContext CaptureContextAt(DWORD pid, int64_t eventMs, bool replayed)
+    {
+        EventContext ctx;
+        ctx.sourcePid = pid;
+        ctx.evidence.observedMs = Evidence::NowMs();
+        ctx.evidence.replayed = replayed;
+        ctx.evidence.sessionId = (int)OwnSessionId();
+        if (!replayed && std::abs(ctx.evidence.observedMs-eventMs)<2000 && GetTickCount64()<g_wakeBoundaryUntilTick.load())
+            ctx.confidence=0.2;
+        ProcessInfo process;
+        const bool knownProcess = pid && LookupProcess(pid, process);
+        if (knownProcess && process.startMs <= eventMs &&
+            (!process.exitMs || process.exitMs >= eventMs))
+        {
+            ctx.sourceExe = process.imagePath;
+            ctx.evidence.processInstance = std::to_string(process.sessionId)+":"+std::to_string(pid)+":"+std::to_string(process.startKey);
+        }
+        else if (pid && !knownProcess && std::abs(ctx.evidence.observedMs-eventMs)<2000)
+        {
+            const auto instance=ProcessInstanceId(pid);
+            const auto last=instance.rfind(':');
+            const uint64_t created=last==std::string::npos ? 0 : std::strtoull(instance.c_str()+last+1,nullptr,10);
+            if (created>=116444736000000000ULL && int64_t((created-116444736000000000ULL)/10000)<=eventMs)
+            {
+                ctx.sourceExe = GetExePathByPid(pid);
+                ctx.evidence.processInstance = instance;
+            }
+        }
+        if (replayed) return ctx;
+        std::lock_guard<std::mutex> lock(g_samplesMtx);
+        for (auto it=g_samples.rbegin();it!=g_samples.rend();++it)
+        {
+            if (it->ms > eventMs) continue;
+            if (eventMs-it->ms>2000) break;
+            ctx.foregroundPid=it->pid; ctx.foregroundExe=it->exe;
+            ctx.msSinceInput=it->input==0xFFFFFFFFu ? 0xFFFFFFFFu :
+                (DWORD)(std::min)(uint64_t(0xFFFFFFFEu),uint64_t(it->input)+uint64_t(eventMs-it->ms));
+            ctx.confidence=(std::min)(ctx.confidence,it->confidence);
+            ctx.evidence.foregroundInstance=it->instance; ctx.evidence.contextAgeMs=eventMs-it->ms;
+            break;
+        }
         return ctx;
     }
 

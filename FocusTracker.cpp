@@ -121,7 +121,7 @@ void FocusTracker::Stop()
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         AccountLocked(GetTickCount64());
-        EndLocked(NowMs(), out);
+        EndLocked(NowMs(), out, "shutdown");
     }
     Emit(out);
 }
@@ -136,7 +136,7 @@ void FocusTracker::Flush()
         HWND h = m_cur.hwnd;
         DWORD p = m_cur.pid;
         int64_t now = NowMs();
-        EndLocked(now, out);
+        EndLocked(now, out, "pause");
         if (m_running.load() && !m_paused.load() && !m_away && h && IsWindow(h)) BeginLocked(h, p, now, out);
     }
     Emit(out);
@@ -177,11 +177,9 @@ void FocusTracker::OnPresenceChanged(const std::string& state, int64_t lastInput
         const int64_t now = NowMs();
         if (away && !m_away)
         {
-            // SIG-2: the user left at their last input, not when the idle timer fired.
-            int64_t end = now;
-            if (state == "away" && m_haveCur && lastInputUtcMs > 0)
-                end = (std::max)(m_cur.startMs, (std::min)(now, lastInputUtcMs));
-            EndLocked(end, out);
+            // Checkpointed foreground exposure is immutable. The detected boundary is
+            // not retroactively moved over already-measured recent-input/idle slices.
+            EndLocked(now, out, state.c_str());
             m_away = true;
         }
         else if (!away && m_away)
@@ -246,8 +244,14 @@ void FocusTracker::BeginLocked(HWND hwnd, DWORD pid, int64_t startMs, std::vecto
     s.shellInfoPending = !sameWindow;
     if (s.shellInfoPending && m_wakeEvent) SetEvent(m_wakeEvent);   // fetched within ms, not at the next 1 s tick
     s.startMs = startMs;
+    s.episodeId = Evidence::NewId("focus");
     s.lastSampleTick = GetTickCount64();
     s.ctx = EventContextUtil::CaptureContext(pid);                    // context at session START (APP-6)
+    s.ctx.evidence.timestampKind = "foreground_sample";
+    s.ctx.evidence.actorMethod = "foreground_owner";
+    s.ctx.evidence.confirmation = "foreground_observed";
+    s.ctx.evidence.sourceQuality = 1;
+    s.ctx.evidence.actorQuality = 0.9;
     s.ctx.confidence = EventContextUtil::ScoreEvent(s.ctx, EventContextUtil::EventKind::Focus,
                                                     EventContextUtil::SourceClass::Focus);
     m_cur = std::move(s);
@@ -284,13 +288,19 @@ void FocusTracker::ResolveDocLocked(Segment& s)
     s.doc = std::move(d);
 }
 
-void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
+void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out, const char* reason)
 {
     if (!m_haveCur) return;
+    CheckpointLocked(endMs, false, reason, out);
     m_haveCur = false;
+}
+
+void FocusTracker::CheckpointLocked(int64_t endMs, bool open, const char* reason, std::vector<FocusEventRecord>& out)
+{
+    if (!m_haveCur) return;
     Segment& s = m_cur;
     const int64_t dur = endMs - s.startMs;
-    if (dur < kMinSegmentMs) return;
+    if (dur < 0 || (open && dur < kMinSegmentMs)) return;
 
     FocusEventRecord r;
     r.startMs = s.startMs;
@@ -319,7 +329,21 @@ void FocusTracker::EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out)
     }
     r.presence = r.passiveSecs > r.activeSecs ? "passive" : "active";
     r.ctx = s.ctx;
+    r.ctx.evidence.id = s.episodeId + ":" + std::to_string(++s.revision);
+    r.ctx.evidence.episodeId = s.episodeId;
+    r.ctx.evidence.revision = s.revision;
+    r.ctx.evidence.open = open;
+    r.ctx.evidence.boundaryReason = reason;
+    r.ctx.evidence.observedMs = NowMs();
+    r.ctx.evidence.resolution = r.docResolution;
+    r.ctx.evidence.identityQuality = s.doc.confidence;
+    r.ctx.evidence.resolutionObservedMs = s.doc.observedMs;
+    r.ctx.evidence.resolutionValidUntilMs = s.doc.validUntilMs;
+    r.ctx.evidence.windowInstance = s.doc.instance;
+    r.ctx.evidence.redaction = s.redaction == Redaction::None ? "none" : "content_withheld";
     out.push_back(std::move(r));
+    s.startMs = endMs;
+    s.activeSecs = s.passiveSecs = s.idleSecs = s.unknownSecs = 0;
 }
 
 void FocusTracker::Emit(std::vector<FocusEventRecord>& out)
@@ -339,6 +363,7 @@ void FocusTracker::SamplerThread()
     {
         const DWORD w = WaitForMultipleObjects(m_wakeEvent ? 2 : 1, waits, FALSE, 1000);
         if (w != WAIT_TIMEOUT && w != WAIT_OBJECT_0 + 1) break;          // stop requested (or wait failed)
+        EventContextUtil::SampleContext();
 
         // Shell info of the current segment (see BeginLocked): fetched with m_mtx RELEASED and
         // stored only if the same segment is still current.
@@ -374,7 +399,7 @@ void FocusTracker::SamplerThread()
                 AccountLocked(now);
                 if (!IsWindow(m_cur.hwnd))
                 {
-                    EndLocked(NowMs(), out);                          // window closed
+                    EndLocked(NowMs(), out, "window_closed");
                 }
                 else
                 {
@@ -392,7 +417,7 @@ void FocusTracker::SamplerThread()
                             const int64_t splitMs = NowMs() - (int64_t)(now - m_cur.pendingSinceTick);
                             HWND h = m_cur.hwnd;
                             DWORD p = m_cur.pid;
-                            EndLocked(splitMs, out);
+                            EndLocked(splitMs, out, "title_changed");
                             BeginLocked(h, p, splitMs, out);
                         }
                     }
@@ -411,12 +436,13 @@ void FocusTracker::SamplerThread()
                         if (redaction == Redaction::None) ResolveDocLocked(candidate);
                         else { candidate.doc = DocInfo{}; candidate.docResolved = false; }
                         if (redaction != m_cur.redaction || candidate.doc.key != m_cur.doc.key ||
-                            candidate.doc.resolution != m_cur.doc.resolution)
+                            candidate.doc.resolution != m_cur.doc.resolution || candidate.doc.instance != m_cur.doc.instance ||
+                            m_cur.ctx.evidence.processInstance != EventContextUtil::ProcessInstanceId(m_cur.pid))
                         {
                             HWND h = m_cur.hwnd;
                             DWORD p = m_cur.pid;
                             const int64_t split = NowMs();
-                            EndLocked(split, out);
+                            EndLocked(split, out, "identity_or_policy_changed");
                             BeginLocked(h, p, split, out);
                             if (m_haveCur && m_cur.redaction == Redaction::None)
                             {
@@ -424,7 +450,15 @@ void FocusTracker::SamplerThread()
                                 m_cur.docResolved = candidate.docResolved;
                             }
                         }
+                        else
+                        {
+                            m_cur.doc.observedMs = candidate.doc.observedMs;
+                            m_cur.doc.validUntilMs = candidate.doc.validUntilMs;
+                            m_cur.doc.confidence = candidate.doc.confidence;
+                        }
                     }
+                    if (m_haveCur && NowMs() - m_cur.startMs >= Evidence::CheckpointSeconds * 1000)
+                        CheckpointLocked(NowMs(), true, "checkpoint", out);
                 }
             }
         }
@@ -450,6 +484,8 @@ bool FocusTracker::GetCurrentSession(ActiveSession& out) const
     out.unknownSecsSoFar = out.durationSoFarSecs - out.activeSecsSoFar - out.passiveSecsSoFar - out.idleSecsSoFar;
     out.aumid = m_cur.aumid;
     out.docResolution = m_cur.redaction == Redaction::None ? m_cur.doc.resolution : "withheld";
+    out.episodeId = m_cur.episodeId;
+    out.confidence = m_cur.ctx.confidence;
     if (m_cur.redaction == Redaction::None && !m_cur.doc.key.empty())
     {
         out.docKey = m_cur.doc.key;

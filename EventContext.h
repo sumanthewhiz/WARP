@@ -33,9 +33,11 @@
 #include <windows.h>
 #include <string>
 #include <cstdint>
+#include "Evidence.h"
 
 struct EventContext
 {
+    ObservationEvidence evidence;
     DWORD        sourcePid       = 0;     // PID that actually emitted the event
     std::wstring sourceExe;               // full path to that PID's exe
     DWORD        foregroundPid   = 0;     // PID owning the foreground HWND
@@ -68,6 +70,9 @@ namespace EventContextUtil
     // at 1.0 and is multiplied by 0.2 inside a wake boundary; producers then call
     // ScoreEvent() which MULTIPLIES into it (SIG-4: never assign).
     EventContext CaptureContext(DWORD sourcePid);
+    EventContext CaptureContextAt(DWORD sourcePid, int64_t eventMs, bool replayed = false);
+    std::string ProcessInstanceId(DWORD pid);
+    void SampleContext();
 
     // Record the current foreground HWND/PID (called by ForegroundChangeBroker).
     void NotifyForegroundChanged(HWND hwnd, DWORD pid);

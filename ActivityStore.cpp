@@ -350,7 +350,7 @@ bool ActivityStore::Open(const std::wstring& dbPath)
     }
     if (!CheckIntegrityOrQuarantine())
         return false;
-    if (!Migrate())
+    if (!Migrate() || !MigrateV4())
     {
         // Keep the old file for diagnosis but never leave the always-on agent without a store.
         WARP_LOG_ERROR("store", "schema migration failed; quarantining database and starting fresh");
@@ -364,7 +364,7 @@ bool ActivityStore::Open(const std::wstring& dbPath)
             std::wstring to = m_path + stamp + sfx;
             MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
-        if (!OpenConnection(&m_wdb, true) || !Migrate())
+        if (!OpenConnection(&m_wdb, true) || !Migrate() || !MigrateV4())
         {
             WARP_LOG_ERROR("store", "fresh database could not be initialized; store not opened");
             if (m_wdb) { sqlite3_close(m_wdb); m_wdb = nullptr; }
@@ -1269,8 +1269,30 @@ namespace
 
     // Does purge floor (kind, v) cover a record with these identities? (Time ranges cover every record.)
     bool FloorCovers(int kind, const std::string& v, const std::string& key, const std::string& key2,
-                     const std::string& host, const std::string& fileKey, const std::string& fileKey2)
+                     const std::string& host, const std::string& fileKey, const std::string& fileKey2, bool hashed = false)
     {
+        auto equals = [&](const std::string& value) { return !value.empty() && (hashed ? Evidence::Fingerprint(value)==v : value==v); };
+        if (hashed)
+        {
+            if (kind==1) return equals(key) || equals(key2);
+            if (kind==2)
+            {
+                if (equals(host)) return true;
+                for (auto dot=host.find('.');dot!=std::string::npos;dot=host.find('.',dot+1))
+                    if (equals(host.substr(dot+1))) return true;
+                return false;
+            }
+            if (kind==3)
+            {
+                for (const auto& path:{fileKey,fileKey2})
+                {
+                    if (equals(path)) return true;
+                    for (auto slash=path.find('\\');slash!=std::string::npos;slash=path.find('\\',slash+1))
+                        if (equals(path.substr(0,slash)) || equals(path.substr(0,slash+1))) return true;
+                }
+                return false;
+            }
+        }
         auto under = [&v](const std::string& k)
         {
             return !k.empty() && k.size() >= v.size() && k.compare(0, v.size(), v) == 0 &&
@@ -1311,7 +1333,7 @@ namespace
 bool ActivityStore::Suppressed(int64_t ms, const RecordIds& ids) const
 {
     for (const PurgeFloor& f : m_floors)
-        if (ms >= f.fromMs && ms <= f.toMs && FloorCovers(f.kind, f.value, ids.key, ids.key2, ids.host, ids.fileKey, ids.fileKey2))
+        if (ms >= f.fromMs && ms <= f.toMs && FloorCovers(f.kind, f.value, ids.key, ids.key2, ids.host, ids.fileKey, ids.fileKey2, f.hashed))
             return true;
     return false;
 }
@@ -1323,7 +1345,8 @@ std::vector<std::pair<int64_t, int64_t>> ActivityStore::UnpurgedParts(int64_t st
     for (const PurgeFloor& f : m_floors)
     {
         if (parts.empty()) break;
-        if (!FloorCovers(f.kind, f.value, ids.key, ids.key2, ids.host, ids.fileKey, ids.fileKey2)) continue;
+        if (endMs < f.fromMs || startMs > f.toMs) continue;
+        if (!FloorCovers(f.kind, f.value, ids.key, ids.key2, ids.host, ids.fileKey, ids.fileKey2, f.hashed)) continue;
         std::vector<std::pair<int64_t, int64_t>> next;
         for (const auto& p : parts)
         {
@@ -1353,6 +1376,22 @@ void ActivityStore::AddFloor(WriterContext& w, PurgeFloor f)
     m_floorsDirty = true;
     if (f.kind != 0)
     {
+        if (!f.hashed) { f.value=Evidence::Fingerprint(f.value); f.hashed=true; }
+        auto st=w.Stmt("INSERT INTO privacy_scope(kind,scope_hash,from_ms,to_ms) VALUES(?,?,?,?) "
+            "ON CONFLICT(kind,scope_hash) DO UPDATE SET from_ms=MIN(from_ms,excluded.from_ms),to_ms=MAX(to_ms,excluded.to_ms)");
+        if (!st) throw std::runtime_error(sqlite3_errmsg(w.db));
+        sqlite3_bind_int(st,1,f.kind); BindText(st,2,f.value);
+        sqlite3_bind_int64(st,3,f.fromMs); sqlite3_bind_int64(st,4,f.toMs);
+        if (sqlite3_step(st)!=SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+        Exec(w.db,"DELETE FROM privacy_scope WHERE (kind,scope_hash) NOT IN "
+            "(SELECT kind,scope_hash FROM privacy_scope ORDER BY to_ms DESC LIMIT 64)");
+        for (auto& previous:m_floors)
+            if (previous.kind==f.kind && previous.hashed && previous.value==f.value)
+            {
+                previous.fromMs=(std::min)(previous.fromMs,f.fromMs);
+                previous.toMs=(std::max)(previous.toMs,f.toMs);
+                return;
+            }
         size_t scoped = 0;
         for (const PurgeFloor& x : m_floors) if (x.kind != 0) ++scoped;
         if (scoped >= 64)
@@ -1409,11 +1448,19 @@ void ActivityStore::LoadFloors()
         f.toMs = std::strtoll(item.c_str() + colon + 1, nullptr, 10);
         if (f.toMs >= f.fromMs) m_floors.push_back(std::move(f));
     }
+    if (sqlite3_prepare_v2(m_wdb,"SELECT kind,scope_hash,from_ms,to_ms FROM privacy_scope ORDER BY to_ms",-1,&st,nullptr)==SQLITE_OK)
+    {
+        while (sqlite3_step(st)==SQLITE_ROW)
+            m_floors.push_back({sqlite3_column_int(st,0),ColU(st,1),sqlite3_column_int64(st,2),sqlite3_column_int64(st,3),true});
+        sqlite3_finalize(st);
+    }
     m_floorsCommitted = m_floors;
 }
 
 bool ActivityStore::RecordFile(FileEventRecord r)
 {
+    Evidence::Prepare(r.ctx.evidence);
+    if (r.ctx.evidence.replayed) r.presence = "unknown";
     return EnqueueRecord([this, r = std::move(r)](WriterContext& w)
     {
         sqlite3_stmt* st = w.Stmt(kInsFile);
@@ -1426,7 +1473,13 @@ bool ActivityStore::RecordFile(FileEventRecord r)
             ids.key = key;
             ids.fileKey = key;
             if (!r.oldPath.empty()) ids.key2 = ids.fileKey2 = EntityKey::FileKey(r.oldPath);
+            ids.host=UrlHost(r.originUrl);
             if (Suppressed(ms, ids)) return;   // reported after a purge of that time or item
+            if (!r.ctx.evidence.cloudUrl.empty())
+            {
+                ids.host=UrlHost(EntityKey::FromUtf8(r.ctx.evidence.cloudUrl));
+                if (Suppressed(ms,ids)) return;
+            }
         }
         sqlite3_bind_int64(st, 1, ms / 1000);
         BindText(st, 2, r.action);
@@ -1439,16 +1492,21 @@ bool ActivityStore::RecordFile(FileEventRecord r)
         BindText(st, 17, r.presence);
         sqlite3_bind_int(st, 18, r.isDir ? 1 : 0);
         BindText(st, 19, r.originUrl);
+        if (EvidenceExists(w, r.ctx.evidence)) return;
         if (sqlite3_step(st) != SQLITE_DONE)
-            WARP_LOG_WARN("store", "file insert failed: %s", sqlite3_errmsg(w.db));
+            throw std::runtime_error(sqlite3_errmsg(w.db));
+        const int64_t rowId = sqlite3_last_insert_rowid(w.db);
         FileEventRecord copy = r;
         copy.eventMs = ms;
+        ResolveArtifact(w, copy);
+        PersistEvidence(w, "file", rowId, ms, copy.ctx.evidence);
         for (IWriterSink* s : m_sinks) s->OnFileEvent(w, copy);
     });
 }
 
 bool ActivityStore::RecordLaunch(LaunchEventRecord r)
 {
+    Evidence::Prepare(r.ctx.evidence);
     return EnqueueRecord([this, r = std::move(r)](WriterContext& w)
     {
         sqlite3_stmt* st = w.Stmt(kInsLaunch);
@@ -1473,8 +1531,10 @@ bool ActivityStore::RecordLaunch(LaunchEventRecord r)
         BindText(st, 18, r.creatorExe);
         BindText(st, 19, r.aumid);
         sqlite3_bind_int64(st, 20, r.sessionId);
+        if (EvidenceExists(w, r.ctx.evidence)) return;
         if (sqlite3_step(st) != SQLITE_DONE)
-            WARP_LOG_WARN("store", "launch insert failed: %s", sqlite3_errmsg(w.db));
+            throw std::runtime_error(sqlite3_errmsg(w.db));
+        PersistEvidence(w, "launch", sqlite3_last_insert_rowid(w.db), ms, r.ctx.evidence);
         LaunchEventRecord copy = r;
         copy.eventMs = ms;
         for (IWriterSink* s : m_sinks) s->OnLaunchEvent(w, copy);
@@ -1498,6 +1558,7 @@ bool ActivityStore::RecordProcessExit(ProcessExitRecord r)
 
 bool ActivityStore::RecordBrowse(BrowseEventRecord r)
 {
+    Evidence::Prepare(r.ctx.evidence);
     return EnqueueRecord([this, r = std::move(r)](WriterContext& w)
     {
         sqlite3_stmt* st = w.Stmt(kInsBrowse);
@@ -1518,15 +1579,17 @@ bool ActivityStore::RecordBrowse(BrowseEventRecord r)
         BindEventContext(st, 5, r.ctx);
         BindText(st, 14, key);
         sqlite3_bind_int64(st, 15, ms);
-        BindText(st, 16, std::string("uia"));
+        BindText(st, 16, r.source);
         BindText(st, 17, r.host);
         BindText(st, 18, r.docId);
         BindText(st, 19, r.docKind);
         sqlite3_bind_int(st, 20, r.dwellSecs);
         BindText(st, 21, r.presence);
         if (r.windowId) sqlite3_bind_int64(st, 22, r.windowId); else sqlite3_bind_null(st, 22);
+        if (EvidenceExists(w, r.ctx.evidence)) return;
         if (sqlite3_step(st) != SQLITE_DONE)
-            WARP_LOG_WARN("store", "browse insert failed: %s", sqlite3_errmsg(w.db));
+            throw std::runtime_error(sqlite3_errmsg(w.db));
+        PersistEvidence(w, "browse", sqlite3_last_insert_rowid(w.db), ms, r.ctx.evidence);
         BrowseEventRecord copy = r;
         copy.eventMs = ms;
         for (IWriterSink* s : m_sinks) s->OnBrowseEvent(w, copy);
@@ -1535,10 +1598,30 @@ bool ActivityStore::RecordBrowse(BrowseEventRecord r)
 
 bool ActivityStore::RecordFocus(FocusEventRecord r)
 {
+    Evidence::Prepare(r.ctx.evidence);
     return EnqueueRecord([this, r = std::move(r)](WriterContext& w)
     {
         auto insert = [this, &w](FocusEventRecord f, int64_t startMs, int64_t endMs)
         {
+            if (!f.ctx.evidence.episodeId.empty())
+            {
+                auto previous = w.Stmt("SELECT MAX(end_ms) FROM activity_episode WHERE episode_id=?1");
+                BindText(previous, 1, f.ctx.evidence.episodeId);
+                int64_t prior = 0;
+                if (sqlite3_step(previous) == SQLITE_ROW) prior = sqlite3_column_int64(previous, 0);
+                sqlite3_reset(previous);
+                if (prior > startMs)
+                {
+                    if (prior >= endMs) return;
+                    f.activeSecs = Attention::Clip(f.activeSecs, startMs, endMs, prior, endMs);
+                    f.passiveSecs = Attention::Clip(f.passiveSecs, startMs, endMs, prior, endMs);
+                    f.idleSecs = Attention::Clip(f.idleSecs, startMs, endMs, prior, endMs);
+                    startMs = prior;
+                }
+            }
+            if (startMs != f.startMs || endMs != f.endMs)
+                f.ctx.evidence.id += ":" + std::to_string(startMs) + ":" + std::to_string(endMs);
+            if (EvidenceExists(w, f.ctx.evidence)) return;
             sqlite3_stmt* st = w.Stmt(kInsFocus);
             if (!st) return;
             int duration = (int)((std::max)(int64_t(0), endMs - startMs) / 1000);
@@ -1548,16 +1631,17 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             remaining -= f.passiveSecs;
             f.idleSecs = (std::max)(0, (std::min)(remaining, f.idleSecs));
             f.unknownSecs = remaining - f.idleSecs;
-            if (f.docResolution == "ambiguous")
+            if (f.docResolution == "ambiguous" || f.docResolution == "withheld" || f.ctx.evidence.redaction != "none")
             {
                 f.docKey.clear();
                 f.docDisplay.clear();
                 f.docType.clear();
+                if (f.docResolution=="withheld" || f.ctx.evidence.redaction!="none") f.windowTitle.clear();
             }
             sqlite3_bind_int64(st, 1, endMs / 1000);
             BindText(st, 2, f.exeName);
             BindText(st, 3, f.exePath);
-            BindText(st, 4, f.windowTitle);
+            sqlite3_bind_text(st, 4, W2U(f.windowTitle).c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(st, 5, duration);
             BindEventContext(st, 6, f.ctx);
             BindText(st, 15, StoreUtil::AppEntityKey(f.exePath, f.aumid));
@@ -1579,7 +1663,23 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             sqlite3_bind_int(st, 30, f.unknownSecs);
             BindText(st, 31, f.docResolution);
             if (sqlite3_step(st) != SQLITE_DONE)
-                WARP_LOG_WARN("store", "focus insert failed: %s", sqlite3_errmsg(w.db));
+                throw std::runtime_error(sqlite3_errmsg(w.db));
+            const int64_t rowId = sqlite3_last_insert_rowid(w.db);
+            f.ctx.evidence.resolution = f.docResolution;
+            PersistEvidence(w, "focus", rowId, endMs, f.ctx.evidence);
+            EpisodeRecord episode;
+            episode.id = f.ctx.evidence.episodeId.empty() ? f.ctx.evidence.id : f.ctx.evidence.episodeId;
+            episode.kind = "focus"; episode.revision = f.ctx.evidence.revision;
+            episode.startMs = startMs; episode.endMs = endMs;
+            episode.entityKey = f.docKey; episode.appKey = StoreUtil::AppEntityKey(f.exePath, f.aumid);
+            episode.display = f.docDisplay; episode.title = f.windowTitle;
+            episode.exposureMs = (std::max)(int64_t(0), endMs-startMs);
+            episode.activeMs = f.activeSecs < 0 ? -1 : int64_t(f.activeSecs)*1000;
+            episode.passiveMs = int64_t(f.passiveSecs)*1000; episode.idleMs = int64_t(f.idleSecs)*1000;
+            episode.unknownMs = episode.exposureMs - (std::max)(int64_t(0),episode.activeMs) -
+                episode.passiveMs - episode.idleMs;
+            episode.evidence = f.ctx.evidence; episode.state = f.presence;
+            PersistEpisode(w, episode, rowId);
             FocusEventRecord copy = f;
             copy.endMs = endMs;
             copy.startMs = startMs;
@@ -1624,6 +1724,7 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
 
 bool ActivityStore::RecordPresence(PresenceRecord r)
 {
+    Evidence::Prepare(r.evidence);
     return EnqueueRecord([this, r](WriterContext& w)
     {
         const int64_t endMs = EffectiveMs(r.endMs, w.nowMs);
@@ -1638,12 +1739,29 @@ bool ActivityStore::RecordPresence(PresenceRecord r)
             parts = UnpurgedParts(r.startMs, endMs, RecordIds{});   // an interval still open during a purge
         for (const auto& p : parts)
         {
+            ObservationEvidence evidence = r.evidence;
+            if (p.first != r.startMs || p.second != endMs)
+                evidence.id += ":" + std::to_string(p.first) + ":" + std::to_string(p.second);
+            if (EvidenceExists(w, evidence)) continue;
             sqlite3_stmt* st = w.Stmt(kInsPresence);
             if (!st) return;
             sqlite3_bind_int64(st, 1, p.first / 1000);
             sqlite3_bind_int64(st, 2, p.second / 1000);
             BindText(st, 3, r.state);
-            sqlite3_step(st);
+            if (sqlite3_step(st) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+            const int64_t rowId = sqlite3_last_insert_rowid(w.db);
+            PersistEvidence(w, "presence", rowId, p.second, evidence);
+            EpisodeRecord episode;
+            episode.id = evidence.episodeId.empty() ? evidence.id : evidence.episodeId;
+            episode.kind = "presence"; episode.revision = evidence.revision;
+            episode.startMs = p.first; episode.endMs = p.second; episode.state = r.state;
+            episode.exposureMs = (std::max)(int64_t(0),p.second-p.first);
+            episode.activeMs = r.state=="active" ? episode.exposureMs : 0;
+            episode.passiveMs = r.state=="passive" ? episode.exposureMs : 0;
+            episode.idleMs = r.state=="away" || r.state=="locked" || r.state=="asleep" ? episode.exposureMs : 0;
+            episode.unknownMs = episode.exposureMs-episode.activeMs-episode.passiveMs-episode.idleMs;
+            episode.evidence = evidence;
+            PersistEpisode(w, episode, rowId);
             PresenceRecord piece = r;
             piece.startMs = p.first;
             piece.endMs = p.second;
@@ -1743,21 +1861,26 @@ namespace
     }
 }
 
-std::vector<FileActivity> ActivityStore::QueryFiles(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence)
+std::vector<FileActivity> ActivityStore::QueryFiles(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs)
 {
     std::vector<FileActivity> out;
-    ReadLease rl = AcquireReader();
-    if (!rl) return out;
+    ReadLease rl = snapshot ? ReadLease() : AcquireReader();
+    sqlite3* db = snapshot ? snapshot : rl.get();
+    if (!db) return out;
     const char* sql =
         "SELECT id, timestamp, COALESCE(event_ms, timestamp * 1000), action, path, old_path, COALESCE(source, 'etw'), source_exe, entity_key, "
-        "COALESCE(confidence, 1.0), COALESCE(is_dir, 0) FROM file_activity "
+        "COALESCE(confidence, 1.0), COALESCE(is_dir, 0), origin_url, "
+        "(SELECT payload FROM observation WHERE kind='file' AND row_id=file_activity.id) FROM file_activity "
         "WHERE timestamp >= ?1 AND timestamp <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
+        "AND NOT EXISTS(SELECT 1 FROM observation WHERE kind='file' AND row_id=file_activity.id AND received_ms>?6) "
         "AND (?3 = 0 OR timestamp < (SELECT timestamp FROM file_activity WHERE id = ?3) "
         "     OR (timestamp = (SELECT timestamp FROM file_activity WHERE id = ?3) AND id < ?3)) "
         "ORDER BY timestamp DESC, id DESC LIMIT ?5;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(rl.get(), sql, -1, &st, nullptr) != SQLITE_OK) return out;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK)
+    { if (snapshot) throw std::runtime_error(sqlite3_errmsg(db)); return out; }
     BindRange(st, startUtc, endUtc, beforeId, minConfidence, limit);
+    sqlite3_bind_int64(st, 6, asOfMs);
     while (sqlite3_step(st) == SQLITE_ROW)
     {
         FileActivity f;
@@ -1772,26 +1895,33 @@ std::vector<FileActivity> ActivityStore::QueryFiles(int64_t startUtc, int64_t en
         f.entityKey = ColU(st, 8);
         f.confidence = sqlite3_column_double(st, 9);
         f.isDir = sqlite3_column_int(st, 10) != 0;
+        f.originUrl = ColW(st, 11);
+        f.evidence = Evidence::Parse(ColU(st, 12));
         out.push_back(std::move(f));
     }
     sqlite3_finalize(st);
     return out;
 }
 
-std::vector<AppLaunchActivity> ActivityStore::QueryLaunches(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence)
+std::vector<AppLaunchActivity> ActivityStore::QueryLaunches(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs)
 {
     std::vector<AppLaunchActivity> out;
-    ReadLease rl = AcquireReader();
-    if (!rl) return out;
+    ReadLease rl = snapshot ? ReadLease() : AcquireReader();
+    sqlite3* db = snapshot ? snapshot : rl.get();
+    if (!db) return out;
     const char* sql =
-        "SELECT id, timestamp, exe_name, exe_path, pid, creator_exe, aumid, COALESCE(confidence, 1.0) FROM app_launch_activity "
+        "SELECT id, timestamp, exe_name, exe_path, pid, creator_exe, aumid, COALESCE(confidence, 1.0), COALESCE(event_ms,timestamp*1000), "
+        "(SELECT payload FROM observation WHERE kind='launch' AND row_id=app_launch_activity.id) FROM app_launch_activity "
         "WHERE timestamp >= ?1 AND timestamp <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
+        "AND NOT EXISTS(SELECT 1 FROM observation WHERE kind='launch' AND row_id=app_launch_activity.id AND received_ms>?6) "
         "AND (?3 = 0 OR timestamp < (SELECT timestamp FROM app_launch_activity WHERE id = ?3) "
         "     OR (timestamp = (SELECT timestamp FROM app_launch_activity WHERE id = ?3) AND id < ?3)) "
         "ORDER BY timestamp DESC, id DESC LIMIT ?5;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(rl.get(), sql, -1, &st, nullptr) != SQLITE_OK) return out;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK)
+    { if (snapshot) throw std::runtime_error(sqlite3_errmsg(db)); return out; }
     BindRange(st, startUtc, endUtc, beforeId, minConfidence, limit);
+    sqlite3_bind_int64(st, 6, asOfMs);
     while (sqlite3_step(st) == SQLITE_ROW)
     {
         AppLaunchActivity a;
@@ -1803,27 +1933,34 @@ std::vector<AppLaunchActivity> ActivityStore::QueryLaunches(int64_t startUtc, in
         a.creatorExe = ColW(st, 5);
         a.aumid = ColW(st, 6);
         a.confidence = sqlite3_column_double(st, 7);
+        a.eventMs = sqlite3_column_int64(st, 8);
+        a.evidence = Evidence::Parse(ColU(st, 9));
         out.push_back(std::move(a));
     }
     sqlite3_finalize(st);
     return out;
 }
 
-std::vector<BrowsingActivity> ActivityStore::QueryBrowsing(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence)
+std::vector<BrowsingActivity> ActivityStore::QueryBrowsing(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs)
 {
     std::vector<BrowsingActivity> out;
-    ReadLease rl = AcquireReader();
-    if (!rl) return out;
+    ReadLease rl = snapshot ? ReadLease() : AcquireReader();
+    sqlite3* db = snapshot ? snapshot : rl.get();
+    if (!db) return out;
     const char* sql =
         "SELECT id, timestamp, browser, title, url, host, doc_id, entity_key, COALESCE(dwell_secs, 0), COALESCE(confidence, 1.0), "
-        "COALESCE(window_id, 0) FROM browsing_activity "
+        "COALESCE(window_id, 0), COALESCE(event_ms,timestamp*1000), "
+        "(SELECT payload FROM observation WHERE kind='browse' AND row_id=browsing_activity.id) FROM browsing_activity "
         "WHERE timestamp >= ?1 AND timestamp <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
+        "AND NOT EXISTS(SELECT 1 FROM observation WHERE kind='browse' AND row_id=browsing_activity.id AND received_ms>?6) "
         "AND (?3 = 0 OR timestamp < (SELECT timestamp FROM browsing_activity WHERE id = ?3) "
         "     OR (timestamp = (SELECT timestamp FROM browsing_activity WHERE id = ?3) AND id < ?3)) "
         "ORDER BY timestamp DESC, id DESC LIMIT ?5;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(rl.get(), sql, -1, &st, nullptr) != SQLITE_OK) return out;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK)
+    { if (snapshot) throw std::runtime_error(sqlite3_errmsg(db)); return out; }
     BindRange(st, startUtc, endUtc, beforeId, minConfidence, limit);
+    sqlite3_bind_int64(st, 6, asOfMs);
     while (sqlite3_step(st) == SQLITE_ROW)
     {
         BrowsingActivity b;
@@ -1838,28 +1975,37 @@ std::vector<BrowsingActivity> ActivityStore::QueryBrowsing(int64_t startUtc, int
         b.dwellSecs = sqlite3_column_int(st, 8);
         b.confidence = sqlite3_column_double(st, 9);
         b.windowId = sqlite3_column_int64(st, 10);
+        b.eventMs = sqlite3_column_int64(st, 11);
+        b.evidence = Evidence::Parse(ColU(st, 12));
         out.push_back(std::move(b));
     }
     sqlite3_finalize(st);
     return out;
 }
 
-std::vector<AppFocusActivity> ActivityStore::QueryFocus(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence)
+std::vector<AppFocusActivity> ActivityStore::QueryFocus(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs)
 {
     std::vector<AppFocusActivity> out;
-    ReadLease rl = AcquireReader();
-    if (!rl) return out;
+    ReadLease rl = snapshot ? ReadLease() : AcquireReader();
+    sqlite3* db = snapshot ? snapshot : rl.get();
+    if (!db) return out;
     const char* sql =
         "SELECT id, timestamp, COALESCE(start_ts, timestamp - duration_secs), COALESCE(end_ts, timestamp), exe_name, exe_path, window_title, "
         "duration_secs, active_secs, doc_key, doc_display, doc_type, COALESCE(confidence, 1.0), aumid, passive_secs, idle_secs, unknown_secs, "
-        "COALESCE(doc_resolution, CASE WHEN COALESCE(doc_key,'')='' THEN 'unresolved' ELSE 'legacy_candidate' END) FROM app_focus_activity "
+        "COALESCE(doc_resolution, CASE WHEN COALESCE(doc_key,'')='' THEN 'unresolved' ELSE 'legacy_candidate' END), "
+        "(SELECT payload FROM observation WHERE kind='focus' AND row_id=app_focus_activity.id), "
+        "COALESCE((SELECT start_ms FROM activity_episode WHERE kind='focus' AND raw_id=app_focus_activity.id LIMIT 1),start_ts*1000,(timestamp-duration_secs)*1000),"
+        "COALESCE(event_ms,end_ts*1000,timestamp*1000) FROM app_focus_activity "
         "WHERE COALESCE(end_ts, timestamp) >= ?1 AND COALESCE(start_ts, timestamp - duration_secs) <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
+        "AND NOT EXISTS(SELECT 1 FROM observation WHERE kind='focus' AND row_id=app_focus_activity.id AND received_ms>?6) "
         "AND (?3 = 0 OR COALESCE(end_ts, timestamp) < (SELECT COALESCE(end_ts, timestamp) FROM app_focus_activity WHERE id = ?3) "
         "     OR (COALESCE(end_ts, timestamp) = (SELECT COALESCE(end_ts, timestamp) FROM app_focus_activity WHERE id = ?3) AND id < ?3)) "
         "ORDER BY COALESCE(end_ts, timestamp) DESC, id DESC LIMIT ?5;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(rl.get(), sql, -1, &st, nullptr) != SQLITE_OK) return out;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK)
+    { if (snapshot) throw std::runtime_error(sqlite3_errmsg(db)); return out; }
     BindRange(st, startUtc, endUtc, beforeId, minConfidence, limit);
+    sqlite3_bind_int64(st, 6, asOfMs);
     while (sqlite3_step(st) == SQLITE_ROW)
     {
         AppFocusActivity f;
@@ -1885,6 +2031,9 @@ std::vector<AppFocusActivity> ActivityStore::QueryFocus(int64_t startUtc, int64_
                                     (std::max)(0, f.passiveSecs) - (std::max)(0, f.idleSecs));
         f.attentionStatus = legacy ? "legacy_combined" : (f.activeSecs < 0 || f.unknownSecs > 0 ? "unknown" : "measured");
         f.docResolution = ColU(st, 17);
+        f.evidence = Evidence::Parse(ColU(st, 18));
+        f.startMs = sqlite3_column_int64(st, 19);
+        f.endMs = sqlite3_column_int64(st, 20);
         out.push_back(std::move(f));
     }
     sqlite3_finalize(st);
@@ -2061,6 +2210,7 @@ void ActivityStore::DoMaintenance(WriterContext& w)
         TombstoneEntity(w, m_sinks, e.first, e.second, "retention");
 
     for (IWriterSink* s : m_sinks) s->OnMaintenance(w, now);
+    PruneEvidence(w);
     WARP_LOG_INFO("store", "maintenance: %lld raw/derived rows and %zu entities expired (raw=%dd, entity=%dd)",
                   (long long)n, stale.size(), m_rawRetentionDays.load(), m_entityRetentionDays.load());
 }
@@ -2090,6 +2240,7 @@ void ActivityStore::DoClearAll(WriterContext& w)
         "file_activity", "app_launch_activity", "browsing_activity", "app_focus_activity", "inference",
         "entity_day", "tombstone", "presence_interval", "context_snapshot", "edge", "work_session",
         "work_thread", "thread_member", "thread_span", "clipboard_activity", "print_activity", "session_attention", "entity_alias",
+        "observation", "activity_episode", "source_coverage", "artifact_alias", "privacy_scope",
     };
     for (const char* t : kTables)
     {
@@ -2140,6 +2291,26 @@ bool ActivityStore::ClearAll(DWORD timeoutMs)
 int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
 {
     int64_t n = 0;
+    if (!spec.entityKey.empty())
+    {
+        std::vector<std::string> aliases;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(w.db,"SELECT DISTINCT path_key FROM artifact_alias WHERE artifact_id IN "
+            "(SELECT artifact_id FROM artifact_alias WHERE path_key=?1)",-1,&st,nullptr)==SQLITE_OK)
+        {
+            BindText(st,1,spec.entityKey);
+            while (sqlite3_step(st)==SQLITE_ROW) aliases.push_back(ColU(st,0));
+            sqlite3_finalize(st);
+        }
+        // Remove the alias graph first so recursive purges cannot revisit it.
+        if (sqlite3_prepare_v2(w.db,"DELETE FROM artifact_alias WHERE artifact_id IN "
+            "(SELECT artifact_id FROM artifact_alias WHERE path_key=?1)",-1,&st,nullptr)==SQLITE_OK)
+        {
+            BindText(st,1,spec.entityKey); sqlite3_step(st); sqlite3_finalize(st);
+        }
+        for (const auto& alias:aliases) if (alias!=spec.entityKey)
+        { PurgeSpec linked; linked.entityKey=alias; n+=DoPurge(w,linked); }
+    }
     auto bindRun = [&](const char* sql, const std::string& a, const std::string& b = std::string()) -> int64_t
     {
         sqlite3_stmt* st = nullptr;
@@ -2775,6 +2946,7 @@ int64_t ActivityStore::DoPurge(WriterContext& w, const PurgeSpec& spec)
             AddFloor(w, PurgeFloor{ 0, std::string(), a * 1000, b >= nowSec ? w.nowMs - 1 : b * 1000 + 999 });
     }
 
+    PurgeEvidence(w,spec);
     n += ScrubThreadsAfterPurge(w, std::move(threads));
     // Purges change derived tables underneath the sinks' write-through caches (thread members, entity
     // rows): drop the caches so nothing purged is written back from memory.

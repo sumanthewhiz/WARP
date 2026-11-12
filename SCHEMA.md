@@ -1,15 +1,157 @@
-# WARP storage schema v3
+# WARP storage schema v4
 
-The `dev` Phase A update uses **SQLite schema 3**, **API version 2**, and
+The `dev` Phase B update uses **SQLite schema 4**, **API version 2**, and
 **identity format 2**. These version numbers describe different contracts.
-`ActivityStore::Migrate` / `MigrateV3` are authoritative; consumers should normally
+`ActivityStore::Migrate` / `MigrateV3` / `MigrateV4` are authoritative; consumers should normally
 use [API.md](API.md), not write the database directly.
 
 The database remains `%LOCALAPPDATA%\WARP\activity.db`: WAL, one writer,
 transactional raw/derived updates, bounded producer queue, three pooled readers.
 There are no SQL foreign keys; the writer maintains the logical relationships.
 
-## Changes from v2
+## Phase B: durable evidence
+
+Schema v4 adds five tables without rewriting legacy raw rows:
+
+| Table | Stored contract |
+|---|---|
+| `observation` | `id` (stable event ID), `kind`, `row_id`, `event_ms`, `received_ms`, JSON `payload`, `change_seq`. Unique `(kind,row_id)`. The envelope commits with the corresponding typed row and derived updates. |
+| `activity_episode` | Immutable `(episode_id,revision)` slices: `kind`, millisecond bounds, `entity_key`, `app_key`, `display`, `title`, exposure/active/passive/idle/unknown milliseconds, `state`, supporting `raw_id`, `received_ms`, provenance `payload`. |
+| `source_coverage` | `(source,instance,start_ms)` checkpoints with `end_ms`, `state`, `reason`, lost/failed observation count and `received_ms`. No excluded titles, URLs or document content. |
+| `artifact_alias` | `(path_key,from_ms)`, exclusive `to_ms` (0 means not closed), `artifact_id`, full-width `physical_id`, `basis`, supporting `evidence_id`. Separate from the v3 URL compatibility aliases. |
+| `privacy_scope` | Bounded durable scoped-purge floors: kind, scope hash and time bounds. Prevents old records from reappearing after restart without retaining plaintext scope strings in this table. |
+
+```mermaid
+flowchart LR
+    Collectors["Collectors: event time + observation context"] --> Typed["Typed raw rows"]
+    Collectors --> Provenance["observation: provenance and receipt time"]
+    Focus["Focus / presence: incremental slices"] --> Episodes["activity_episode"]
+    Web["Page identity + bounded URL rechecks"] --> Episodes
+    Health["Collector health and loss counters"] --> Coverage["source_coverage"]
+    Typed --> Alias["artifact_alias: valid-time lineage"]
+    Typed --> Reader["One SQLite read snapshot"]
+    Provenance --> Reader
+    Episodes --> Reader
+    Coverage --> Reader
+    Reader --> Canonical["Canonical selected evidence"]
+    Canonical --> Projections["Combined / facets / items / consumer entities"]
+    Reader --> EvidenceAPI["GetContextEvidence"]
+    Projections --> IntervalAPI["GetIntervalContext"]
+```
+
+### Observation envelope
+
+`payload` is the same `provenance` object exposed by raw event queries and
+`GetContextEvidence`. It records:
+
+- Stable `event_id`, runtime `source_instance`, `observed_ms`, `received_ms`,
+  source `timestamp_kind`, `replayed`, `confirmation`, and rule version.
+- `process_instance`, `foreground_instance`, session ID, `actor_method`,
+  attribution age and foreground-context sample age. Unknown attribution does
+  not become the foreground application at delayed emission time.
+- Resolution method, observation/validity times, redaction class, and separately
+  qualified source/actor/identity rule weights. Missing weights are JSON null.
+  These weights are **not calibrated probabilities**.
+- When supplied by the source: full-width file ID, volume, journal ID, USN/reason
+  information, originating Office app and canonical mapped cloud URL.
+- Episode/window instance IDs, revision, continuation state and boundary reason.
+  `support_count` counts known supporting observations, not all subsequently
+  suppressed duplicates. `observed_utc_offset_minutes` describes the observation,
+  not an inferred historical time zone.
+
+Legacy rows have `available:false` provenance and no invented observation or
+receipt timestamps. Read APIs retain them but qualify their evidence/coverage as
+partial. A source receipt timestamp is not evidence that a recency-list item was
+opened at receipt time. Replayed file events have unknown contemporaneous
+presence and actor attribution.
+USN IDs are derived from volume/journal/USN/kind; Recent/MRU IDs use the source
+identity and source timestamp. They remain stable across process restarts.
+Untimed recency entries are labeled `recency_observation`, not fresh opens.
+They do not receive fresh engagement credit. File IDs are 32 lowercase hex
+digits (high 64 bits followed by low 64 bits; NTFS has a zero high half), scoped
+by the volume identity.
+
+### Physical and logical file identity
+
+The physical key uses the volume and both 64-bit halves of a file ID; it does not
+use the reader's legacy folded `fileRef`. Path-only evidence is marked
+`path_fallback`. A known explicit rename retains its artifact ID and closes the
+old path's validity interval. A modification/atomic replacement at the same path
+can retain the logical artifact while recording a different physical instance.
+A new create/copy is not assumed to be the same artifact. Ambiguous or missing
+identity remains a fallback, not a basename join.
+
+Raw paths remain paths-at-observation. `ResolveFileIdentity` exposes the recorded
+lineage and its validity intervals; API v2 path keys are not silently replaced by
+artifact IDs. Aliases require retained supporting observations. ReFS IDs, copies
+across volumes, paths reused for new creates, and safe-save lineage have native
+fixtures. This is not a full filesystem inventory or proof of arbitrary moves
+that happened outside capture.
+
+### Checkpoints and page episodes
+
+Focus and presence target 30-second incremental checkpoints. Each slice has a
+stable episode ID and increasing revision; replaying the same event ID does not
+credit engagement twice. Focus samples retain active/passive/idle/unknown
+separately. Away/lock/sleep boundaries are **detected transition times**; they do
+not retroactively erase already-checkpointed foreground exposure.
+
+Page episodes record foreground exposure, not interaction time. They close on
+navigation, loss of foreground, pause/withholding, window destruction and clean
+shutdown, even without a successor page. A continuing page is checkpointed.
+`open:true` means the slice ended at a continuing checkpoint; consumers must
+never extend its end after a crash. A new foreground visit/window gets an opaque
+instance; process identity and destruction handling prevent cached identity from
+being carried across observed PID/HWND reuse.
+
+Foreground URL rechecks are bounded (approximately 5-7 seconds plus UIA
+latency/retry). Same-title URL changes can therefore be detected without reading
+typed omnibox text. Unknown private-window status fails closed; incomplete UIA
+walks no longer become permission to persist content. Browser-version coverage
+still requires real-browser validation. Pending reads are tied to the window
+instance and uninterrupted foreground generation; late replies cannot reopen
+background/replaced windows or change their privacy verdict. A recorded page
+boundary is the verified observation time, not an earlier queued title event
+or a claim about the exact browser navigation time.
+
+The 30-second cadence is not a universal crash-loss guarantee: scheduler stalls,
+queue pressure, write failures and unavailable sources can lose more. Coverage
+and dropped counters expose these limitations; uncheckpointed time is unknown.
+Legacy `browsing_activity.dwell_secs` keeps its previous-page meaning for API
+compatibility. New consumers use page episodes.
+
+### Consistent interval reads and lifecycle
+
+`ReadEvidence` materializes all raw types, episodes, coverage and a committed
+watermark inside one SQLite read transaction, then releases it before model
+work. Bounds are `[start_ms,end_ms)`. An `as_of` cutoff excludes observations
+received later. Historic queries do not read today's foreground, presence,
+current thread or long-horizon engagement score.
+
+Coverage is checkpointed for files, launch, browser, focus, presence and storage.
+Disabled, paused, degraded, privacy-withheld and unavailable states are distinct.
+Uncovered periods, including offline/crash gaps, remain unknown. `healthy` means
+the collector was available, **not complete capture recall**. Truncation and the
+new-evidence/retention availability horizon are explicit.
+
+Raw-record deletion triggers remove companion provenance and supported slices.
+Retention expires standalone page slices and coverage at the raw-data horizon.
+Entity purge follows retained file aliases; time purge conservatively removes
+intersecting new slices/aliases/coverage rather than leaving deleted evidence.
+Clear-all empties the five new tables and retains the global cleared-time floor.
+The newest 64 distinct scoped floors persist as hashes; like the existing 64
+merged time floors, this is a bounded replay guard, not a permanent unlimited
+denylist. Hashing is not a claim of anonymization. New activity after the purge
+time remains eligible. Queries intersecting a retained scoped purge expose
+`privacy_redacted:true` and are partial. Legacy raw interval trimming remains in force.
+
+Snapshots persist their actual summary vector in JSON when available, alongside
+the `summary_joined_v1` input profile, model/tokenizer file hashes, dimension and
+normalization. The separate historical label embedding is not silently exposed
+as that summary vector. Old snapshots without a summary vector remain empty.
+Do not compare vectors with missing or different compatibility metadata.
+
+## Earlier v2-to-v3 changes retained in v4
 
 | Area | v3 contract |
 |---|---|
@@ -39,7 +181,8 @@ flowchart LR
 
 Times named `timestamp`, `start_ts`, `end_ts`, `*_ts` are UTC Unix seconds.
 `event_ms` is UTC Unix milliseconds. Focus persists its end in both `timestamp`
-and `event_ms`; its start is currently persisted only to second precision.
+and `event_ms`. New focus episode slices retain millisecond start bounds; the
+read projection prefers these over the second-precision legacy `start_ts`.
 Do not treat integer timestamp precision as exact UI/input timing.
 
 The four core activity tables share the existing `EventContext` fields:
@@ -48,8 +191,8 @@ The four core activity tables share the existing `EventContext` fields:
 `parent_pid`, `parent_exe`, `created_window_ms`, `confidence`.
 
 These are heuristic attribution, not proof of intent or a calibrated model
-probability. Additional receipt/replay/process-instance/coverage fields remain
-Phase B work.
+probability. Schema v4 stores the additional receipt/replay/process-instance
+fields in companion observations, with source availability in coverage rows.
 
 | Table | Persisted fields, in addition to the shared context where applicable |
 |---|---|
@@ -62,7 +205,7 @@ Phase B work.
 | `print_activity` | `id`, `timestamp`, `event_ms`, `document`, `printer`, `pages` |
 
 Browser `dwell_secs` still describes the **previous page** in `window_id`.
-Phase A does not introduce page episodes or claim complete tab/navigation history.
+Schema v4 adds page episodes but does not claim complete tab/navigation history.
 Clipboard metadata does not establish a paste or content-transfer relationship.
 Print owner/client names are checked in memory; they are not added to the table.
 
@@ -125,8 +268,9 @@ Examples:
 Mixed segments do not say *where* inside the interval interaction occurred.
 Their rates are therefore proportional estimates, not exact attention episodes.
 Context clipping uses cumulative floors so adjacent windows conserve measured
-component totals. Second-level quantization and mixed-segment estimation remain
-limitations until finer episodes/checkpoints are implemented.
+component totals. Schema v4 checkpoints bound the size of new slices and retain
+millisecond bounds. Attention counters/work-session totals still have
+second-level quantization, and mixed-slice estimates are not exact input timing.
 
 `work_session` retains `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs`,
 and adds `accounting_version`:
@@ -145,7 +289,7 @@ including after restart. Session totals returned by `QueryTimeline` describe the
 
 | Identity | Normalization |
 |---|---|
-| Windows file | Existing canonical path, invariant lowercase. Full physical file IDs and case-sensitive NTFS/WSL paths are not added in Phase A. |
+| Windows file | API v2 keeps the canonical, invariant-lowercase path. Schema v4 adds qualified physical/logical identities alongside it; case-sensitive NTFS/WSL path semantics are not implemented. |
 | Application | AUMID where available, otherwise canonical exe path. AUMIDs remain case-folded. |
 | URL | Lowercase scheme/authority; preserve canonical path/query case. Privacy filtering happens first in `UrlCanonicalizer`. |
 | Document | Normalize the provider prefix, preserve the provider-normalized payload. The URL canonicalizer still applies provider-specific rules, such as GitHub repository normalization. |
@@ -162,8 +306,8 @@ CREATE TABLE entity_alias (
 CREATE INDEX idx_entity_alias_target ON entity_alias(entity_key);
 ```
 
-This is a **v2 case-correction compatibility map**, not the future file
-rename/physical/logical artifact alias system.
+This is a **v2 case-correction compatibility map**, separate from schema v4's
+`artifact_alias` file rename/physical/logical lineage.
 
 Default lookups use identity format 2 and never consult aliases. In
 `ScoreEntities` / `QueryInferences`, `identity_version: 1` explicitly requests old
@@ -193,6 +337,8 @@ Ordered migrations run transactionally:
    They must discard their old key cache and resync. Surviving feed records are
    resequenced after the reset epoch so multi-page bootstrap cannot get stuck in
    repeated resets, including after old tombstones are pruned.
+7. v4 adds observation, episode, source-coverage, artifact-alias and scoped-privacy
+   tables without fabricating missing historical provenance or checkpoints.
 
 Old entity engagement totals may still contain legacy combined active/passive
 contributions when their identity did not need reconstruction. Phase A does not
@@ -225,7 +371,7 @@ reintroduced. Entity purge removes matching aliases and uses **case-sensitive,
 parsed JSON identity matching** for snapshots, not a lowercased substring.
 References inside prose are removed conservatively as well, without folding
 case-sensitive web/document identities. Scoped item purges retain anonymous session occupancy, as before; whole/time
-purges remove the corresponding occupancy. Clear-all empties both new tables.
+purges remove the corresponding occupancy. Clear-all empties the v3 and v4 derived evidence tables.
 
 ## Public projections and validation
 
@@ -233,4 +379,4 @@ See [API.md](API.md) for nullable attention fields, observed actions, resolution
 status and persisted facet behavior. See
 [tests/SIGNAL_QUALITY.md](tests/SIGNAL_QUALITY.md) for on-demand native replay,
 metric definitions, labeled external observations, and the distinction between
-Phase A invariants and still-unmeasured live/SLM/search quality.
+Phase A/B invariants and still-unmeasured live/SLM/search quality.

@@ -44,6 +44,7 @@
 #include <ctime>
 #include <algorithm>
 #include <cstdio>
+#include <map>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -153,6 +154,10 @@ static std::atomic<bool>  g_subsystemsUp{ false };
 static std::atomic<bool>  g_stopping{ false };
 static std::atomic<int>   g_presenceState{ 0 };        // PresenceState as int
 static std::atomic<int64_t> g_presenceSinceMs{ 0 };
+static std::mutex          g_presenceEvidenceMutex;
+static std::string         g_presenceEpisode;
+static int                 g_presenceRevision = 0;
+static bool                g_presenceEvidencePaused = false;
 static bool               g_capturePausedApplied = false;
 static UINT               g_wmTaskbarCreated = 0;
 static int64_t            g_startedUtc = 0;
@@ -1726,10 +1731,75 @@ void PurgeRecent(HWND hWnd, int64_t seconds, const wchar_t* label)
 }
 
 // Applies the effective pause state (user pause / policy) to every capture source.
+namespace { std::string PresenceName(); }
+
+static void CheckpointPresence(const char* reason, bool close, const std::string& state, bool paused)
+{
+    std::lock_guard<std::mutex> lock(g_presenceEvidenceMutex);
+    const int64_t now = StoreUtil::NowMs();
+    PresenceRecord r;
+    r.startMs = g_presenceSinceMs.exchange(now); r.endMs = now; r.state = state;
+    if (g_presenceEpisode.empty()) g_presenceEpisode = Evidence::NewId("presence");
+    r.evidence.episodeId = g_presenceEpisode; r.evidence.revision = ++g_presenceRevision;
+    r.evidence.id = g_presenceEpisode + ":" + std::to_string(g_presenceRevision);
+    r.evidence.timestampKind = "presence_sample"; r.evidence.boundaryReason = reason; r.evidence.open = !close;
+    r.evidence.observedMs = now; r.evidence.actorMethod = "device_presence";
+    if (r.startMs>0 && r.endMs>r.startMs && !g_presenceEvidencePaused &&
+        Settings::Instance().Get().capturePresence) g_store.RecordPresence(std::move(r));
+    g_presenceEvidencePaused = paused;
+    if (close) { g_presenceEpisode.clear(); g_presenceRevision = 0; }
+}
+
+static void CheckpointCoverage()
+{
+    static std::mutex mutex;
+    static int64_t since = 0;
+    static std::map<std::string,std::pair<std::string,uint64_t>> previous;
+    static uint64_t previousWebWithheld = 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    const int64_t now = StoreUtil::NowMs();
+    const auto cfg = Settings::Instance().Get();
+    const bool paused = Settings::Instance().IsPaused(now/1000);
+    const auto files = g_files.GetStats();
+    const auto launch = g_launch.GetStats();
+    const auto web = g_web.GetStats();
+    const auto store = g_store.GetStats();
+    auto state = [&](bool enabled, bool running) -> std::string {
+        return !enabled ? "disabled" : paused ? "paused" : running ? "healthy" : "unavailable";
+    };
+    std::map<std::string,std::pair<std::string,uint64_t>> current = {
+        {"files",{state(cfg.captureFiles,files.etwRunning && (files.usnRunning || files.rdcwRoots>0)),files.queueDropped+files.etwEventsLost+files.etwBuffersLost+files.rdcwOverflows}},
+        {"launch",{state(cfg.captureAppLaunch,launch.etwRunning),launch.eventsLost}},
+        {"browser",{state(cfg.captureWeb,web.running && web.uiaAvailable),web.queueDropped+web.uiaTimeouts+web.uiaFailures}},
+        {"focus",{state(cfg.captureFocus,true),0}},
+        {"presence",{state(cfg.capturePresence,true),0}},
+        {"storage",{g_store.IsOpen() ? "healthy" : "unavailable",store.dropped+store.writeErrors}}
+    };
+    if (files.etwUnconfirmed && current["files"].first=="healthy") current["files"].first="degraded";
+    for (const auto& pair:current)
+    {
+        if (!since) break;
+        const auto old=previous.find(pair.first);
+        SourceCoverage c; c.source=pair.first; c.startMs=since; c.endMs=now;
+        c.state=old==previous.end() ? "unknown" : old->second.first;
+        c.dropped=old==previous.end() || pair.second.second<old->second.second ? 0 : pair.second.second-old->second.second;
+        if (c.dropped) { c.state="degraded"; c.reason="lost_or_failed_observations"; }
+        else if (pair.second.first!=c.state) { c.state="degraded"; c.reason="state_transition_within_checkpoint"; }
+        else c.reason=c.state=="healthy" ? "collector_available_not_complete_recall" : c.state;
+        if (c.source=="browser" && web.privateDropped+web.excludedDropped>previousWebWithheld)
+        { c.state="privacy_withheld"; c.reason="private_or_excluded_content"; }
+        g_store.RecordCoverage(std::move(c));
+    }
+    since=now; previous=std::move(current);
+    previousWebWithheld=web.privateDropped+web.excludedDropped;
+}
+
 void ApplyPauseState()
 {
     const bool paused = Settings::Instance().IsPaused((int64_t)time(nullptr));
     if (paused == g_capturePausedApplied) return;
+    CheckpointPresence(paused ? "pause" : "resume",true,PresenceName(),paused);
+    CheckpointCoverage();
     g_capturePausedApplied = paused;
     g_files.SetPaused(paused);
     g_launch.SetPaused(paused);
@@ -1825,7 +1895,8 @@ namespace
         WebCapture::PageInfo page;
         if (g_web.LookupPage(root, page))
         {
-            if (page.isPrivate || page.excluded) return false;
+            if (page.isPrivate || page.excluded || !page.privacyKnown) return false;
+            if (NowUtcMs()-page.observedMs>30000) { out.resolution="stale"; return false; }
             if (page.url.empty() && page.docId.empty()) return false;
             std::wstring pt = DocResolver::NormalizeTitle(page.title);
             if (!pt.empty() && title.find(pt) == std::wstring::npos && pt.find(title) == std::wstring::npos) return false;
@@ -1833,6 +1904,8 @@ namespace
             out.display = page.url;
             out.type = "url";
             out.resolution = "browser_window";
+            out.instance = page.pageInstance;
+            out.observedMs = page.observedMs; out.validUntilMs = page.observedMs+30000; out.confidence = 0.9;
             return !out.key.empty();
         }
         std::wstring exeLower = EntityKey::FromUtf8(EntityKey::Key(EntityKey::BaseName(exePath)));
@@ -1854,6 +1927,7 @@ namespace
         out.display = path;
         out.type = "file";
         out.resolution = "filename_candidate";
+        out.observedMs = NowUtcMs(); out.validUntilMs = out.observedMs+3000; out.confidence = 0.5;
         return !out.key.empty();
     }
 
@@ -1863,7 +1937,9 @@ namespace
         if (Settings::Instance().IsExcludedApp(exePath)) return FocusTracker::Redaction::DropAll;
         if (g_web.IsPrivateWindow(root)) return FocusTracker::Redaction::DropContent;
         WebCapture::PageInfo page;
-        if (g_web.LookupPage(root, page) && page.excluded) return FocusTracker::Redaction::DropContent;
+        const bool knownPage = g_web.LookupPage(root, page);
+        if (knownPage && (page.excluded || !page.privacyKnown)) return FocusTracker::Redaction::DropContent;
+        if (!knownPage && WebCapture::IsBrowserProcess(exePath)) return FocusTracker::Redaction::DropContent;
         if (Settings::Instance().IsExcludedTitle(title)) return FocusTracker::Redaction::DropContent;
         return FocusTracker::Redaction::None;
     }
@@ -1889,7 +1965,8 @@ namespace
          .KV("last_event_ms", l.lastEventMs);
         if (full) w.KV("last_error", l.lastError);
         w.EndObject();
-        w.Key("web").BeginObject().KV("enabled", cfg.captureWeb).KV("pages", wb.pages).KV("private_dropped", wb.privateDropped)
+        w.Key("web").BeginObject().KV("enabled", cfg.captureWeb).KV("running",wb.running).KV("uia_available",wb.uiaAvailable)
+         .KV("pages", wb.pages).KV("private_dropped", wb.privateDropped)
          .KV("excluded_dropped", wb.excludedDropped).KV("uia_requests", wb.uiaRequests).KV("uia_timeouts", wb.uiaTimeouts)
          .KV("uia_failures", wb.uiaFailures).KV("last_event_ms", wb.lastEventMs).EndObject();
         w.KV("focus_enabled", cfg.captureFocus);
@@ -1933,13 +2010,10 @@ void StartSubsystems()
     PresenceMonitor& pm = PresenceMonitor::Instance();
     pm.Configure((DWORD)cfg.awayAfterSeconds * 1000);
     g_presenceSinceMs = NowUtcMs();
+    g_presenceEvidencePaused = Settings::Instance().IsPaused(StoreUtil::NowUtc());
     pm.AddListener([](PresenceState oldState, PresenceState newState, const PresenceSnapshot& snap) {
         const int64_t now = NowUtcMs();
-        PresenceRecord r;
-        r.startMs = g_presenceSinceMs.exchange(now);
-        r.endMs = now;
-        r.state = PresenceStateName(oldState);
-        if (!Settings::Instance().IsPaused(now / 1000)) g_store.RecordPresence(std::move(r));   // paused: nothing is recorded
+        CheckpointPresence(PresenceStateName(newState),true,PresenceStateName(oldState),Settings::Instance().IsPaused(now/1000));
         g_presenceState = (int)newState;
         g_focus.OnPresenceChanged(PresenceStateName(newState), snap.lastInputUtc * 1000);
     });
@@ -1954,13 +2028,14 @@ void StartSubsystems()
     g_files.SetCursorStore(
         [](const std::wstring& volume, std::string& blob) { return g_store.GetMeta("usn:" + EntityKey::Key(volume), blob); },
         [](const std::wstring& volume, const std::string& blob) { g_store.SetMeta("usn:" + EntityKey::Key(volume), blob); });
+    g_files.SetCloudCallback([](BrowseEventRecord&& r) { g_store.RecordBrowse(std::move(r)); });
     if (cfg.captureFiles && !g_files.Start())
         WARP_LOG_ERROR("main", "file capture could not start (see earlier errors); the supervisor will keep retrying");
 
     g_launch.SetCallbacks(
         [](LaunchEventRecord&& r) { g_store.RecordLaunch(std::move(r)); },
         [](ProcessExitRecord&& r) { g_store.RecordProcessExit(std::move(r)); });
-    if (cfg.captureAppLaunch) g_launch.Start();
+    if (cfg.captureAppLaunch || cfg.captureFiles || cfg.captureFocus || cfg.captureWeb) g_launch.Start();
 
     if (cfg.captureClipboardMetadata)
         g_clipboard.Start([](const ClipboardEvent& e) {
@@ -2030,6 +2105,7 @@ void StartUiSubsystems()
         if (r.presence.empty()) r.presence = PresenceName();
         g_store.RecordBrowse(std::move(r));
     });
+    g_web.SetEpisodeCallback([](EpisodeRecord&& r) { g_store.RecordPageEpisode(std::move(r)); });
     if (cfg.captureWeb) g_web.Start();
 
     g_focus.SetDocResolver(&ResolveDoc);
@@ -2044,6 +2120,7 @@ void StartUiSubsystems()
     g_subsystemsUp = true;
     g_capturePausedApplied = false;
     ApplyPauseState();
+    CheckpointCoverage();
 
     // RUN-5 supervisor thread: every 30 s restart dead ETW consumers with backoff, poll lost events,
     // reconcile sources with Settings, and retry a file capture that could not start at all.
@@ -2064,6 +2141,9 @@ void StartUiSubsystems()
                 Log::SetMinLevel((Log::Level)(std::max)(0, (std::min)(3, live.logLevel)));
                 g_files.Heartbeat();
                 g_launch.Heartbeat();
+                g_web.Heartbeat();
+                CheckpointPresence("checkpoint",false,PresenceName(),Settings::Instance().IsPaused(StoreUtil::NowUtc()));
+                CheckpointCoverage();
                 // A running FileCapture restarts its own dead sources in Heartbeat; Start() is only retried
                 // when it never started (or stopped) - e.g. capture enabled live, or every source failed.
                 if (live.captureFiles && !g_files.IsRunning() && ++fileRetryTicks >= 10)
@@ -2211,13 +2291,7 @@ void StopSubsystems()
     g_clipboard.Stop();
     g_print.Stop();
     PresenceMonitor::Instance().Stop();
-    {
-        PresenceRecord r;
-        const int64_t now = NowUtcMs();
-        r.startMs = g_presenceSinceMs.exchange(now);
-        r.endMs = now;
-        r.state = PresenceName();
-        if (r.startMs > 0 && g_store.IsOpen() && !Settings::Instance().IsPaused(now / 1000)) g_store.RecordPresence(std::move(r));
-    }
+    CheckpointPresence("shutdown",true,PresenceName(),true);
+    CheckpointCoverage();
     g_store.Close();                                         // drains the writer queue (bounded)
 }

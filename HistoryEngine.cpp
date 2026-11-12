@@ -805,8 +805,11 @@ std::vector<WorkThreadInfo> HistoryEngine::GetThreads(int64_t startUtc, int64_t 
             sqlite3_bind_int64(sp, 3, endUtc);
             while (sqlite3_step(sp) == SQLITE_ROW)
             {
-                t.spans.emplace_back(sqlite3_column_int64(sp, 0), sqlite3_column_int64(sp, 1));
-                t.activeSecsInRange += sqlite3_column_double(sp, 2);
+                const int64_t a=sqlite3_column_int64(sp,0), b=sqlite3_column_int64(sp,1);
+                const int64_t lo=(std::max)(a,startUtc), hi=(std::min)(b,endUtc);
+                if (hi<=lo) continue;
+                t.spans.emplace_back(lo,hi);
+                if (b>a) t.activeSecsInRange += sqlite3_column_double(sp,2) * double(hi-lo)/double(b-a);
             }
             if (startUtc > 0 && t.spans.empty()) continue;      // touched the range only between spans
         }

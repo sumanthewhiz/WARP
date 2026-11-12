@@ -17,7 +17,8 @@ screenshots or clipboard content.
 
 PHASE A SIGNAL CORRECTNESS (DEV)
 ------------------------------
-  Storage schema 3 separates active, passive, idle and unknown focus time.
+  Schema 3 introduced separate active, passive, idle and unknown focus time;
+  the current schema 4 retains these semantics.
   Zero active time stays zero; overlapping focus/presence is counted once.
   URL paths and opaque document IDs preserve case. Ambiguous file names
   do not identify a specific file. Sparse opens/pages/launches remain useful
@@ -27,6 +28,20 @@ PHASE A SIGNAL CORRECTNESS (DEV)
   Existing data migrates automatically. API clients must honor feed resets
   and must not lowercase arbitrary web keys. See SCHEMA.md and API.md.
   Developers can run tests\run_signal_quality.ps1 from a source checkout.
+
+PHASE B DURABLE EVIDENCE (DEV)
+-----------------------------
+  Storage schema 4 retains source/receipt timing, replay and attribution
+  provenance, full-width file IDs and time-valid logical artifact aliases.
+  Focus, presence and browser page exposure target 30-second checkpoints;
+  final-page exposure no longer needs a later navigation to be recorded.
+  Missing, paused, disabled and degraded source coverage remains explicit.
+  GetContextEvidence and GetIntervalContext read explicit historical
+  [start,end) windows with an observation as_of cutoff. Summaries, facets,
+  model items and consumer entities share one canonical evidence selection.
+  This is not yet a query-conditioned search product or proof of retrieval
+  gains. Startup with large histories and in-place upgrades still have known
+  operational limitations documented in README.md.
 
 
 PRIVACY

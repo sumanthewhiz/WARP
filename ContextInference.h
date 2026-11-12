@@ -50,8 +50,12 @@ struct ContextSnapshot
 {
     int64_t       timestamp      = 0;   // When this snapshot was generated (epoch s).
     int64_t       windowStartTs  = 0;   // Inclusive start of the lookback window (epoch s).
-    int64_t       windowEndTs    = 0;   // Inclusive end of the lookback window (epoch s).
+    int64_t       windowEndTs    = 0;   // Exclusive end of the evidence window (epoch s).
     int64_t       windowSeconds  = 0;   // Width of the lookback window (= windowEndTs - windowStartTs).
+    int64_t       generatedAt = 0, asOfMs = 0, inputWatermark = 0, availableStartMs = 0;
+    bool          partial = true, truncated = false, historical = false, liveOverlay = false;
+    std::string   evidenceJson;
+    std::string   modelRevision, tokenizerRevision;
     // Multi-line "context summary": 1-3 short lines (one per cluster
     // of activity) that semantically describe what the user is doing.
     // Each entry is a separate phrase; consumers render them as
@@ -131,6 +135,8 @@ struct ContextSnapshot
         int         pct          = 0; // % of total focus seconds.
         int         threadId     = 0; // Cluster ID this item belongs to (1-based).
         std::string entityKey;    // Joinable entity key (document/URL when resolved, else app).
+        std::string action;
+        std::vector<std::string> evidenceRefs;
     };
     std::vector<AppItem> items;
 
@@ -154,6 +160,7 @@ struct ContextSnapshot
         int64_t     lastActiveTs = 0;
         int64_t     lastObservedTs = 0;
         double      score        = 0.0; // long-horizon engagement percentile [0,1]
+        std::vector<std::string> evidenceRefs, actions;
     };
     std::vector<EntityItem> entities;
     int64_t      threadId = 0;          // persistent work-thread id (HistoryEngine), 0 if none
@@ -251,6 +258,8 @@ public:
     // Structured current context (API v2 GetCurrentContext): presence, foreground, current
     // entities with keys/roles/active seconds, combined summary.  JSON object.
     std::string GetCurrentContextJson(bool includeVector = false);
+    std::string GetIntervalContext(int64_t startUtc, int64_t endUtc, int64_t asOfUtc,
+                                   const std::string& category = "all", bool includeVector = false);
     void ClearHistory();
 
     // Embedding helper shared with the history layer (thread labels). Empty if no model.
@@ -302,6 +311,7 @@ private:
     Ort::MemoryInfo*     m_ortMemInfo = nullptr;
     bool                 m_modelReady = false;
     std::string          m_modelName;        // "granite-embedding-small-english-r2" or empty
+    std::string          m_modelRevision, m_tokenizerRevision;
 
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;
@@ -324,7 +334,8 @@ private:
     // Compose a fresh snapshot covering the last `windowSecs` seconds of
     // activity.  Pass 0 to use the default 15-minute window.  `allowLlm` is false for
     // on-demand windows (the LLM never runs on a client's request path).
-    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true, int64_t asOf = 0);
+    ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true, int64_t asOf = 0,
+                                     int64_t knowledgeAsOfMs = 0, bool historical = false);
 
     // Decide whether `snap` is materially different from the last-appended
     // history entry.  Used to keep `GetRecentContexts` from returning rows

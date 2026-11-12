@@ -77,12 +77,12 @@ namespace
     }
 }
 
-TEST(Store, OpensFreshDatabaseAtSchemaV3)
+TEST(Store, OpensFreshDatabaseAtSchemaV4)
 {
     Fixture f;
     REQUIRE(f.open);
     ActivityStore::Stats s = f.store.GetStats();
-    CHECK_EQ(s.schemaVersion, 3);
+    CHECK_EQ(s.schemaVersion, 4);
     std::string fts;
     CHECK(f.store.GetMeta("fts_available", fts));
     CHECK_EQ(fts, std::string("1"));                  // the test build compiles SQLite with FTS5
@@ -646,7 +646,7 @@ TEST(Store, MigratesALegacyV1Database)
     store.AddSink(&ents);
     store.AddSink(&hist);
     REQUIRE(store.Open(path));
-    CHECK_EQ(store.GetStats().schemaVersion, 3);
+    CHECK_EQ(store.GetStats().schemaVersion, 4);
 
     EntityRecord plan = ents.Lookup({ EntityKey::FileKey(L"C:\\Legacy\\Plan.DOCX") })[0];
     REQUIRE(!plan.entityKey.empty());

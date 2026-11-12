@@ -69,6 +69,7 @@ public:
     FileCapture& operator=(const FileCapture&) = delete;
 
     void SetCallback(Callback cb);
+    void SetCloudCallback(std::function<void(BrowseEventRecord&&)> cb);
 
     // Persist USN cursors (WARP stores them in its DB meta table as strings keyed by volume).
     // Keys are the volume GUID paths reported by UsnJournalReader; the Recent-items and

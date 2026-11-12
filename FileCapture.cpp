@@ -1301,6 +1301,7 @@ enum RdcwAction : uint8_t { kRdcwAdded = 1, kRdcwRemoved = 2, kRdcwModified = 3,
 // Item from a polling source (USN, RDCW, Recent, MRU).
 struct PullItem
 {
+    ObservationEvidence evidence;
     PullKind     kind = PullKind::Usn;
     uint8_t      sub = 0;          // UsnFileEvent::Kind or RdcwAction
     bool         isDir = false;
@@ -1342,6 +1343,8 @@ enum class Src : uint8_t { Etw, Usn, Rdcw, Recent, Mru };
 // A decided file event on its way to the callback (possibly held for coalescing).
 struct Output
 {
+    EventContext ctx;
+    ObservationEvidence evidence;
     Act          act = Act::Open;
     Src          src = Src::Etw;
     std::wstring path;
@@ -1513,6 +1516,7 @@ struct FileCapture::Impl
     // ---- configuration ----
     std::mutex cbMtx;
     Callback   callback;
+    std::function<void(BrowseEventRecord&&)> cloudCallback;
     std::mutex cursorMtx;
     LoadFn     cursorLoad;
     SaveFn     cursorSave;
@@ -1690,7 +1694,7 @@ struct FileCapture::Impl
     void  ProcessPull(PullItem& item);
     void  ProcessUsn(PullItem& item);
     void  ProcessRdcw(PullItem& item);
-    void  ProcessExplicitOpen(const std::wstring& rawPath, Src src, int64_t utcMs, bool backfill);
+    void  ProcessExplicitOpen(const std::wstring& rawPath, Src src, int64_t utcMs, bool backfill, const ObservationEvidence& evidence);
     void  ProcessDue(ULONGLONG now, bool flushAll);
     void  DecideAndSubmitRename(const std::wstring& src, const std::wstring& dst, const Output& base);
     void  Submit(Output&& o);
@@ -2635,6 +2639,8 @@ void FileCapture::Impl::QueryEtwLoss()
 // ==========================================================================================
 bool FileCapture::Impl::PushPull(PullItem&& item)
 {
+    item.evidence.observedMs = NowUnixMs();
+    item.evidence.replayed = item.backfill;
     std::unique_lock<std::mutex> lk(qMtx);
     while (pullQ.size() >= kPullQueueCap)
     {
@@ -2677,6 +2683,16 @@ void FileCapture::Impl::OnUsnEvent(const UsnFileEvent& ev)
     item.utcMs = ev.utcMs;
     item.path = ev.path;
     item.oldPath = ev.oldPath;
+    item.evidence.volumeId = EntityKey::Key(ev.volume);
+    char fileId[33]{};
+    sprintf_s(fileId, "%016llx%016llx", (unsigned long long)ev.fileIdHigh, (unsigned long long)ev.fileIdLow);
+    item.evidence.fileId = fileId;
+    item.evidence.journalId = std::to_string(ev.journalId);
+    item.evidence.sourceRecordId = std::to_string(ev.usn) + ":" + std::to_string(ev.reason) + ":" + std::to_string(ev.sourceInfo);
+    item.evidence.timestampKind = "journal_record";
+    item.evidence.confirmation = "journal_observed";
+    item.evidence.id = "usn:" + Evidence::Fingerprint(item.evidence.volumeId + ":" + item.evidence.journalId +
+        ":" + std::to_string(ev.usn) + ":" + std::to_string(item.sub));
     PushPull(std::move(item));
 }
 
@@ -2694,6 +2710,8 @@ void FileCapture::Impl::OnRecentItem(const RecentItemEvent& ev)
     item.utcMs = ev.utcMs;
     item.backfill = ev.backfill;
     item.path = ev.target;
+    item.evidence.timestampKind = ev.utcMs>0 ? "recent_item_time" : "recency_observation";
+    item.evidence.id = "recent:" + Evidence::Fingerprint(EntityKey::FileKey(ev.target) + ":" + std::to_string(ev.utcMs));
     PushPull(std::move(item));
 }
 
@@ -2706,12 +2724,23 @@ void FileCapture::Impl::OnMruItem(const OfficeMruItem& mruItem)
         statFiltered.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    static const std::pair<const wchar_t*,const wchar_t*> kOfficeApps[] = {
+        {L"Word",L"winword.exe"},{L"Excel",L"excel.exe"},{L"PowerPoint",L"powerpnt.exe"},
+        {L"Visio",L"visio.exe"},{L"Access",L"msaccess.exe"},{L"Publisher",L"mspub.exe"}
+    };
+    for (const auto& app:kOfficeApps)
+        if (_wcsicmp(mruItem.app.c_str(),app.first)==0 && Settings::Instance().IsExcludedApp(app.second))
+        { statFiltered.fetch_add(1,std::memory_order_relaxed); return; }
     PullItem item;
     item.kind = PullKind::Mru;
     item.utcMs = mruItem.utcMs;
     item.backfill = mruItem.backfill;
     item.isUrl = mruItem.isUrl;
     item.path = mruItem.pathOrUrl;
+    item.evidence.originApp = StoreUtil::W2U(mruItem.app);
+    item.evidence.timestampKind = mruItem.utcMs>0 ? "mru_last_open" : "recency_observation";
+    const auto identity=mruItem.isUrl ? StoreUtil::W2U(mruItem.pathOrUrl) : EntityKey::FileKey(mruItem.pathOrUrl);
+    item.evidence.id = "mru:" + Evidence::Fingerprint(item.evidence.originApp + ":" + identity + ":" + std::to_string(mruItem.utcMs));
     PushPull(std::move(item));
 }
 
@@ -3095,6 +3124,12 @@ void FileCapture::Impl::ProcessEtwOp(EtwOp& op)
     o.startKey = op.startKey;
     o.remote = vi.remote;
     o.unconfirmed = !op.confirmed;
+    o.ctx = EventContextUtil::CaptureContextAt(op.pid, op.eventMs);
+    o.evidence = o.ctx.evidence;
+    o.evidence.timestampKind = "etw_event";
+    o.evidence.confirmation = op.confirmed ? "operation_success" : "unconfirmed";
+    o.evidence.actorMethod = "source_process";
+    o.evidence.attributionAgeMs = 0;
 
     switch (op.kind)
     {
@@ -3197,22 +3232,35 @@ void FileCapture::Impl::ProcessPull(PullItem& item)
             rdcwDelay.emplace_back(GetTickCount64() + kRdcwDelayMs, std::move(item));
         break;
     case PullKind::Recent:
-        ProcessExplicitOpen(item.path, Src::Recent, item.utcMs, item.backfill);
+        ProcessExplicitOpen(item.path, Src::Recent, item.utcMs, item.backfill, item.evidence);
         break;
     case PullKind::Mru:
         if (item.isUrl)
         {
+            const auto cfg = Settings::Instance().Get();
+            const auto cloud = UrlCanon::Canonicalize(item.path, cfg.excludedDomains, cfg.urlQueryAllowlist);
+            if (cloud.excluded || cloud.canonical.empty()) break;
             std::wstring local;
             if (!OneDriveMapper::Instance().UrlToLocalPath(item.path, local))
             {
-                statFiltered.fetch_add(1, std::memory_order_relaxed);   // cloud-only document
+                BrowseEventRecord row;
+                row.eventMs=item.utcMs; row.source=L"mru"; row.browser=StoreUtil::U2W(item.evidence.originApp.c_str());
+                row.url=cloud.canonical; row.host=cloud.host; row.docId=cloud.docId; row.docKind=cloud.docKind;
+                row.title=cloud.canonical;
+                row.ctx=EventContextUtil::CaptureContextAt(0,item.utcMs,item.backfill);
+                row.ctx.evidence=item.evidence; row.ctx.evidence.resolution="cloud_mru";
+                row.ctx.evidence.confirmation="recency_observed"; row.ctx.evidence.actorMethod="recency_observation";
+                row.presence="unknown";
+                std::lock_guard<std::mutex> lock(cbMtx);
+                if (cloudCallback) cloudCallback(std::move(row));
                 break;
             }
-            ProcessExplicitOpen(local, Src::Mru, item.utcMs, item.backfill);
+            item.evidence.cloudUrl = StoreUtil::W2U(cloud.canonical);
+            ProcessExplicitOpen(local, Src::Mru, item.utcMs, item.backfill, item.evidence);
         }
         else
         {
-            ProcessExplicitOpen(item.path, Src::Mru, item.utcMs, item.backfill);
+            ProcessExplicitOpen(item.path, Src::Mru, item.utcMs, item.backfill, item.evidence);
         }
         break;
     }
@@ -3258,6 +3306,10 @@ void FileCapture::Impl::ProcessUsn(PullItem& item)
     base.startKey = who.startKey;
     base.isDir = item.isDir;
     base.backfill = item.backfill;
+    base.ctx = EventContextUtil::CaptureContextAt(who.pid, eventMs, item.backfill);
+    base.evidence = item.evidence;
+    base.evidence.actorMethod = who.pid ? "opener_association" : "unknown";
+    base.evidence.attributionAgeMs = who.pid ? (std::max)(int64_t(0),eventMs-who.ms) : -1;
     switch (static_cast<UsnFileEvent::Kind>(item.sub))
     {
     case UsnFileEvent::Kind::Created:
@@ -3320,6 +3372,11 @@ void FileCapture::Impl::ProcessRdcw(PullItem& item)
     base.pid = who.pid;
     base.startKey = who.startKey;
     base.remote = IsRemoteDosPath(path);
+    base.ctx = EventContextUtil::CaptureContextAt(who.pid, item.utcMs, item.backfill);
+    base.evidence = item.evidence;
+    base.evidence.timestampKind = "change_notification";
+    base.evidence.actorMethod = who.pid ? "opener_association" : "unknown";
+    base.evidence.attributionAgeMs = who.pid ? (std::max)(int64_t(0),item.utcMs-who.ms) : -1;
     switch (item.sub)
     {
     case kRdcwAdded:
@@ -3355,7 +3412,7 @@ void FileCapture::Impl::ProcessRdcw(PullItem& item)
 
 // Recent .lnk and Office MRU entries: explicit user intent (FILE-11). Only privacy exclusions and
 // transient names apply; built-in "noise" rules are for kernel-observed activity.
-void FileCapture::Impl::ProcessExplicitOpen(const std::wstring& rawPath, Src src, int64_t utcMs, bool backfill)
+void FileCapture::Impl::ProcessExplicitOpen(const std::wstring& rawPath, Src src, int64_t utcMs, bool backfill, const ObservationEvidence& evidence)
 {
     if (!IsFileSystemDosPath(rawPath))
     {
@@ -3386,6 +3443,9 @@ void FileCapture::Impl::ProcessExplicitOpen(const std::wstring& rawPath, Src src
     o.eventMs = eventMs;
     o.backfill = backfill;
     o.isExplicit = true;
+    o.ctx = EventContextUtil::CaptureContextAt(0, eventMs, backfill);
+    o.evidence = evidence;
+    o.evidence.actorMethod = "recency_observation";
     EmitNow(o);
 }
 
@@ -3713,7 +3773,18 @@ void FileCapture::Impl::EmitNow(Output& o)
     rec.source = SrcName(o.src);
     rec.isDir = o.isDir;
     rec.originUrl = o.originUrl;
-    rec.ctx = EventContextUtil::CaptureContext(o.pid);
+    rec.ctx = o.ctx;
+    const auto contextEvidence = rec.ctx.evidence;
+    rec.ctx.evidence = o.evidence;
+    rec.ctx.evidence.processInstance = contextEvidence.processInstance;
+    rec.ctx.evidence.foregroundInstance = contextEvidence.foregroundInstance;
+    rec.ctx.evidence.contextAgeMs = contextEvidence.contextAgeMs;
+    rec.ctx.evidence.sessionId = contextEvidence.sessionId;
+    rec.ctx.evidence.resolution = "observed_path";
+    rec.ctx.evidence.sourceQuality = o.src == Src::Etw ? 0.75 : (o.isExplicit ? 0.95 : 0.7);
+    rec.ctx.evidence.actorQuality = o.backfill || !o.pid ? -1 : (o.src == Src::Etw ? 0.8 : 0.4);
+    rec.ctx.evidence.identityQuality = 1.0;
+    rec.ctx.evidence.replayed = o.backfill;
     if (pe != nullptr)
         rec.ctx.sourceExe = pe->exePath;   // start-key aware: a recycled PID must not lend its image
     if (o.backfill)
@@ -4382,6 +4453,12 @@ void FileCapture::SetCallback(Callback cb)
     m_impl->callback = std::move(cb);
 }
 
+void FileCapture::SetCloudCallback(std::function<void(BrowseEventRecord&&)> cb)
+{
+    std::lock_guard<std::mutex> lock(m_impl->cbMtx);
+    m_impl->cloudCallback=std::move(cb);
+}
+
 void FileCapture::SetCursorStore(std::function<bool(const std::wstring& volume, std::string& blob)> load,
                                  std::function<void(const std::wstring& volume, const std::string& blob)> save)
 {
@@ -4463,11 +4540,15 @@ std::vector<std::wstring> FileCapture::RecentPathsForPid(DWORD pid, DWORD maxAge
     std::vector<std::wstring> out;
     if (pid == 0 || max == 0)
         return out;
+    EventContextUtil::ProcessInfo process;
+    const bool knownInstance=EventContextUtil::LookupProcess(pid,process);
     std::vector<RingItem> items;
     {
         std::lock_guard<std::mutex> lk(m_impl->ringMtx);
         const auto it = m_impl->pidRings.find(pid);
         if (it == m_impl->pidRings.end())
+            return out;
+        if (knownInstance && process.exitMs)
             return out;
         items.assign(it->second.items.begin(), it->second.items.end());
     }
@@ -4477,6 +4558,7 @@ std::vector<std::wstring> FileCapture::RecentPathsForPid(DWORD pid, DWORD maxAge
     {
         if (now - item.ms > static_cast<int64_t>(maxAgeMs))
             continue;
+        if (knownInstance && process.startMs>0 && item.ms<process.startMs) continue;
         out.push_back(item.path);
         if (out.size() >= max)
             break;

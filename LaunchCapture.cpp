@@ -398,7 +398,8 @@ void LaunchCapture::OnProcessStart(PEVENT_RECORD ev)
         ++m_stats.otherSession;
         return;
     }
-    if (m_paused.load() || Settings::Instance().IsPaused(eventMs / 1000)) return;
+    if (m_paused.load() || Settings::Instance().IsPaused(eventMs / 1000) ||
+        !Settings::Instance().Get().captureAppLaunch) return;
 
     const std::wstring exeName = BaseName(exePath);
     const std::wstring nameLower = Lower(exeName);
@@ -434,7 +435,14 @@ void LaunchCapture::OnProcessStart(PEVENT_RECORD ev)
         if (PackageFamilyNameFromFullName(packageFullName.c_str(), &len, family) == ERROR_SUCCESS)
             p.rec.aumid = std::wstring(family) + L"!" + relativeAppId;
     }
-    p.rec.ctx = EventContextUtil::CaptureContext(pid);
+    p.rec.ctx = EventContextUtil::CaptureContextAt(pid, eventMs);
+    p.rec.ctx.evidence.timestampKind = "process_creation";
+    p.rec.ctx.evidence.actorMethod = "process_creation_not_gesture";
+    p.rec.ctx.evidence.confirmation = "process_created";
+    p.rec.ctx.evidence.resolution = "process";
+    p.rec.ctx.evidence.sourceQuality = 1;
+    p.rec.ctx.evidence.actorQuality = 0.3;
+    p.rec.ctx.evidence.identityQuality = 1;
     p.rec.ctx.parentPid = parent;
     p.rec.ctx.parentExe = parentPath;
     p.parkedTick = GetTickCount64();
@@ -449,6 +457,7 @@ void LaunchCapture::OnProcessStart(PEVENT_RECORD ev)
     }
     if (shown || HasUserFacingWindowNow(pid))
     {
+        p.rec.ctx.evidence.confirmation = "window_visible";
         Finalize(std::move(p), true, 0);
         return;
     }
@@ -531,7 +540,11 @@ void LaunchCapture::OnWindowShown(HWND hwnd)
             found = true;
         }
     }
-    if (found) Finalize(std::move(p), true, (DWORD)(now - p.startTick));
+    if (found)
+    {
+        p.rec.ctx.evidence.confirmation = "window_visible";
+        Finalize(std::move(p), true, (DWORD)(now - p.startTick));
+    }
 }
 
 void LaunchCapture::SweeperThread()
@@ -564,6 +577,7 @@ void LaunchCapture::SweeperThread()
 
 void LaunchCapture::Finalize(Pending&& p, bool sawWindow, DWORD windowDelayMs)
 {
+    if (m_paused.load() || !Settings::Instance().Get().captureAppLaunch || Settings::Instance().IsPaused(StoreUtil::NowUtc())) return;
     LaunchEventRecord rec = std::move(p.rec);
     if (rec.aumid.empty()) rec.aumid = DesktopInfo::GetAumidForProcess(rec.pid);
     rec.ctx.createdWindowMs = sawWindow ? (std::max<DWORD>)(1, windowDelayMs) : 0;

@@ -34,6 +34,9 @@ public:
         std::wstring display;      // full path / canonical URL
         std::string  type;         // file | url
         std::string  resolution = "unresolved";
+        std::string  instance;
+        int64_t      observedMs = 0, validUntilMs = 0;
+        double       confidence = -1;
     };
     enum class Redaction { None, DropContent, DropAll };
 
@@ -58,6 +61,8 @@ public:
         std::string  docType;
         std::wstring aumid;
         std::string  docResolution;
+        std::string  episodeId;
+        double       confidence = 1;
     };
 
     FocusTracker();
@@ -78,6 +83,9 @@ public:
     static std::string AttentionState(const std::string& presence, DWORD msSinceInput);
 
 private:
+#ifdef WARP_UNIT_TESTS
+    friend struct FocusTrackerTestAccess;
+#endif
     struct Segment
     {
         HWND         hwnd = nullptr;
@@ -97,6 +105,8 @@ private:
         // aumid / desktopId still to be fetched by the sampler thread (COM into Explorer: never
         // on the UI thread, never under m_mtx)
         bool         shellInfoPending = false;
+        std::string  episodeId;
+        int          revision = 0;
         // pending title change (debounce)
         std::wstring pendingTitle;
         ULONGLONG    pendingSinceTick = 0;
@@ -104,7 +114,8 @@ private:
 
     void OnForegroundChanged(HWND hwnd, DWORD pid);
     void BeginLocked(HWND hwnd, DWORD pid, int64_t startMs, std::vector<FocusEventRecord>& out);
-    void EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out);
+    void EndLocked(int64_t endMs, std::vector<FocusEventRecord>& out, const char* reason = "window_changed");
+    void CheckpointLocked(int64_t endMs, bool open, const char* reason, std::vector<FocusEventRecord>& out);
     void AccountLocked(ULONGLONG nowTick);
     void ResolveDocLocked(Segment& s);
     void Emit(std::vector<FocusEventRecord>& out);
