@@ -36,6 +36,7 @@ struct WarpSettings
     int awayAfterSeconds    = 300;    // no input for this long (and no passive-media/meeting signal) => "away" (clamped 30..86400)
     // --- models / performance ---
     bool llmEnabled            = false;   // optional Qwen refiner (off by default: costly, no measured quality gain)
+    bool contextModelEnabled   = false;   // experimental evidence-linked hypotheses; never runs on search requests
     bool llmAllowedOnBattery   = false;
     int  contextCadenceSeconds = 60;      // clamped 15..3600
     // --- API access control ---

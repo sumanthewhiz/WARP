@@ -114,6 +114,7 @@ namespace
         IntValue(L"EntityRetentionDays",          &WarpSettings::entityRetentionDays,   7, 3650),
         IntValue(L"AwayAfterSeconds",             &WarpSettings::awayAfterSeconds,      30, 86400),
         BoolValue(L"LlmEnabled",                  &WarpSettings::llmEnabled),
+        BoolValue(L"ContextModelEnabled",         &WarpSettings::contextModelEnabled),
         BoolValue(L"LlmAllowedOnBattery",         &WarpSettings::llmAllowedOnBattery),
         IntValue(L"ContextCadenceSeconds",        &WarpSettings::contextCadenceSeconds, 15, 3600),
         BoolValue(L"ApiAllowAppContainerClients", &WarpSettings::apiAllowAppContainerClients),

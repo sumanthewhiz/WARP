@@ -3,15 +3,13 @@
 //
 //   * Work sessions : durable interval union of presence/focus support, split by gaps
 //                     >= kSessionGapSec (and never joined across purged time).
-//   * Work threads  : every context snapshot carries its entity set (keys + active seconds);
-//                     consecutive snapshots join the thread with the highest weighted-Jaccard
-//                     overlap (with hysteresis for the current thread), otherwise a new thread
-//                     starts. Threads persist label, members (decayed weights), project and
-//                     time spans, and are resumed across days when a later snapshot matches.
+//   * Work threads  : each supported task group is assigned independently using weighted
+//                     Jaccard resumption. Observation IDs deduplicate focus credit; task time
+//                     is an interval union rather than repeated rolling-window duration.
 //   * Projects      : stable anchors - git / solution roots, OneDrive / SharePoint library
 //                     folders, repository URLs - voted by member weight.
-//   * Edges         : decayed co-occurrence between entities seen in the same snapshot,
-//                     used for "related items" and contextual boosting.
+//   * Relations     : typed associations retain observation support. A snapshot bag or one
+//                     foreground transition is not evidence of a strong task relationship.
 //
 // Writes happen on the ActivityStore writer thread (IWriterSink / Enqueue/RunSync jobs).
 // Reads use the store's read pool and may run on any thread.
@@ -31,21 +29,33 @@ struct SnapshotEntity
     std::string  entityType;     // file | app | url
     std::wstring display;
     double       activeSecs = 0; // clipped active seconds inside the snapshot window
+    std::vector<std::string> evidenceRefs;
+};
+
+struct SnapshotTask
+{
+    std::vector<std::string> entities;
+    std::string label;
+    int64_t lastMs = 0;
+    bool primary = false;
 };
 
 struct SnapshotInput
 {
     int64_t ts = 0;                        // UTC seconds
+    int64_t generatedTs = 0;
     int64_t windowSecs = 0;
     std::vector<SnapshotEntity> entities;  // app entities excluded by the caller when a document is known
     std::string label;                     // human-readable line (rich listing)
     std::string json;                      // full snapshot JSON (persisted when `persist`)
     std::vector<float> embedding;          // optional label embedding (L2-normalized)
     std::string model;
+    std::vector<SnapshotTask> tasks;
     bool persist = false;                  // store in context_snapshot (material change)
     // HistoryEngine::Generation() read before the snapshot's inputs were queried. A clear-all or
     // purge in between makes the snapshot stale and it is dropped. UINT64_MAX = no check.
     uint64_t generation = UINT64_MAX;
+    uint64_t evidenceEpoch = UINT64_MAX;
 };
 
 struct WorkThreadMember
@@ -144,6 +154,7 @@ private:
     void    PersistThread(WriterContext& w, ThreadState& t);
     void    ExtendSpan(WriterContext& w, int64_t threadId, int64_t ts, double activeSecs);
     void    UpdateEdges(WriterContext& w, const SnapshotInput& in, double scale);
+    void    CreditEvidence(WriterContext& w, ThreadState& thread, const SnapshotEntity& entity);
     void    ExtendSession(WriterContext& w, int64_t startTs, int64_t endTs, double activeSecs, double passiveSecs);
     void    ResetCaches();
 

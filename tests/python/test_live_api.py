@@ -63,7 +63,7 @@ def test_standard_user_client_can_connect(pipe_ready):
 def test_status_reports_store_and_capture_health(pipe_ready):
     s = warp_pipe.call({"op": "GetStatus"})
     print(s)
-    assert s["store"]["schema_version"] == 4
+    assert s["store"]["schema_version"] == 5
     assert s["store"]["write_errors"] == 0
     files = s["capture"]["files"]
     assert files["enabled"]
@@ -108,6 +108,28 @@ def test_phase_b_evidence_and_interval_contract(pipe_ready):
     assert "summary_embedding" not in context
     invalid = warp_pipe.call({"op": "GetContextEvidence", "start": 2, "end": 1})
     assert invalid["error"]["code"] == "invalid_request"
+
+def test_phase_c_candidate_contract_and_baseline_fallback(pipe_ready):
+    deadline = time.monotonic() + 30
+    while True:
+        frozen = warp_pipe.call({"op": "GetSearchContext"})
+        if frozen.get("error", {}).get("code") != "unavailable" or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    assert frozen["ok"] and not frozen["model_on_request_path"]
+    assert frozen["context"]["schema"] == "warp.task-context.v1"
+    response = warp_pipe.call({
+        "op": "ScoreCandidates", "context_ref": frozen["context_ref"], "query": "unseen-budget",
+        "candidates": [{"key": r"C:\WarpSynthetic\Unseen\unseen-budget.xlsx", "name": "unseen-budget.xlsx",
+                        "base_score": 100, "exact": True}],
+    })
+    assert response["ok"] and response["exact_matches_first"]
+    assert not response["query_and_candidates_persisted"]
+    assert len(response["candidates"]) == 1
+    assert 0 <= response["candidates"][0]["score_delta"] <= 8
+    invalid = warp_pipe.call({"op": "ScoreCandidates", "context_ref": "unknown", "query": "budget",
+                             "candidates": [{"key": r"C:\WarpSynthetic\budget.xlsx", "base_score": 100}]})
+    assert invalid["error"]["code"] == "context_expired"
 
 
 def _documents_dir() -> pathlib.Path:

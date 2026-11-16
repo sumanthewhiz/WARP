@@ -266,7 +266,7 @@ void HistoryEngine::EnsureThreadsLoaded(WriterContext& w)
     m_threadsLoaded = true;
     int64_t cutoff = w.nowMs / 1000 - kThreadLookbackSec;
     sqlite3_stmt* st = w.Stmt("SELECT id, label, first_ts, last_ts, active_secs, project_key, centroid FROM work_thread "
-                              "WHERE last_ts >= ?1 ORDER BY last_ts DESC LIMIT 300;");
+                              "WHERE last_ts >= ?1 AND evidence_version=1 ORDER BY last_ts DESC LIMIT 300;");
     if (!st) return;
     sqlite3_bind_int64(st, 1, cutoff);
     while (sqlite3_step(st) == SQLITE_ROW)
@@ -304,8 +304,8 @@ void HistoryEngine::PersistThread(WriterContext& w, ThreadState& t)
     int blobLen = (int)(t.centroid.size() * sizeof(float));
     if (t.id == 0)
     {
-        sqlite3_stmt* st = w.Stmt("INSERT INTO work_thread (label, first_ts, last_ts, active_secs, project_key, centroid, change_seq) "
-                                  "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);");
+        sqlite3_stmt* st = w.Stmt("INSERT INTO work_thread (label, first_ts, last_ts, active_secs, project_key, centroid, change_seq,evidence_version) "
+                                  "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,1);");
         if (!st) return;
         BindU(st, 1, t.label);
         sqlite3_bind_int64(st, 2, t.firstTs);
@@ -382,45 +382,58 @@ void HistoryEngine::ExtendSpan(WriterContext& w, int64_t threadId, int64_t ts, d
 
 void HistoryEngine::UpdateEdges(WriterContext& w, const SnapshotInput& in, double scale)
 {
-    if (scale <= 0.0) return;
-    std::vector<const SnapshotEntity*> top;
-    for (const SnapshotEntity& e : in.entities)
-        if (!e.entityKey.empty() && e.activeSecs > 0) top.push_back(&e);
-    std::sort(top.begin(), top.end(), [](const SnapshotEntity* a, const SnapshotEntity* b) { return a->activeSecs > b->activeSecs; });
-    if (top.size() > kEdgeTopEntities) top.resize(kEdgeTopEntities);
-    if (top.size() < 2) return;
-    double maxAct = top.front()->activeSecs;
-    int64_t ts = in.ts;
-    sqlite3_stmt* sel = w.Stmt("SELECT weight, last_ts FROM edge WHERE a = ?1 AND b = ?2;");
-    sqlite3_stmt* up = w.Stmt("INSERT INTO edge (a, b, weight, last_ts) VALUES (?1, ?2, ?3, ?4) "
-                              "ON CONFLICT(a, b) DO UPDATE SET weight = excluded.weight, last_ts = excluded.last_ts;");
-    if (!sel || !up) return;
-    for (size_t i = 0; i < top.size(); ++i)
-        for (size_t j = i + 1; j < top.size(); ++j)
+    // Kept as a no-op for the legacy snapshot path. Typed relations are written
+    // once with observations; a rolling bag is not new co-use evidence.
+    (void)w; (void)in; (void)scale;
+}
+
+void HistoryEngine::CreditEvidence(WriterContext& w, ThreadState& thread, const SnapshotEntity& entity)
+{
+    for (const auto& id : entity.evidenceRefs)
+    {
+        auto support = w.Stmt("INSERT OR IGNORE INTO task_support(evidence_id,thread_id,entity_key,last_ms) "
+            "SELECT id,?2,?3,event_ms FROM observation WHERE id=?1");
+        BindU(support, 1, id); sqlite3_bind_int64(support, 2, thread.id); BindU(support, 3, entity.entityKey);
+        if (sqlite3_step(support) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+        if (!sqlite3_changes(w.db)) continue;
+        auto focus = w.Stmt("SELECT f.start_ts,f.end_ts,f.active_secs FROM observation o JOIN app_focus_activity f "
+            "ON o.kind='focus' AND o.row_id=f.id WHERE o.id=?1 AND f.doc_key=?2 AND f.active_secs>0");
+        BindU(focus, 1, id); BindU(focus, 2, entity.entityKey);
+        if (sqlite3_step(focus) != SQLITE_ROW) { sqlite3_reset(focus); continue; }
+        const int64_t start = sqlite3_column_int64(focus, 0), end = sqlite3_column_int64(focus, 1);
+        const double active = sqlite3_column_double(focus, 2);
+        sqlite3_reset(focus);
+        if (end <= start) continue;
+        if (!thread.firstTs || start < thread.firstTs) thread.firstTs = start;
+        auto previous = w.Stmt("SELECT start_ts,end_ts,active_secs FROM thread_span "
+            "WHERE thread_id=?1 AND end_ts>=?2 AND start_ts<=?3");
+        sqlite3_bind_int64(previous, 1, thread.id); sqlite3_bind_int64(previous, 2, start);
+        sqlite3_bind_int64(previous, 3, end);
+        std::vector<Attention::Span> spans;
+        double before = 0;
+        while (sqlite3_step(previous) == SQLITE_ROW)
         {
-            const std::string& k1 = top[i]->entityKey;
-            const std::string& k2 = top[j]->entityKey;
-            if (k1 == k2) continue;
-            const std::string& a = k1 < k2 ? k1 : k2;
-            const std::string& b = k1 < k2 ? k2 : k1;
-            double inc = scale * (std::min)(top[i]->activeSecs, top[j]->activeSecs) / maxAct;
-            double weight = inc;
-            sqlite3_reset(sel);
-            BindU(sel, 1, a);
-            BindU(sel, 2, b);
-            if (sqlite3_step(sel) == SQLITE_ROW)
-            {
-                double old = sqlite3_column_double(sel, 0);
-                int64_t oldTs = sqlite3_column_int64(sel, 1);
-                weight += old * std::exp(-(double)(std::max<int64_t>)(0, ts - oldTs) / kEdgeTauSec);
-            }
-            sqlite3_reset(up);
-            BindU(up, 1, a);
-            BindU(up, 2, b);
-            sqlite3_bind_double(up, 3, weight);
-            sqlite3_bind_int64(up, 4, ts);
-            sqlite3_step(up);
+            const auto a = sqlite3_column_int64(previous, 0), b = sqlite3_column_int64(previous, 1);
+            const auto seconds = sqlite3_column_double(previous, 2);
+            if (b > a) { spans.push_back({ a, b, seconds / (b - a), 0 }); before += seconds; }
         }
+        sqlite3_reset(previous);
+        spans.push_back({ start, end, (std::min)(1.0, active / (end - start)), 0 });
+        auto del = w.Stmt("DELETE FROM thread_span WHERE thread_id=?1 AND end_ts>=?2 AND start_ts<=?3");
+        sqlite3_bind_int64(del, 1, thread.id); sqlite3_bind_int64(del, 2, start); sqlite3_bind_int64(del, 3, end);
+        if (sqlite3_step(del) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+        double after = 0;
+        for (const auto& span : Attention::Union(spans))
+        {
+            auto add = w.Stmt("INSERT INTO thread_span(thread_id,start_ts,end_ts,active_secs) VALUES(?1,?2,?3,?4)");
+            const double seconds = (span.end - span.start) * span.active;
+            sqlite3_bind_int64(add, 1, thread.id); sqlite3_bind_int64(add, 2, span.start);
+            sqlite3_bind_int64(add, 3, span.end); sqlite3_bind_double(add, 4, seconds);
+            if (sqlite3_step(add) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(w.db));
+            after += seconds;
+        }
+        thread.activeSecs += (std::max)(0.0, after - before);
+    }
 }
 
 int64_t HistoryEngine::AssignSnapshot(WriterContext& w, const SnapshotInput& in)
@@ -488,8 +501,9 @@ int64_t HistoryEngine::AssignSnapshot(WriterContext& w, const SnapshotInput& in)
         for (const SnapshotEntity& e : in.entities)
         {
             if (e.entityKey.empty()) continue;
-            t.members[e.entityKey] += (std::max)(1.0, e.activeSecs) / 60.0;
+            t.members[e.entityKey] = (std::max)(t.members[e.entityKey], (std::max)(1.0, e.activeSecs) / 60.0);
             t.memberTypes[e.entityKey] = e.entityType;
+            CreditEvidence(w, t, e);
         }
         // Keep the strongest members only.
         if (t.members.size() > kMaxMembers || !t.members.empty())
@@ -521,14 +535,14 @@ int64_t HistoryEngine::AssignSnapshot(WriterContext& w, const SnapshotInput& in)
         {
             std::unordered_map<std::string, double> votes;
             double all = 0.0;
-            for (const auto& m : t.members)
+            for (const auto& member : in.entities)
             {
-                auto ty = t.memberTypes.find(m.first);
-                std::string type = ty == t.memberTypes.end() ? std::string() : ty->second;
+                const std::string type = member.entityType;
                 if (type != "file" && type != "url") continue;
-                all += m.second;
-                std::string pk = ProjectKeyFor(U2W(m.first.c_str()), type);
-                if (!pk.empty()) votes[pk] += m.second;
+                const double weight = (std::max)(1.0, member.activeSecs);
+                all += weight;
+                const std::string pk = Evidence::WorkspaceFor(W2U(member.display), type);
+                if (!pk.empty()) votes[pk] += weight;
             }
             std::string best;
             double bestV = 0.0;
@@ -537,7 +551,9 @@ int64_t HistoryEngine::AssignSnapshot(WriterContext& w, const SnapshotInput& in)
         }
         PersistThread(w, t);
         chosen = t.id;
-        ExtendSpan(w, t.id, ts, 0.0);
+        if (in.tasks.empty() && std::all_of(in.entities.begin(), in.entities.end(),
+            [](const SnapshotEntity& e) { return e.evidenceRefs.empty(); }))
+            ExtendSpan(w, t.id, ts, 0.0);
         m_currentThread = t.id;
         {
             std::lock_guard<std::mutex> lk(m_labelMtx);
@@ -562,7 +578,7 @@ int64_t HistoryEngine::AssignSnapshot(WriterContext& w, const SnapshotInput& in)
         sqlite3_stmt* st = w.Stmt("INSERT INTO context_snapshot (ts, window_secs, json, thread_id, embedding, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6);");
         if (st)
         {
-            sqlite3_bind_int64(st, 1, ts);
+            sqlite3_bind_int64(st, 1, in.generatedTs > 0 ? in.generatedTs : ts);
             sqlite3_bind_int64(st, 2, in.windowSecs);
             sqlite3_bind_text(st, 3, in.json.c_str(), (int)in.json.size(), SQLITE_TRANSIENT);
             if (chosen) sqlite3_bind_int64(st, 4, chosen); else sqlite3_bind_null(st, 4);
@@ -581,7 +597,29 @@ int64_t HistoryEngine::RecordSnapshot(const SnapshotInput& in, DWORD timeoutMs)
 {
     auto result = std::make_shared<int64_t>(0);
     SnapshotInput copy = in;
-    bool ok = m_store->RunSync([this, copy, result](WriterContext& w) { *result = AssignSnapshot(w, copy); }, timeoutMs);
+    bool ok = m_store->RunSync([this, copy, result](WriterContext& w) {
+        if (copy.generation != UINT64_MAX && copy.generation != m_generation.load()) return;
+        if (copy.evidenceEpoch != UINT64_MAX && copy.evidenceEpoch != m_store->EvidenceEpoch()) return;
+        if (copy.tasks.empty()) { *result = AssignSnapshot(w, copy); return; }
+        std::vector<SnapshotTask> tasks = copy.tasks;
+        std::stable_sort(tasks.begin(), tasks.end(), [](const SnapshotTask& a, const SnapshotTask& b) {
+            if (a.primary != b.primary) return !a.primary;
+            return a.lastMs < b.lastMs;
+        });
+        for (size_t i = 0; i < tasks.size(); ++i)
+        {
+            SnapshotInput one = copy;
+            one.tasks.clear(); one.entities.clear();
+            for (const auto& entity : copy.entities)
+                if (std::find(tasks[i].entities.begin(), tasks[i].entities.end(), entity.entityKey) != tasks[i].entities.end())
+                    one.entities.push_back(entity);
+            one.ts = tasks[i].lastMs / 1000; one.generatedTs = copy.ts;
+            one.label = tasks[i].label; one.embedding.clear();
+            one.persist = copy.persist && i + 1 == tasks.size();
+            if (!one.persist) one.json.clear();
+            *result = AssignSnapshot(w, one);
+        }
+    }, timeoutMs);
     return ok ? *result : m_currentThread.load();
 }
 
@@ -677,21 +715,8 @@ void HistoryEngine::OnFocusEvent(WriterContext& w, const FocusEventRecord& r)
     int64_t endTs = r.endMs / 1000;
     int64_t startTs = r.startMs > 0 ? r.startMs / 1000 : endTs - r.activeSecs;
     ExtendSession(w, startTs, endTs, (double)(std::max)(0, r.activeSecs), (double)(std::max)(0, r.passiveSecs));
-    if (r.activeSecs <= 0) return;
-
-    int64_t cur = m_currentThread.load();
-    if (cur == 0) return;
-    auto it = m_threads.find(cur);
-    if (it == m_threads.end()) return;
-    it->second.activeSecs += r.activeSecs;
-    sqlite3_stmt* st = w.Stmt("UPDATE work_thread SET active_secs = active_secs + ?2 WHERE id = ?1;");
-    if (st)
-    {
-        sqlite3_bind_int64(st, 1, cur);
-        sqlite3_bind_double(st, 2, (double)r.activeSecs);
-        sqlite3_step(st);
-    }
-    if (m_spanThread == cur) ExtendSpan(w, cur, (std::max)(endTs, m_spanEnd), (double)r.activeSecs);
+    // Task time is credited from deduplicated supporting observations after
+    // segmentation, not blindly to whichever thread was current at capture.
 }
 
 void HistoryEngine::OnPresence(WriterContext& w, const PresenceRecord& r)
@@ -876,11 +901,14 @@ std::vector<RelatedEntity> HistoryEngine::Related(const std::string& entityKey, 
     if (!rl) return out;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(rl.get(),
-        "SELECT CASE WHEN e.a = ?1 THEN e.b ELSE e.a END AS other, e.weight, e.last_ts, i.entity_type, i.display_name "
-        "FROM edge e JOIN inference i ON i.entity_key = (CASE WHEN e.a = ?1 THEN e.b ELSE e.a END) AND i.deleted = 0 "
-        "WHERE e.a = ?1 OR e.b = ?1;", -1, &st, nullptr) != SQLITE_OK)
+        "SELECT CASE WHEN e.from_key=?1 THEN e.to_key ELSE e.from_key END AS other,MAX(e.quality),"
+        "MAX(e.end_ms)/1000,i.entity_type,i.display_name FROM evidence_relation e JOIN inference i "
+        "ON i.entity_key=(CASE WHEN e.from_key=?1 THEN e.to_key ELSE e.from_key END) AND i.deleted=0 "
+        "WHERE (e.from_key=?1 OR e.to_key=?1) AND e.kind IN ('download_origin','renamed_from','alias_of') "
+        "AND e.received_ms<=?2 AND e.start_ms<=?2 GROUP BY other;", -1, &st, nullptr) != SQLITE_OK)
         return out;
     BindU(st, 1, entityKey);
+    sqlite3_bind_int64(st, 2, nowUtc * 1000 + 999);
     while (sqlite3_step(st) == SQLITE_ROW)
     {
         RelatedEntity r;
@@ -906,6 +934,13 @@ std::vector<double> HistoryEngine::ContextBoost(const std::vector<std::string>& 
     ActivityStore::ReadLease rl = m_store->AcquireReader();
     if (!rl) return out;
     sqlite3* db = rl.get();
+    sqlite3_stmt* fresh = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT last_ts FROM work_thread WHERE id=?1 AND evidence_version=1", -1, &fresh, nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_int64(fresh, 1, cur);
+    const bool current = sqlite3_step(fresh) == SQLITE_ROW && nowUtc - sqlite3_column_int64(fresh, 0) <= 300;
+    sqlite3_finalize(fresh);
+    if (!current) return out;
 
     std::unordered_map<std::string, double> members;
     double maxW = 0.0;

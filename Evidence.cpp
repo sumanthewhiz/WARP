@@ -71,6 +71,37 @@ namespace
 
 namespace Evidence
 {
+    std::string WorkspaceFor(const std::string& display, const std::string& type)
+    {
+        if (type == "file")
+        {
+            const auto key = EntityKey::FileKey(EntityKey::FromUtf8(display));
+            const auto cut = key.rfind('\\');
+            if (cut == std::string::npos || cut <= 3) return {};
+            const auto parent = key.substr(0, cut);
+            const auto leaf = parent.substr(parent.rfind('\\') + 1);
+            static const std::set<std::string> generic = {
+                "users", "documents", "desktop", "downloads", "pictures", "videos", "music",
+                "temp", "tmp", "onedrive", "public", "windows", "appdata", "node_modules", ".git"
+            };
+            if (generic.count(leaf) || leaf.find("onedrive - ") == 0) return {};
+            return "folder:" + parent;
+        }
+        if (type == "url")
+        {
+            const auto url = EntityKey::UrlKey(EntityKey::FromUtf8(display));
+            const std::string prefix = "https://github.com/";
+            if (url.compare(0, prefix.size(), prefix) != 0) return {};
+            const auto ownerEnd = url.find('/', prefix.size());
+            if (ownerEnd == std::string::npos) return {};
+            const auto repoEnd = url.find_first_of("/?#", ownerEnd + 1);
+            const auto repo = url.substr(0, repoEnd);
+            if (repo.size() <= ownerEnd + 1) return {};
+            return "repository:" + EntityKey::Key(EntityKey::FromUtf8(repo));
+        }
+        return {};
+    }
+
     std::string Fingerprint(const std::string& value)
     {
         BCRYPT_ALG_HANDLE algorithm = nullptr;
@@ -346,7 +377,161 @@ namespace Evidence
             .KV("dropped", c.dropped)
             .EndObject();
     }
+
+    void Write(WarpJson::Writer& w, const EvidenceRelation& r)
+    {
+        w.BeginObject().KV("relation_id", r.id).KV("from", r.from).KV("to", r.to)
+            .KV("kind", r.kind).KV("start_ms", r.startMs).KV("end_ms", r.endMs)
+            .KV("received_ms", r.receivedMs).KV("source", r.source).KV("basis", r.basis)
+            .KV("quality", r.quality).KV("quality_semantics", "uncalibrated_rule_weight")
+            .Key("evidence_refs").BeginArray();
+        for (const auto& id : r.support) w.String(id);
+        w.EndArray().EndObject();
+    }
 } // namespace Evidence
+
+bool ActivityStore::MigrateV5()
+{
+    if (Scalar(m_wdb, "PRAGMA user_version") >= 5) return true;
+    try
+    {
+        Exec(m_wdb, "BEGIN IMMEDIATE");
+        Exec(m_wdb,
+            "CREATE TABLE IF NOT EXISTS evidence_relation(id TEXT PRIMARY KEY,from_key TEXT NOT NULL,to_key TEXT NOT NULL,"
+            "kind TEXT NOT NULL,start_ms INTEGER NOT NULL,end_ms INTEGER NOT NULL,received_ms INTEGER NOT NULL,"
+            "quality REAL NOT NULL,source TEXT NOT NULL,basis TEXT NOT NULL) WITHOUT ROWID;"
+            "CREATE INDEX IF NOT EXISTS idx_relation_time ON evidence_relation(end_ms,start_ms);"
+            "CREATE INDEX IF NOT EXISTS idx_relation_from ON evidence_relation(from_key);"
+            "CREATE INDEX IF NOT EXISTS idx_relation_to ON evidence_relation(to_key);"
+            "CREATE TABLE IF NOT EXISTS relation_support(relation_id TEXT NOT NULL,support_id TEXT NOT NULL,"
+            "PRIMARY KEY(relation_id,support_id)) WITHOUT ROWID;"
+            "CREATE INDEX IF NOT EXISTS idx_relation_support ON relation_support(support_id);"
+            "CREATE TABLE IF NOT EXISTS task_support(evidence_id TEXT PRIMARY KEY,thread_id INTEGER NOT NULL,entity_key TEXT NOT NULL,"
+            "last_ms INTEGER NOT NULL) WITHOUT ROWID;"
+            "CREATE TRIGGER IF NOT EXISTS relation_delete AFTER DELETE ON evidence_relation BEGIN "
+            "DELETE FROM relation_support WHERE relation_id=old.id; END;"
+            "CREATE TRIGGER IF NOT EXISTS relation_observation_delete AFTER DELETE ON observation BEGIN "
+            "DELETE FROM evidence_relation WHERE id IN (SELECT relation_id FROM relation_support WHERE support_id=old.id);"
+            "DELETE FROM task_support WHERE evidence_id=old.id; END;"
+            "DELETE FROM edge;");
+        if (!Scalar(m_wdb, "SELECT COUNT(*) FROM pragma_table_info('work_thread') WHERE name='evidence_version'"))
+            Exec(m_wdb, "ALTER TABLE work_thread ADD COLUMN evidence_version INTEGER NOT NULL DEFAULT 0;");
+        if (!Scalar(m_wdb, "SELECT COUNT(*) FROM pragma_table_info('artifact_alias') WHERE name='closed_received_ms'"))
+            Exec(m_wdb, "ALTER TABLE artifact_alias ADD COLUMN closed_received_ms INTEGER NOT NULL DEFAULT 0;");
+        Exec(m_wdb, "INSERT OR REPLACE INTO meta(key,value) VALUES('relations_available_from','" +
+            std::to_string(Evidence::NowMs()) + "'); PRAGMA user_version=5; COMMIT;");
+        return true;
+    }
+    catch (...)
+    {
+        sqlite3_exec(m_wdb, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+}
+
+void ActivityStore::PersistRelation(WriterContext& w, EvidenceRelation r)
+{
+    if (r.from.empty() || r.to.empty() || r.from == r.to || r.support.empty() || r.endMs <= r.startMs) return;
+    std::sort(r.support.begin(), r.support.end());
+    r.support.erase(std::unique(r.support.begin(), r.support.end()), r.support.end());
+    std::string identity = r.kind + "\n" + r.from + "\n" + r.to + "\n" + std::to_string(r.startMs);
+    for (const auto& id : r.support)
+    {
+        Statement exists(w.db, "SELECT received_ms FROM observation WHERE id=?1");
+        Text(exists, 1, id);
+        if (sqlite3_step(exists) != SQLITE_ROW) return;
+        r.receivedMs = (std::max)(r.receivedMs, sqlite3_column_int64(exists, 0));
+        identity += "\n" + id;
+    }
+    r.id = "relation:" + Evidence::Fingerprint(identity);
+    auto st = w.Stmt("INSERT OR IGNORE INTO evidence_relation VALUES(?,?,?,?,?,?,?,?,?,?)");
+    Text(st, 1, r.id); Text(st, 2, r.from); Text(st, 3, r.to); Text(st, 4, r.kind);
+    sqlite3_bind_int64(st, 5, r.startMs); sqlite3_bind_int64(st, 6, r.endMs);
+    sqlite3_bind_int64(st, 7, r.receivedMs); sqlite3_bind_double(st, 8, r.quality);
+    Text(st, 9, r.source); Text(st, 10, r.basis);
+    Done(w.db, st);
+    if (!sqlite3_changes(w.db)) return;
+    for (const auto& id : r.support)
+    {
+        auto support = w.Stmt("INSERT OR IGNORE INTO relation_support VALUES(?1,?2)");
+        Text(support, 1, r.id); Text(support, 2, id);
+        Done(w.db, support);
+    }
+    w.NextChangeSeq();
+}
+
+void ActivityStore::RelateFile(WriterContext& w, const FileEventRecord& r)
+{
+    const auto& e = r.ctx.evidence;
+    if (r.isDir || e.redaction != "none" || e.replayed || e.timestampKind == "recency_observation" || r.action == L"DELETE" ||
+        EntityStore::IsTransientFileName(r.path)) return;
+    auto add = [&](const std::string& to, const char* kind, const char* basis, double quality) {
+        EvidenceRelation relation;
+        relation.from = EntityKey::FileKey(r.path); relation.to = to;
+        relation.kind = kind; relation.basis = basis; relation.source = StoreUtil::W2U(r.source);
+        relation.startMs = r.eventMs; relation.endMs = r.eventMs + 1;
+        relation.quality = quality; relation.support = { e.id };
+        PersistRelation(w, std::move(relation));
+    };
+    if (r.action == L"DOWNLOAD" && !r.originUrl.empty())
+        add(EntityKey::UrlKey(r.originUrl), "download_origin", "reported_origin_not_proof_of_reading", .8);
+    if (r.action == L"RENAME" && e.identityBasis == "explicit_rename")
+        add(EntityKey::FileKey(r.oldPath), "renamed_from", "explicit_rename_lineage", 1.0);
+    if (!e.cloudUrl.empty())
+        add(EntityKey::UrlKey(EntityKey::FromUtf8(e.cloudUrl)), "alias_of", "provider_path_mapping", .7);
+    const auto workspace = Evidence::WorkspaceFor(StoreUtil::W2U(r.path), "file");
+    if (!workspace.empty())
+        add(workspace, "within_workspace", "directory_membership_not_proven_task", .6);
+}
+
+void ActivityStore::RelateFocus(WriterContext& w, const FocusEventRecord& r)
+{
+    const auto& e = r.ctx.evidence;
+    if (r.docKey.empty() || e.redaction != "none" || e.replayed || r.endMs <= r.startMs ||
+        r.docResolution == "ambiguous" || r.docResolution == "withheld" || r.docResolution == "unresolved") return;
+    auto add = [&](const std::string& to, const char* kind, const char* basis, double quality) {
+        EvidenceRelation relation;
+        relation.from = r.docKey; relation.to = to; relation.kind = kind;
+        relation.source = "focus"; relation.basis = basis;
+        relation.startMs = r.startMs; relation.endMs = r.endMs;
+        relation.quality = quality; relation.support = { e.id };
+        PersistRelation(w, std::move(relation));
+    };
+    add(StoreUtil::AppEntityKey(r.exePath, r.aumid), "opened_in",
+        "resolved_foreground_document_not_new_open", .8);
+    const auto workspace = Evidence::WorkspaceFor(StoreUtil::W2U(r.docDisplay), r.docType == "file" ? "file" : "url");
+    if (!workspace.empty())
+        add(workspace, "within_workspace", "directory_or_repository_membership_not_proven_task", .6);
+    if (r.activeSecs <= 0) return;
+    // Both neighbors allow late-arriving checkpoints without inventing order from receipt time.
+    for (bool preceding : {true, false})
+    {
+        Statement neighbor(w.db, preceding ?
+            "SELECT entity_key,start_ms,end_ms,payload FROM activity_episode WHERE kind='focus' AND active_ms>0 "
+            "AND end_ms<=?1 AND end_ms>=?1-30000 ORDER BY end_ms DESC LIMIT 1" :
+            "SELECT entity_key,start_ms,end_ms,payload FROM activity_episode WHERE kind='focus' AND active_ms>0 "
+            "AND start_ms>=?1 AND start_ms<=?1+30000 ORDER BY start_ms LIMIT 1");
+        sqlite3_bind_int64(neighbor, 1, preceding ? r.startMs : r.endMs);
+        if (sqlite3_step(neighbor) != SQLITE_ROW) continue;
+        const auto key = Text(neighbor, 0);
+        const auto previous = Evidence::Parse(Text(neighbor, 3));
+        if (key.empty() || key == r.docKey || previous.replayed || previous.redaction != "none" ||
+            previous.id == e.id || (e.sessionId >= 0 && previous.sessionId >= 0 && e.sessionId != previous.sessionId))
+            continue;
+        const int64_t boundary = preceding ? r.startMs : sqlite3_column_int64(neighbor, 1);
+        EvidenceRelation transition;
+        transition.from = preceding ? key : r.docKey; transition.to = preceding ? r.docKey : key;
+        transition.kind = "foreground_transition"; transition.source = "focus";
+        transition.basis = "adjacent_active_episodes_association_only"; transition.quality = .2;
+        transition.startMs = boundary; transition.endMs = boundary + 1;
+        transition.support = { previous.id, e.id };
+        PersistRelation(w, transition);
+        transition.kind = "co_used_nearby"; transition.quality = .1;
+        transition.basis = "adjacent_active_episodes_weak_proximity_only";
+        if (transition.from > transition.to) std::swap(transition.from, transition.to);
+        PersistRelation(w, std::move(transition));
+    }
+}
 
 bool ActivityStore::MigrateV4()
 {
@@ -600,9 +785,10 @@ void ActivityStore::ResolveArtifact(WriterContext& w, FileEventRecord& r)
             identity = previous;
             basis = "explicit_rename";
         }
-        Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
+        Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2,closed_received_ms=?3 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
         Text(close, 1, old);
         sqlite3_bind_int64(close, 2, when);
+        sqlite3_bind_int64(close, 3, e.receivedMs);
         Done(w.db, close);
     }
     else if (!target.artifactId.empty() && !physical.empty() && !target.physicalId.empty() &&
@@ -619,9 +805,10 @@ void ActivityStore::ResolveArtifact(WriterContext& w, FileEventRecord& r)
     e.identityBasis = basis;
     if (r.action == L"DELETE")
     {
-        Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
+        Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2,closed_received_ms=?3 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
         Text(close, 1, key);
         sqlite3_bind_int64(close, 2, when);
+        sqlite3_bind_int64(close, 3, e.receivedMs);
         Done(w.db, close);
         return;
     }
@@ -634,11 +821,12 @@ void ActivityStore::ResolveArtifact(WriterContext& w, FileEventRecord& r)
         Done(w.db, refresh);
         return;
     }
-    Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
+    Statement close(w.db, "UPDATE artifact_alias SET to_ms=?2,closed_received_ms=?3 WHERE path_key=?1 AND to_ms=0 AND from_ms<=?2");
     Text(close, 1, key);
     sqlite3_bind_int64(close, 2, when);
+    sqlite3_bind_int64(close, 3, e.receivedMs);
     Done(w.db, close);
-    Statement add(w.db, "INSERT OR IGNORE INTO artifact_alias VALUES(?,?,0,?,?,?,?)");
+    Statement add(w.db, "INSERT OR IGNORE INTO artifact_alias(path_key,from_ms,to_ms,artifact_id,physical_id,basis,evidence_id) VALUES(?,?,0,?,?,?,?)");
     Text(add, 1, key);
     sqlite3_bind_int64(add, 2, when);
     Text(add, 3, e.artifactId);
@@ -678,8 +866,9 @@ std::vector<ArtifactAlias> ActivityStore::ResolveFileIdentity(const std::string&
 
 void ActivityStore::PruneEvidence(WriterContext& w)
 {
+    m_evidenceDirty = true;
     const int64_t cut = w.nowMs - int64_t(m_rawRetentionDays.load()) * 86400000;
-    for (const char* table : {"activity_episode", "source_coverage"})
+    for (const char* table : {"activity_episode", "source_coverage", "evidence_relation"})
     {
         std::string sql = std::string("DELETE FROM ") + table + " WHERE end_ms<?1";
         Statement st(w.db, sql.c_str());
@@ -690,9 +879,13 @@ void ActivityStore::PruneEvidence(WriterContext& w)
 
 void ActivityStore::PurgeEvidence(WriterContext& w, const PurgeSpec& spec)
 {
+    m_evidenceDirty = true;
     // A privacy edit can change only provenance/episodes, without an entity tombstone.
     // It must still invalidate evidence references keyed by the committed watermark.
     w.NextChangeSeq();
+    // A privacy edit can trim, rather than delete, a supporting raw row.
+    // Conservatively invalidate all derived associations and dedup support.
+    Exec(w.db, "DELETE FROM evidence_relation; DELETE FROM task_support;");
     if (!spec.entityKey.empty())
     {
         Statement st(w.db, "DELETE FROM activity_episode WHERE entity_key=?1 OR app_key=?1");
@@ -811,7 +1004,9 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
     Exec(db, "BEGIN");
     try
     {
+        result.partial = false;
         result.watermark = Scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='change_seq_hw'");
+        result.relationsAvailableMs = Scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='relations_available_from'");
         result.availableStartMs =
             (std::max)(Scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='evidence_available_from'"),
                        Evidence::NowMs() - int64_t(m_rawRetentionDays.load()) * 86400000);
@@ -847,6 +1042,54 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
             std::remove_if(result.focus.begin(), result.focus.end(),
                            [&](const auto& row) { return row.endMs <= startMs || row.startMs >= endMs; }),
             result.focus.end());
+        Statement relations(db,
+            "SELECT id,from_key,to_key,kind,start_ms,end_ms,received_ms,quality,source,basis FROM evidence_relation "
+            "WHERE end_ms>?1 AND start_ms<?2 AND received_ms<=?3 ORDER BY start_ms,id LIMIT ?4");
+        sqlite3_bind_int64(relations, 1, startMs); sqlite3_bind_int64(relations, 2, endMs);
+        sqlite3_bind_int64(relations, 3, result.asOfMs); sqlite3_bind_int(relations, 4, limitPerType + 1);
+        while (sqlite3_step(relations) == SQLITE_ROW)
+        {
+            if ((int)result.relations.size() == limitPerType) { result.truncated = true; break; }
+            EvidenceRelation r;
+            r.id = Text(relations, 0); r.from = Text(relations, 1); r.to = Text(relations, 2);
+            r.kind = Text(relations, 3); r.startMs = (std::max)(startMs, sqlite3_column_int64(relations, 4));
+            r.endMs = (std::min)(endMs, sqlite3_column_int64(relations, 5));
+            r.receivedMs = sqlite3_column_int64(relations, 6); r.quality = sqlite3_column_double(relations, 7);
+            r.source = Text(relations, 8); r.basis = Text(relations, 9);
+            Statement supports(db, "SELECT support_id FROM relation_support WHERE relation_id=?1 ORDER BY support_id");
+            Text(supports, 1, r.id);
+            while (sqlite3_step(supports) == SQLITE_ROW) r.support.push_back(Text(supports, 0));
+            result.relations.push_back(std::move(r));
+        }
+        if (!result.truncated)
+        {
+            Statement aliases(db,
+                "SELECT a.path_key,a.from_ms,a.to_ms,a.artifact_id,a.physical_id,a.basis,a.evidence_id,a.closed_received_ms FROM artifact_alias a "
+                "JOIN observation o ON o.id=a.evidence_id WHERE o.received_ms<=?3 AND a.from_ms<=?3 AND "
+                "(a.artifact_id IN (SELECT json_extract(payload,'$.artifact_id') FROM observation WHERE kind='file' "
+                "AND event_ms>=?1 AND event_ms<?2 AND received_ms<=?3 LIMIT ?4) OR a.path_key IN "
+                "(SELECT entity_key FROM file_activity WHERE timestamp>=?1/1000 AND timestamp<(?2+999)/1000 "
+                "AND event_ms>=?1 AND event_ms<?2 LIMIT ?4)) "
+                "ORDER BY a.path_key,a.from_ms LIMIT ?4");
+            sqlite3_bind_int64(aliases, 1, startMs); sqlite3_bind_int64(aliases, 2, endMs);
+            sqlite3_bind_int64(aliases, 3, result.asOfMs); sqlite3_bind_int(aliases, 4, limitPerType + 1);
+            while (sqlite3_step(aliases) == SQLITE_ROW)
+            {
+                if ((int)result.aliases.size() == limitPerType) { result.truncated = true; break; }
+                ArtifactAlias a;
+                a.pathKey = Text(aliases, 0); a.fromMs = sqlite3_column_int64(aliases, 1);
+                a.toMs = sqlite3_column_int64(aliases, 2); a.artifactId = Text(aliases, 3);
+                a.physicalId = Text(aliases, 4); a.basis = Text(aliases, 5); a.evidenceId = Text(aliases, 6);
+                a.closedReceivedMs = sqlite3_column_int64(aliases, 7);
+                if (a.toMs > 0 && a.closedReceivedMs == 0)
+                {
+                    result.partial = true;
+                    continue; // a legacy closing boundary has no knowledge-time provenance
+                }
+                if (a.closedReceivedMs > result.asOfMs) { a.toMs = 0; a.closedReceivedMs = 0; }
+                result.aliases.push_back(std::move(a));
+            }
+        }
         Statement ep(
             db, "SELECT episode_id,revision,kind,start_ms,end_ms,entity_key,app_key,display,title,exposure_ms,"
                 "active_ms,passive_ms,idle_ms,unknown_ms,state,received_ms,payload FROM activity_episode "
@@ -921,7 +1164,7 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
         sqlite3_bind_int64(redacted, 1, startMs);
         sqlite3_bind_int64(redacted, 2, endMs);
         result.privacyRedacted = sqlite3_step(redacted) == SQLITE_ROW;
-        result.partial = result.truncated || startMs < result.availableStartMs || result.privacyRedacted;
+        result.partial = result.partial || result.truncated || startMs < result.availableStartMs || result.privacyRedacted;
         auto unknownProvenance = [](const auto& rows) {
             return std::any_of(rows.begin(), rows.end(),
                                [](const auto& row) { return row.evidence.id.empty() || row.evidence.receivedMs <= 0; });
@@ -964,7 +1207,8 @@ std::string ActivityStore::EvidenceJson(const EvidenceSet& e, int limitPerType)
     const size_t limit = (size_t)(std::max)(0, (std::min)(20000, limitPerType));
     const bool projectionTruncated =
         limit && (e.files.size() > limit || e.launches.size() > limit || e.browsing.size() > limit ||
-                  e.focus.size() > limit || e.episodes.size() > limit || e.coverage.size() > limit);
+                  e.focus.size() > limit || e.episodes.size() > limit || e.coverage.size() > limit ||
+                  e.relations.size() > limit || e.aliases.size() > limit);
     w.BeginObject()
         .KV("schema", "warp.context-evidence.v1")
         .KV("available", e.available)
@@ -974,6 +1218,7 @@ std::string ActivityStore::EvidenceJson(const EvidenceSet& e, int limitPerType)
         .KV("as_of_ms", e.asOfMs)
         .KV("input_watermark", e.watermark)
         .KV("available_start_ms", e.availableStartMs)
+        .KV("relations_available_from_ms", e.relationsAvailableMs)
         .KV("partial", e.partial)
         .KV("privacy_redacted", e.privacyRedacted)
         .KV("truncated", e.truncated)
@@ -1078,6 +1323,16 @@ std::string ActivityStore::EvidenceJson(const EvidenceSet& e, int limitPerType)
     w.EndArray().Key("source_coverage").BeginArray();
     for (size_t i = 0; i < e.coverage.size() && i < limit; ++i)
         Evidence::Write(w, e.coverage[i]);
+    w.EndArray().Key("relations").BeginArray();
+    for (size_t i = 0; i < e.relations.size() && i < limit; ++i) Evidence::Write(w, e.relations[i]);
+    w.EndArray().Key("aliases").BeginArray();
+    for (size_t i = 0; i < e.aliases.size() && i < limit; ++i)
+    {
+        const auto& a = e.aliases[i];
+        w.BeginObject().KV("path_key", a.pathKey).KV("artifact_id", a.artifactId)
+            .KV("valid_from_ms", a.fromMs).KV("valid_to_ms", a.toMs)
+            .KV("basis", a.basis).KV("evidence_ref", a.evidenceId).EndObject();
+    }
     w.EndArray()
         .KV("missing_coverage_semantics", "Uncovered time is unknown, not inactivity.")
         .KV("open_episode_semantics", "Only checkpointed time is durable; no extrapolation after a crash.")

@@ -12,6 +12,12 @@ See [SIGNAL_QUALITY.md](SIGNAL_QUALITY.md) for all metric definitions, optional
 Granite runs, labeled live/SLM/search inputs, required-measurement gates and
 grouped held-out comparisons. Unmeasured metrics are not reported as successes.
 
+For Phase C, run `.\tests\run_signal_quality.ps1 -PhaseC`; add
+`-WithSlm -ModelsDir .\models` for the real pinned Qwen comparison. The new
+synthetic search corpus, frozen candidates, grouping/grounding invariants,
+held-out project resampling and exact/unseen/fallback guards are documented in
+[SIGNAL_QUALITY.md](SIGNAL_QUALITY.md#phase-c-synthetic-search-and-model-evaluation).
+
 ## Quick start
 
 ```powershell
@@ -78,6 +84,7 @@ python -m pytest -c pytest.ini eval/
 | §4.1 Eval corpus | ✅ seed (5 scenarios) | `eval/corpus.jsonl` + `eval/test_corpus_integrity.py` validate schema + reference satisfies its own assertions. Expand to 50+ in P5. |
 | Phase A signal quality | Implemented | `fixtures/signal_quality.jsonl`, `WarpTests.Context.cpp`, `eval/signal_quality.py`: actual capture-rule/storage/context replay, time/identity/action/privacy/lifecycle invariants, correlation diagnostics, and optional labeled model/search/cost metrics. This is separate from the older five-row summary corpus. |
 | Phase B durable evidence | Implemented | `WarpTests.Evidence.cpp`: provenance/idempotency, full-width file IDs and alias validity, incremental focus/page slices, restart loss, consistent snapshots, as-of/half-open bounds, coverage, v3 -> v4 migration and deletion. The default scorer requires the new measured contract gates. |
+| Phase C context/search | Implemented | `WarpTests.Search.cpp`, `fixtures/phase_c_search.jsonl`, `eval/phase_c_quality.py`: actual task/feature APIs and shared consumer ranking, typed provenance, task switches, post-commit purge invalidation, late alias knowledge, transient queries, exact/unseen/fallback controls, independently audited model claims and grouped held-out search metrics. |
 | §2.1 Capture layer | ✅ partial | Pure capture rules in C++ (`WarpTests.Canon.cpp`: transient/download names, anchored exclusions, rename decisions, title grammars, URL canonicalization and document ids); end-to-end capture against a live headless WARP in CI (`python/test_live_api.py`). ⏳ ETW replay fixtures (`.etl` recorded with WPR) still to be recorded. |
 | §2.3 Storage (ActivityStore / EntityStore / HistoryEngine) | ✅ via `WarpTests.Store.cpp` and `WarpTests.Context.cpp` | Existing lifecycle/concurrency tests plus v1/v2 -> v3 migration, case-collision reconstruction, explicit legacy aliases, interval union, purge/replay and restart. |
 | Consumer API (ApiServer) | ✅ via `WarpTests.Api.cpp` + `python/test_live_api.py` | Structured errors, escaped/Unicode keys, scopes, ranking/search/feed/purge/timeline cursors, long-poll; live: per-session pipe, standard-user (medium IL) client, server PID check. |

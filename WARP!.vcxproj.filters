@@ -46,6 +46,8 @@
     <ClInclude Include="DesktopInfo.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="EventContext.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Evidence.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ContextIntelligence.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="SearchRanking.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="SystemProcessClassifier.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ContextInference.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LlmSummarizer.h"><Filter>Header Files</Filter></ClInclude>
@@ -83,6 +85,7 @@
     <ClCompile Include="DesktopInfo.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="EventContext.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="Evidence.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ContextIntelligence.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="SystemProcessClassifier.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="ContextInference.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="LlmSummarizer.cpp"><Filter>Source Files</Filter></ClCompile>

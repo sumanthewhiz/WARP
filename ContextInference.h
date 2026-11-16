@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include "ModernBertTokenizer.h"
+#include "ContextIntelligence.h"
 
 // Forward-declare the ONNX Runtime types so callers don't need to pull the
 // header into every translation unit.  All access lives behind opaque pointers.
@@ -55,6 +56,8 @@ struct ContextSnapshot
     int64_t       generatedAt = 0, asOfMs = 0, inputWatermark = 0, availableStartMs = 0;
     bool          partial = true, truncated = false, historical = false, liveOverlay = false;
     std::string   evidenceJson;
+    ContextIntelligence::Frame taskContext;
+    bool entitiesTruncated = false;
     std::string   modelRevision, tokenizerRevision;
     // Multi-line "context summary": 1-3 short lines (one per cluster
     // of activity) that semantically describe what the user is doing.
@@ -260,6 +263,7 @@ public:
     std::string GetCurrentContextJson(bool includeVector = false);
     std::string GetIntervalContext(int64_t startUtc, int64_t endUtc, int64_t asOfUtc,
                                    const std::string& category = "all", bool includeVector = false);
+    ContextIntelligence::Frame GetSearchFrame(int64_t startUtc, int64_t endUtc, int64_t asOfUtc, bool historical);
     void ClearHistory();
 
     // Embedding helper shared with the history layer (thread labels). Empty if no model.
@@ -268,6 +272,7 @@ public:
 private:
 #ifdef WARP_UNIT_TESTS
     friend struct ContextInferenceTestAccess;
+    friend struct PhaseCTestAccess;
 #endif
     ActivityStore*     m_store = nullptr;
     FocusTracker*      m_fg = nullptr;
@@ -315,6 +320,7 @@ private:
 
     // Optional polishing layer.  Borrowed; not owned.
     LlmSummarizer*       m_llm = nullptr;
+    std::atomic<uint64_t> m_lastTaskModelTick{ 0 };
 
     // Borrowed collaborators (nullptr in unit tests / tooling).
     EntityStore*         m_entities = nullptr;
@@ -335,7 +341,8 @@ private:
     // activity.  Pass 0 to use the default 15-minute window.  `allowLlm` is false for
     // on-demand windows (the LLM never runs on a client's request path).
     ContextSnapshot ComposeSnapshot(int64_t windowSecs = 0, bool allowLlm = true, int64_t asOf = 0,
-                                     int64_t knowledgeAsOfMs = 0, bool historical = false);
+                                     int64_t knowledgeAsOfMs = 0, bool historical = false, bool embeddings = true,
+                                     bool durableOnly = false);
 
     // Decide whether `snap` is materially different from the last-appended
     // history entry.  Used to keep `GetRecentContexts` from returning rows

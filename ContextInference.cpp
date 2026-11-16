@@ -1228,6 +1228,7 @@ void ContextInference::RunOnce()
 {
     if (!m_store || !m_store->IsOpen()) return;
     const uint64_t epoch = m_epoch.load();
+    const uint64_t evidenceEpoch = m_store->EvidenceEpoch();
     uint64_t histGeneration = UINT64_MAX;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -1249,7 +1250,7 @@ void ContextInference::RunOnce()
     bool append = false;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        if (m_epoch.load() != epoch) return;          // history was cleared while composing
+        if (m_epoch.load() != epoch || m_store->EvidenceEpoch() != evidenceEpoch) return;
         append = ShouldAppendToHistory(snap);
         hist = m_historyEngine;
     }
@@ -1268,20 +1269,25 @@ void ContextInference::RunOnce()
             se.entityType = e.entityType;
             se.display = WarpJson::Utf8ToWide(e.display);
             se.activeSecs = e.activeSecs;
+            for (const auto& card : snap.taskContext.cards)
+                if (card.key == e.entityKey) { se.evidenceRefs = card.support; break; }
             in.entities.push_back(std::move(se));
         }
+        for (const auto& task : snap.taskContext.tasks)
+            in.tasks.push_back({ task.entities, task.label, task.endMs, task.primary });
         in.label = snap.summary.empty() ? std::string() : snap.summary.front();
         if (!in.label.empty()) in.embedding = Embed(in.label);
         in.model = snap.model;
         in.persist = append;
         in.generation = histGeneration;
+        in.evidenceEpoch = evidenceEpoch;
         if (append) in.json = SnapshotToJsonObject(snap, "all", true);
-        if (m_epoch.load() != epoch) return;          // cleared while embedding: never persist pre-clear activity
+        if (m_epoch.load() != epoch || m_store->EvidenceEpoch() != evidenceEpoch) return;
         snap.threadId = hist->RecordSnapshot(in);
     }
 
     std::lock_guard<std::mutex> lk(m_mutex);
-    if (m_epoch.load() != epoch) return;
+    if (m_epoch.load() != epoch || m_store->EvidenceEpoch() != evidenceEpoch) return;
     m_latest     = snap;
     m_haveLatest = true;
 
@@ -1609,9 +1615,10 @@ static std::vector<std::string> ComposeRichListing(
     return { "User is " + std::string(verb) + " " + body + appClause };
 }
 
-ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm, int64_t asOf, int64_t knowledgeAsOfMs, bool historical)
+ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allowLlm, int64_t asOf, int64_t knowledgeAsOfMs, bool historical, bool embeddings, bool durableOnly)
 {
     if (windowSecs <= 0) windowSecs = CONTEXT_WINDOW_SECS;
+    const bool useModel = embeddings && m_modelReady;
 
     ContextSnapshot snap;
     snap.timestamp     = asOf > 0 ? asOf : static_cast<int64_t>(std::time(nullptr));
@@ -1685,7 +1692,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // ---- Live-session overlay (critical for accuracy) -------------
     // FocusTracker only emits a row when a session ends.  Ask it for the session in
     // progress (with its resolved document) and add the in-window part as a virtual row.
-    if (m_fg && !historical)
+    if (m_fg && !historical && !durableOnly)
     {
         FocusTracker::ActiveSession active;
         if (m_fg->GetCurrentSession(active))
@@ -1992,7 +1999,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
         double                           bagTotalFocus = 0.0;
         for (const auto& a : bag) bagTotalFocus += (std::max)(0.0, a.weightedFocusSecs);
 
-        if (m_modelReady && bag.size() >= 2)
+        if (useModel && bag.size() >= 2)
         {
             // Natural clustering for both "All" and category modes.
             // The old categoryMode behaviour forced every bag entry
@@ -2140,7 +2147,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             scored.reserve(orderedLowers.size());
 
             std::vector<float> cleanCentroid;
-            if (m_modelReady)
+            if (useModel)
             {
                 std::string joined;
                 for (const auto& lc : orderedLowers)
@@ -2194,7 +2201,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
                 // focus is elsewhere).
                 if (focusCoverage < 0.05) s *= 0.2;
 
-                if (m_modelReady && !cleanCentroid.empty())
+                if (useModel && !cleanCentroid.empty())
                 {
                     std::vector<float> v = Embed(bestSurface[lc].empty() ? lc : bestSurface[lc]);
                     if (!v.empty())
@@ -2763,7 +2770,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     snap.threadCount       = allBuild.threadCount;
     std::vector<int>& clusterOf = allBuild.clusterOf;
     if (clusterOf.empty()) clusterOf.assign(ranked.size(), -1);
-    snap.model = m_modelReady ? m_modelName : std::string("deterministic");
+    snap.model = useModel ? m_modelName : std::string("deterministic");
 
     // ---- Structured breakdown (per-entry top 5) -------------------
     for (size_t i = 0; i < ranked.size() && snap.items.size() < MAX_ITEMS; ++i)
@@ -2791,7 +2798,8 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     {
         static const char* const kCommApps[] = { "Outlook", "Teams", "Slack", "Discord", "WhatsApp", "Zoom", "Skype", "Telegram", "Mail" };
         std::vector<std::string> keys;
-        for (size_t i = 0; i < ranked.size() && snap.entities.size() < 12; ++i)
+        snap.entitiesTruncated = ranked.size() > 24;
+        for (size_t i = 0; i < ranked.size() && snap.entities.size() < 24; ++i)
         {
             const AppAgg& a = ranked[i];
             ContextSnapshot::EntityItem e;
@@ -2827,6 +2835,26 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
             for (size_t i = 0; i < sc.size() && i < snap.entities.size(); ++i)
                 if (sc[i].found) snap.entities[i].score = sc[i].score;
         }
+    }
+
+    snap.taskContext = ContextIntelligence::Build(snap, evidence);
+    const auto modelConfig = Settings::Instance().Get();
+    if (allowLlm && !historical && modelConfig.contextModelEnabled && llm && llm->IsAvailable() &&
+        !snap.taskContext.tasks.empty() && !snap.taskContext.truncated && !snap.taskContext.redacted &&
+        (snap.presence == "active" || snap.presence == "passive"))
+    {
+        SYSTEM_POWER_STATUS power{};
+        const bool battery = GetSystemPowerStatus(&power) && power.ACLineStatus == 0;
+        const uint64_t tick = GetTickCount64(), last = m_lastTaskModelTick.load();
+        if ((!battery || modelConfig.llmAllowedOnBattery) && (!last || tick - last >= 300000))
+        {
+            m_lastTaskModelTick = tick;
+            const auto input = ContextIntelligence::ModelInput(snap.taskContext);
+            const auto output = llm->InterpretEvidence(input);
+            ContextIntelligence::Apply(snap.taskContext, ContextIntelligence::Validate(snap.taskContext, output));
+            snap.taskContext.modelMetadata = llm->EvidenceModelMetadata();
+        }
+        else snap.taskContext.modelStatus = battery ? "battery_deferred" : "rate_limited";
     }
 
     if (totalFocusSecs == 0)
@@ -2946,7 +2974,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     const bool llmLoaded = llm && llm->IsAvailable();
     snap.modelPolish = llmLoaded ? llm->ModelName() : std::string("(not loaded)");
     const bool llmWillRun = llmLoaded && allowLlm && cfg.llmEnabled && userPresent &&
-                            (!onBattery || cfg.llmAllowedOnBattery) && m_modelReady;
+                            (!onBattery || cfg.llmAllowedOnBattery) && useModel;
     if (llmWillRun)
     {
         std::vector<LlmActivityItem> llmItemsAll;
@@ -3019,7 +3047,7 @@ ContextSnapshot ContextInference::ComposeSnapshot(int64_t windowSecs, bool allow
     // summary, suitable for similarity search / clustering across
     // snapshots in downstream consumers.  Empty when the granite
     // model isn't loaded or the summary is empty.
-    if (m_modelReady && !snap.summary.empty())
+    if (useModel && !snap.summary.empty())
     {
         std::string joined;
         for (size_t i = 0; i < snap.summary.size(); ++i)
@@ -3111,6 +3139,7 @@ std::string ContextInference::SnapshotToJsonObject(const ContextSnapshot& s,
      .KV("dimension",(int)s.summaryEmbedding.size()).KV("normalization","l2").EndObject();
     lines("signal_types", s.signalTypes);
     w.Key("evidence").Raw(s.evidenceJson.empty() ? "{}" : s.evidenceJson);
+    w.Key("task_context").Raw(ContextIntelligence::Json(s.taskContext));
     if (includeVector)
     {
         w.Key("summary_embedding").BeginArray();
@@ -3168,6 +3197,17 @@ std::string ContextInference::GetIntervalContext(int64_t startUtc, int64_t endUt
     if (m_epoch.load()!=epoch)
         return "{\"ok\":false,\"error\":{\"code\":\"context_invalidated\",\"message\":\"History changed during composition; retry\"}}";
     return "{\"ok\":true,\"interval_context\":" + SnapshotToJsonObject(snapshot,NormalizeCategory(category),includeVector) + "}";
+}
+
+ContextIntelligence::Frame ContextInference::GetSearchFrame(int64_t startUtc, int64_t endUtc,
+                                                            int64_t asOfUtc, bool historical)
+{
+    if (!m_store || !m_store->IsOpen()) return {};
+    std::lock_guard<std::mutex> compose(m_composeMtx);
+    const uint64_t epoch = m_epoch.load();
+    auto snapshot = ComposeSnapshot(endUtc - startUtc, false, endUtc, asOfUtc * 1000 + 999, historical, false, true);
+    if (m_epoch.load() != epoch) return {};
+    return std::move(snapshot.taskContext);
 }
 
 // Acceptable window lengths (seconds).  The UI dropdown surfaces

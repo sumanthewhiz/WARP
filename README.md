@@ -19,11 +19,12 @@ Windows 11, and works entirely on the local PC:
    optionally, printed documents and clipboard *metadata*. Every capture source runs
    on its own threads and hands typed records to a single storage writer.
 
-2. **Remembers** it in a versioned SQLite database (schema v4): raw events for
+2. **Remembers** it in a versioned SQLite database (schema v5): raw events for
    30 days by default, a per-entity **engagement model** (decayed short- and
    long-term engagement, daily rollups, tombstones, a global change sequence, an
    FTS5 search index) and a **history layer** (work sessions, work threads,
-   projects, co-occurrence edges) kept for 395 days by default.
+   projects) kept for 395 days by default. Typed relations retain observation
+   support and expire with that raw evidence.
 
 3. **Reasons** over it: every minute a context composer clusters the recent window,
    tab and document titles with the on-device **granite-embedding-small-english-r2**
@@ -54,8 +55,19 @@ coverage, and a single canonical evidence selection now feed all context
 projections. `GetContextEvidence` and `GetIntervalContext` support explicit UTC
 `[start,end)` windows and an observation `as_of` cutoff. Historical queries do not
 borrow today's foreground or current task. Missing evidence is reported as
-unknown/partial, not inactivity. Typed task relations, grounded SLM hypotheses
-and measured query-conditioned search gains remain Phase C.
+unknown/partial, not inactivity.
+
+**Phase C on `dev`:** typed, evidence-backed relations and multiple task
+hypotheses replace blanket snapshot co-use. `GetSearchContext` freezes a
+short-lived context reference; `ScoreCandidates` supplies bounded, query-aware
+features for a consumer's own filename/content candidates. Exact matches and
+unseen files are protected by the accompanying ranking policy. Missing, stale,
+withheld or invalidated context falls back to baseline ranking. Qwen's new
+evidence/role interface is strictly validated and remains off by default; no
+model runs on a search request. The **same dev Granite and Qwen inputs are now
+pinned**, not upgraded. The [synthetic Phase C evaluator](tests/SIGNAL_QUALITY.md#phase-c-synthetic-search-and-model-evaluation)
+compares no-context, legacy engagement, deterministic context and a prespecified
+real-Qwen subset; it does not claim measured real-user relevance.
 
 WARP runs fully offline — no cloud calls, no telemetry. `WARP!.exe --install`
 copies it to `%ProgramFiles%\WARP` and registers a per-user logon scheduled task
@@ -104,7 +116,7 @@ the tray icon (status, pause, delete history) or the command line.
 | **Presence** | `PresenceMonitor` classifies the user as *active*, *passive* (no input, but media playing, microphone/camera in use or a full-screen app), *away*, *locked* or *asleep*. Presence never pauses capture: it tags events, closes focus sessions and drives work sessions. |
 | **Print & clipboard (optional)** | `PrintMonitor` admits event 307 only when its qualified owner matches this user's cached token identity and its client matches this PC. Missing/bare/foreign owners or remote clients are rejected. `ClipboardMonitor` remains metadata-only and off by default. |
 | **Confidence model** | Every event carries a `[0, 1]` confidence from `EventContextUtil::ScoreEvent` (source class, foreground match, input recency, attribution, process role, event kind, wake boundary). Noisy processes are scored down instead of silently dropped. |
-| **Single-writer storage** | `ActivityStore`: one writer thread, batched transactions with per-job savepoints, bounded queue (20 000), 3 readers, ordered transactional migrations through schema v4, `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
+| **Single-writer storage** | `ActivityStore`: one writer thread, batched transactions with per-job savepoints, bounded queue (20 000), 3 readers, ordered transactional migrations through schema v5, `quick_check` + quarantine, global `change_seq`, retention, tombstones, scoped purge and secure clear. |
 | **Engagement ranking** | `EntityStore` keeps decayed short-term (τ = 3 days) and long-term (τ = 30 days) engagement per file, app and URL, computes per-type percentile scores at **read** time and explains them (*"edited today"*, *"42 min active in the last 7 days"*). Renames carry history to the new key; deletes become tombstones after a 15 s safe-save grace. |
 | **History & context** | `HistoryEngine` builds work sessions, persistent work threads (resumable for 14 days), project anchors and co-occurrence edges. `ContextInference` composes the current context every 60 s (configurable; EcoQoS thread, slower on battery, skipped when nothing changed). |
 | **API v2** | Per-session + legacy named pipes with an explicit DACL, caller identification, policy allow-lists and scopes; 8 workers, deadlines, 1 MiB request limit, `api_version` on every response, structured errors. v1 requests keep working. |
@@ -172,7 +184,7 @@ flowchart TB
     end
 
     subgraph Storage ["Storage · single writer thread"]
-        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v4 · activity.db</sub>")]:::storage
+        STORE[("ActivityStore<br/><sub>SQLite WAL · schema v5 · activity.db</sub>")]:::storage
         ES["EntityStore<br/><sub>decayed engagement · change feed · FTS5</sub>"]:::storage
         HE["HistoryEngine<br/><sub>attention union · sessions · thread heuristics</sub>"]:::storage
     end
@@ -975,7 +987,8 @@ discarded. Response shapes are documented in [API.md](API.md).
 `LlmSummarizer` is the optional Qwen3-0.6B (INT4) refiner on ONNX Runtime GenAI —
 x64 and ARM64 builds only (x86 compiles a no-op stub), with `onnxruntime-genai.dll`
 **delay-loaded** so it is mapped only when the refiner is enabled and a missing DLL
-cannot stop WARP from starting. It is initialized only when `LlmEnabled` is set;
+cannot stop WARP from starting. It is initialized only when `LlmEnabled` or
+`ContextModelEnabled` is set;
 the model loads lazily on the first `Polish()` call and is **unloaded after 10
 idle minutes**, generation has a 5 s timeout, the intra-op thread count is capped
 in `genai_config.json` at build time, and the output is validated (1–3 short
@@ -983,6 +996,44 @@ lines, no prompt echo) before the groundedness gate in `ContextInference` sees i
 When files or the runtime are missing it reports `model_polish: "(not loaded)"`.
 `ModernBertTokenizer.h` is the header-only byte-level BPE tokenizer for the granite
 encoder (bit-exact with the Hugging Face tokenizer).
+
+#### `ContextIntelligence` (`ContextIntelligence.h` / `ContextIntelligence.cpp`)
+
+Builds bounded entity cards, durable attention episodes, supported relations
+and multiple task hypotheses from the canonical selection. Broad folders,
+replayed/ambiguous evidence and proximity alone do not establish a task.
+The current task follows the latest qualified evidence, not the most-used
+application. Point observations never become invented attention seconds.
+
+The optional `ContextModelEnabled` experiment sends compact IDs, qualified
+observations and coverage to the pinned Qwen model. The host validates every
+entity/support/role and refuses unsupported task merges. One surrounding JSON
+code fence is tolerated, not arbitrary surrounding instructions or prose.
+Rejected or abstaining output leaves the deterministic result intact.
+Generation is greedy, capped at 384 new tokens and a cooperative 5-second
+decode budget; model loading/prefill can take longer. Calls are background-only,
+at most once per five minutes, and respect presence/battery gates.
+
+Search uses the deterministic path, including when that experiment is enabled.
+The consumer retains its index, lexical/content relevance, exact-match rules,
+and results with no prior WARP activity. The shared `SearchRanking.h` policy
+adds at most eight points on FindMyFile's score scale, only to query-compatible
+candidates; no applicable context means exactly the baseline order.
+
+```mermaid
+sequenceDiagram
+    participant App as Search consumer
+    participant Index as App's filename/content index
+    participant W as WARP local pipe
+    App->>Index: Retrieve candidates for query
+    Index-->>App: Baseline relevance and metadata
+    App->>W: GetSearchContext (current or explicit interval)
+    W-->>App: Frozen reference, tasks, provenance and expiry
+    App->>W: ScoreCandidates (reference + query + candidates)
+    W-->>App: Bounded deltas, identity, raw features and reasons
+    App->>App: Protect exact matches; preserve unknown candidates
+    Note over App,W: No LLM on this path; errors/staleness keep baseline
+```
 
 > **Query surface**
 
@@ -1260,16 +1311,19 @@ The four main activity tables (`file_activity`, `app_launch_activity`,
 | `entity_day` | daily rollups | `entity_key`, `day` (local day index), `opens`, `edits`, `active_secs`, `sessions` |
 | `tombstone` | deletions for the change feed | `change_seq`, `entity_key`, `entity_type`, `ts`, `reason` (`deleted`, `renamed`, `purge`, `retention`) |
 | `activity_fts` | FTS5 search index | `rowid` (= `inference` rowid), `kind`, `ref`, `ts`, `text`; tokenizer `unicode61 remove_diacritics 2` |
-| `edge` | co-occurrence | `a`, `b`, `weight`, `last_ts` |
+| `edge` | legacy co-use, cleared and no longer populated in v5 | `a`, `b`, `weight`, `last_ts` |
+| `evidence_relation` | directed, qualified associations | ID, endpoints, kind, event/receipt bounds, source, basis and rule weight |
+| `relation_support` | relation provenance | relation ID and supporting observation ID; deletion cascades by trigger |
+| `task_support` | idempotent thread credit | observation ID, thread ID, entity key and event time |
 | `work_session` | work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs`, `accounting_version` |
 | `session_attention` | non-overlapping attention union | `start_ts` (PK), `end_ts`, `active_rate`, `passive_rate` |
 | `entity_alias` | explicit v2-key compatibility | `alias_key`, nullable `entity_key` (null = unresolved/ambiguous), `created_ts` |
 | `observation` | durable source provenance | stable event ID, typed-row reference, event/receipt times, rule-versioned envelope, watermark |
 | `activity_episode` | focus/presence/page checkpoint slices | episode/revision, millisecond bounds, qualified attention/exposure, raw support and provenance |
 | `source_coverage` | capture availability | source/runtime, interval, state/reason and dropped counts; no private content |
-| `artifact_alias` | time-valid file lineage | path, validity interval, logical artifact, full physical ID and supporting observation |
+| `artifact_alias` | time-valid file lineage | path, validity interval, closing receipt time, logical artifact, full physical ID and supporting observation |
 | `privacy_scope` | durable scoped replay guards | newest 64 distinct scope hashes and their purge-time bounds |
-| `work_thread` | work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid` (BLOB), `change_seq` |
+| `work_thread` | work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid` (BLOB), `change_seq`, `evidence_version` |
 | `thread_member` | thread members | `thread_id`, `entity_key`, `weight`, `last_ts` |
 | `thread_span` | thread time spans | `thread_id`, `start_ts`, `end_ts`, `active_secs` |
 | `meta` | key/value bookkeeping | `key`, `value` |
@@ -1370,9 +1424,9 @@ synchronous job for each context snapshot) and reads from the pool.
 | Concept | How it is built | Exposed through |
 |---|---|---|
 | **Work sessions** (`work_session`) | Active/passive focus and presence are normalized into a durable interval union (`session_attention`), not added twice. Gaps contribute no time; gaps of **≥ 15 minutes** split sessions. Mixed segments are proportional estimates; migrated estimates carry `accounting_version: 0`. | `QueryTimeline` (`sessions`, whole overlapping sessions) |
-| **Work threads** (`work_thread`, `thread_member`, `thread_span`) | Every context compose passes its entity set (keys + clipped active seconds). The snapshot joins the thread with the highest **weighted-Jaccard** overlap — ≥ 0.25 to join or resume a thread, ≥ 0.12 to stay on the current one (hysteresis); the label embedding only breaks ties. Otherwise a new thread starts. A thread keeps a label (the rich listing), up to 40 members with decaying weights (τ = 2 days), time spans (a new span after a 15-minute gap) and a project; any thread active in the last **14 days** can be resumed. | `GetWorkThreads`, `QueryTimeline` (`threads`), `GetCurrentContext` (`thread`), `thread_id` in snapshots |
-| **Projects** (`project_key`) | A member-weighted vote (≥ 30 % of the weight) over stable anchors: git repositories (`.git`), solutions and workspaces (`*.sln`, `*.slnx`, `*.code-workspace`), the first folder under a OneDrive sync root, repository URLs (GitHub, GitLab, Bitbucket, Azure DevOps and `*.visualstudio.com`), SharePoint sites (`/sites/…`, `/teams/…`); otherwise a specific containing folder. | `GetWorkThreads` (`project`) |
-| **Related items** (`edge`) | Decayed snapshot co-use (τ = 14 days) between its top 8 entities, weighted by aggregate active seconds. This does **not** prove actual temporal overlap or causality. | `GetRelated`; `ScoreEntities` with `"context": "current"` adds a `context_boost` from current-thread membership and edges |
+| **Work threads** (`work_thread`, `thread_member`, `thread_span`) | The composer assigns each evidence-backed task group separately, retaining weighted-Jaccard resumption rather than forcing the whole window into one thread. Supporting observations are credited once; focus spans use interval union. Repeated rolling snapshots do not accumulate the same duration/member weight again. Legacy threads are retained but are not loaded as new evidence-based current tasks. | `GetWorkThreads`, `QueryTimeline`, snapshot `task_context`; legacy `thread_id` identifies the selected primary thread |
+| **Workspace anchors** (`project_key`) | A member-weighted vote over captured display identities: specific containing directories or GitHub repository URLs, without treating an opaque document ID as a URL. Broad folders are excluded. This is metadata association, not proof of a user's project or intent. | `GetWorkThreads`, `task_context` |
+| **Related items** (`evidence_relation`) | Retained, supported download-origin, rename and mapped-alias associations. Weak proximity/foreground transitions are visible as qualified relations, not promoted as strong relatedness. The old bag-co-use edges are no longer populated. | `GetRelated`; use `ScoreCandidates`, not an engagement percentile, for query-aware ranking |
 | **Context snapshots** (`context_snapshot`) | Material changes of the periodic context, with their thread id and summary embedding, so history survives restarts. | `GetRecentContexts` |
 
 ---
@@ -1436,6 +1490,7 @@ policy-owned ones with `(policy)`.
 | `EntityRetentionDays` | DWORD | 395 | Per-entity state, rollups, threads, sessions and edges (7–3650). |
 | `AwayAfterSeconds` | DWORD | 300 | No input and no passive signal for this long means *away* (30–86400). |
 | `LlmEnabled` | DWORD 0/1 | 0 | Enable the optional Qwen3 refiner (x64 / ARM64). |
+| `ContextModelEnabled` | DWORD 0/1 | 0 | Experimental evidence-linked Qwen task/role interpretation, background only. Restart after enabling to initialize the runtime. Default search remains deterministic. |
 | `LlmAllowedOnBattery` | DWORD 0/1 | 0 | Let the refiner run on battery power. |
 | `ContextCadenceSeconds` | DWORD | 60 | Context compose interval (15–3600; doubled on battery). |
 | `ApiAllowAppContainerClients` | DWORD 0/1 | 0 | Admit AppContainer (packaged, low-integrity) clients to the pipes. |
@@ -1709,6 +1764,18 @@ and writes JSON/Markdown scorecards. It reports unmeasured live/SLM/search/cost
 metrics explicitly. An optional Granite run and labeled external observations
 use the same scorer. See [tests/SIGNAL_QUALITY.md](tests/SIGNAL_QUALITY.md).
 
+Phase C adds a fixed synthetic labeled candidate corpus and real API/ranking replay:
+
+```powershell
+.\tests\run_signal_quality.ps1 -PhaseC
+.\tests\run_signal_quality.ps1 -PhaseC -WithSlm -ModelsDir .\models
+```
+
+The second command compares the actual pinned Qwen model on a prespecified,
+project-stratified subset of identical evidence. The report separates tested
+model cases from fallback-only cases; it never counts an unrun SLM as measured.
+Synthetic relevance is not proof of real-user search improvement.
+
 | Suite | Where | How to run | What it covers |
 |---|---|---|---|
 | **Python** (pytest + Hypothesis) | `tests/run_tests.py`, `tests/python/`, `tests/eval/` | `python -m pip install -r tests/requirements.txt`, then `python tests/run_tests.py` (options `--layer l1`, `l1_property`, `l2` or `l3`; `--tier python` or `scripts`; `--list`) or `.\tests\run_tests.ps1 [-Layer l1]` | **L1** deterministic tests (hallucination guard, near-copy gate, rich-listing port, sync tests that pin the Python ports to the constants in `EntityStore.cpp`, `ActivityStore.h` and `LlmSummarizer.cpp`); **L1 property** fuzzing of the engagement math and the grounding gate; **L2** model-contract and adversarial tests; **L3** eval corpus and metrics. No models or build needed. |
@@ -1846,6 +1913,8 @@ fields such as `confidence`, `entity_key`, `source`, `start_ts` / `end_ts` /
 | `GetContextEvidence` | Consistent bounded evidence, provenance, episodes and coverage for `[start,end)` | activity |
 | `GetIntervalContext` | Historical interval composition with explicit `as_of`, without today's state | activity |
 | `ResolveFileIdentity` | Physical/logical file aliases and their validity intervals | activity |
+| `GetSearchContext` | Freeze current or interval task evidence for one search interaction | activity |
+| `ScoreCandidates` | Query-conditioned, bounded features for the consumer's own candidates | activity |
 | `GetRecentContext` / `GetRecentContexts` | Latest / last *N* context snapshots (`category`, `window_seconds`, `include_vector`) | activity |
 | `Purge` | Delete by `start` / `end`, `key` / `entity_key`, `domain` or `path_prefix` | control (WARP only) |
 | `Pause` / `Resume` | Pause for `minutes`, until a time or indefinitely; resume | control (WARP only) |
@@ -1928,7 +1997,7 @@ WARP!\
 |-- Json.h / .cpp                  Strict JSON parser and writer (WarpJson)
 |
 |   Storage, ranking, history, context, API
-|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v4 + migrations, purge, change feed
+|-- ActivityStore.h / .cpp         Single-writer SQLite store, schema v5 + migrations, purge, change feed
 |-- Evidence.h / .cpp              Provenance, aliases, episodes, coverage, consistent interval evidence
 |-- Attention.h                   Unknown-safe clipping and interval-union helpers
 |-- SCHEMA.md                     Storage, identity, migration and retention contract
@@ -1990,17 +2059,17 @@ WARP!\
   installer (installation is the `--install` verb).
 - **Code signing** needs a certificate: CI signs `WARP!.exe` only when the signing
   secrets are configured; otherwise packages are unsigned.
-- **Model pins.** `scripts/models.lock.json` does not pin commits or hashes yet:
-  CI verifies downloads against Hugging Face's published hashes and warns, and
-  builds of `main` / `master` (`-RequirePinned`) fail until the pins are filled in
-  with `fetch_models.ps1 -UpdateLock`.
+- **Model reproducibility.** `scripts/models.lock.json` pins the same three
+  upstream revisions and nine inputs used by verified Phase B dev CI. A model
+  upgrade is a separate evaluated change; do not casually refresh moving refs.
 - **ETW replay fixtures** (recorded `.etl` traces) still need to be recorded;
   capture is covered by rule tests, native synthetic replay and the live CI run.
-- **Phase B is not proof of search value.** Typed relations/multiple task hypotheses,
-  evidence-based SLM reasoning and query-conditioned search evaluation remain
-  Phase C. Mixed legacy intervals still use proportional estimates. Snapshot co-use
-  can connect unrelated tasks; the quality suite reports this rather than
-  describing it as solved.
+- **Synthetic search is not real-user proof.** Phase C tests a fixed, labeled
+  candidate corpus, not full-disk retrieval recall or community usage. Directory
+  associations can still span unrelated work; model hypotheses are not facts.
+  Selection is bounded, historical coverage can be partial, and mixed legacy
+  attention intervals remain proportional estimates. The SLM stays optional
+  unless it clears an incremental quality and cost gate on identical evidence.
 - **Print metadata can be insufficient.** Qualified own-user identity and a local
   client are required; bare usernames, missing fields and remote jobs are omitted.
 - **Needs confirmation on real machines:** Kernel-File / Kernel-Process event

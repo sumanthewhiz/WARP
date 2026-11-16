@@ -61,10 +61,9 @@ The default inference measurements cover actual deterministic context output:
 time, identities, action claims, required entities, output shape and repeat
 stability. They are not measurements of Qwen or a future evidence-reasoning SLM.
 
-Correlation diagnostics also exercise the current semantic-cluster/co-use
-implementation. The mixed work/personal fixture can expose false co-use links
-even while Phase A/B gates pass: replacing those heuristics is Phase C, not a fix
-silently claimed by this tranche. No aggregate "AI quality percentage" is emitted.
+Correlation diagnostics also exercise the context/history path. Phase C removes
+the old blanket bag-co-use edges and adds its own typed/task/search invariants
+below. No aggregate "AI quality percentage" is emitted.
 
 The Phase B corpus additionally checks persisted provenance, coverage states,
 exclusive-end/as-of membership, final-page exposure and checkpoint/restart
@@ -94,8 +93,8 @@ python tests\eval\signal_quality.py `
 ```
 
 This runs the same corrected evidence through the production Granite clustering
-path. It **does not enable Qwen**, change registry settings, or implement the
-proposed Phase C SLM task-hypothesis interface. Reports record the model mode and
+path. It **does not enable Qwen** or change registry settings. Use the separate
+Phase C command below to evaluate the evidence-linked model interface. Reports record the model mode and
 actual SHA-256/size of model/tokenizer inputs. Native binary, corpus and evaluator
 hashes, source revision and dirty-worktree status identify the evaluated build.
 
@@ -204,8 +203,106 @@ A search observation example (the labels belong in the corpus, not in this row):
 }
 ```
 
-This is an **evaluation protocol**, not a new WARP runtime API or a claim that
-the current model produces evidence-linked task hypotheses.
+This generic export format remains an **evaluation protocol**. The implemented
+Phase C task/search API has its own contract in [API.md](../API.md).
+
+## Phase C synthetic search and model evaluation
+
+```powershell
+# Builds native code, runs focused safeguards, then evaluates the complete corpus.
+.\tests\run_signal_quality.ps1 -PhaseC
+.\tests\run_signal_quality.ps1 -PhaseC -Platform ARM64
+
+# The actual pinned dev Qwen model on identical evidence; no registry changes.
+.\tests\run_signal_quality.ps1 -PhaseC -NoBuild -WithSlm -ModelsDir .\models
+
+# Development/tuning split only (not a held-out release gate).
+python tests\eval\phase_c_quality.py `
+  --native-bin build\tests\x64\Release\WarpTests.exe `
+  --split tune --output-dir build\phase-c-tune
+```
+
+Default results go to `build\phase-c-quality`: frozen replay inputs, native log,
+observations and `scorecard.json`. CI runs the deterministic gate on every build;
+manual `workflow_dispatch` can additionally request `evaluate_slm`.
+Model downloads are a separate step: `scripts\fetch_models.ps1 -RequirePinned`.
+The lock preserves the known-good dev model inputs rather than upgrading them.
+
+`fixtures\phase_c_search.jsonl` is **272 synthetic labeled cases** across
+16 independent project/session groups: 68 tuning cases and 204 held-out cases.
+Groups are disjoint. The 17 scenarios cover ambiguous filenames, content-only
+matches, unseen relevant files, exact filenames, task switches/returns,
+historical windows, stale/missing context, unrelated queries, downloads,
+multilingual metadata, adversarial titles, privacy invalidation, reused paths
+and delayed receipt/as-of cutoffs. The generator is deterministic and never
+reads user files. Relevance labels identify the synthetic intended target;
+they are not chosen from the baseline's winning rank.
+
+The native runner inserts synthetic observations into scratch stores and calls
+the actual context/feature API. The predictor never reads `labels`; Python uses
+those only for scoring. Frozen candidate lists isolate **reranking**, not
+retrieval across a real disk:
+
+| Arm | What runs |
+|---|---|
+| No context | Stable baseline filename/content match scores. |
+| Engagement only | The previous FindMyFile-style `+125 * engagement` policy; a comparison arm, not the new shipping default. |
+| Deterministic | Real Phase C features plus the shared production `SearchRanking.h` exact-match/maximum-delta policy. |
+| Local SLM | Same evidence/candidates, actual Qwen, strict host validation and deterministic fallback. |
+
+The model subset is selected **before held-out evaluation**: one
+ambiguous/task-switch/multilingual/adversarial case per project, stratified across
+groups (4 tuning, 12 held-out). This bounds local CPU cost without silently
+calling unevaluated cases model successes. Model aggregates use only that paired
+subset. This small experiment is not a broad trained-model benchmark.
+
+`eval\phase_c_gates.json` freezes the policy and thresholds: at least +0.03
+held-out nDCG@10, a positive 95% paired-project bootstrap lower bound (4,000
+resamples), zero exact-match or unseen-recall regressions, zero fallback-order
+changes, zero unsupported accepted claims, and task-switch/boundary invariants.
+MRR@10, Recall@10 and top-result task success are reported by cohort.
+The scorer independently audits accepted model IDs/support/roles in addition
+to the native validator. Abstention, malformed output, unavailability and
+unrun model cases remain distinct.
+
+Qwen is not enabled by a deterministic pass. The model must additionally improve
+paired nDCG@10 by at least +0.02 with a positive lower bound and satisfy the
+declared cost budget. A valid abstention is not an improvement. The default stays
+deterministic when these conditions are not met.
+
+### Recorded Phase C result
+
+The final local ARM64 replay (272 cases, 204 held-out across 12 project groups)
+produced the following **synthetic reranking** result:
+
+| Held-out metric | Baseline | Deterministic context |
+|---|---:|---:|
+| nDCG@10 | 0.3760 | 0.7556 |
+| MRR@10 | 0.2737 | 0.7158 |
+| Recall@10 | 0.7255 | 0.8922 |
+| Top-result success | 0.1618 | 0.6716 |
+
+Paired-project nDCG gain was 0.3796, with a 95% bootstrap interval of
+[0.3504, 0.4039]. Exact-match, unseen-recall, fallback-order, task-boundary,
+task-switch, unsupported-accepted-claim, API and candidate-set invariants all
+had zero failures. Final native regressions passed on ARM64 and x64 (124 each);
+the product built for ARM64, x64 and x86.
+
+The actual pinned Qwen subset ran 16 cases (12 held-out): six accepted
+abstentions, no accepted task hypotheses, and no incremental ranking gain.
+The deterministic paired subset already scored 1.0, so that subset has a
+ceiling effect: it cannot establish a general absence of model value.
+Observed model p95 was about 48.8 seconds under concurrent local build load,
+not a controlled production benchmark. This experiment provides no basis to
+enable `ContextModelEnabled` by default. Keep the corpus and gates fixed when
+reproducing this result; new capability experiments need separately labeled data.
+
+API latency is measured in-process on synthetic scratch databases, not over
+the pipe or across a populated index. Model latency includes the observed
+generation call; cold loading/prefill can exceed the cooperative decode budget.
+Background machine load can affect timing. No measured capture precision,
+continuous-agent battery impact, real-user relevance or full-disk recall is
+implied by a synthetic pass.
 
 ## Metrics
 

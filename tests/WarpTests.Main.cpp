@@ -18,6 +18,7 @@ namespace
 }
 
 int RunQualityReplay(const std::wstring& input, const std::wstring& output, const std::wstring& models);
+int RunSearchReplay(const std::wstring& input, const std::wstring& output, const std::wstring& models, bool modelEval);
 
 namespace wt
 {
@@ -79,7 +80,8 @@ namespace wt
 int wmain(int argc, wchar_t** argv)
 {
     std::string filter;
-    std::wstring replay, output, report, models;
+    std::wstring replay, output, report, models, searchReplay;
+    bool modelEval = false;
     unsigned timeoutSec = 600;
     // Options may be spelled --name, -name or /name.
     auto is = [](const wchar_t* arg, const wchar_t* name)
@@ -95,6 +97,8 @@ int wmain(int argc, wchar_t** argv)
         else if (is(argv[i], L"output") && i + 1 < argc) output = argv[++i];
         else if (is(argv[i], L"report") && i + 1 < argc) report = argv[++i];
         else if (is(argv[i], L"models") && i + 1 < argc) models = argv[++i];
+        else if (is(argv[i], L"search-replay") && i + 1 < argc) searchReplay = argv[++i];
+        else if (is(argv[i], L"model-eval")) modelEval = true;
         else if (is(argv[i], L"list"))
         {
             for (const wt::TestCase& t : wt::Registry()) std::printf("%s.%s\n", t.suite, t.name);
@@ -113,12 +117,13 @@ int wmain(int argc, wchar_t** argv)
         TerminateProcess(GetCurrentProcess(), 3);
     }).detach();
 
-    if (!replay.empty())
+    if (!replay.empty() || !searchReplay.empty())
     {
         try
         {
             if (output.empty()) throw std::runtime_error("/replay requires /output");
-            return RunQualityReplay(replay, output, models);
+            return searchReplay.empty() ? RunQualityReplay(replay, output, models) :
+                RunSearchReplay(searchReplay, output, models, modelEval);
         }
         catch (const std::exception& e) { std::fprintf(stderr, "Replay failed: %s\n", e.what()); return 1; }
     }

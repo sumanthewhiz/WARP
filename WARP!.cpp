@@ -1978,7 +1978,8 @@ namespace
         if (full) w.KV("media_playing", ps.mediaPlaying).KV("mic_in_use", ps.micInUse).KV("camera_in_use", ps.cameraInUse);
         w.EndObject();
         w.Key("models").BeginObject().KV("embedding_loaded", g_contextInference.IsModelLoaded())
-         .KV("llm_enabled", cfg.llmEnabled).KV("llm_available", g_llmSummarizer.IsAvailable())
+         .KV("llm_enabled", cfg.llmEnabled).KV("context_model_enabled", cfg.contextModelEnabled)
+         .KV("llm_available", g_llmSummarizer.IsAvailable())
          .KV("llm_resident", g_llmSummarizer.IsLoaded()).EndObject();
         if (full) w.KV("data_dir", g_dataDir);
         w.KV("elevated", IsElevated()).KV("headless", g_headless).KV("logon_task_installed", g_taskInstalled);
@@ -2066,7 +2067,7 @@ void StartSubsystems()
     g_contextInference.SetHistoryEngine(&g_history);
     g_contextInference.SetPresenceProvider([]() { return PresenceName(); });
     // PERF-1 / INTEL-6: the LLM refiner is opt-in (LlmEnabled); nothing is loaded otherwise.
-    if (cfg.llmEnabled && g_llmSummarizer.Init(modelsDir))
+    if ((cfg.llmEnabled || cfg.contextModelEnabled) && g_llmSummarizer.Init(modelsDir))
         g_contextInference.SetLlmSummarizer(&g_llmSummarizer);
     WARP_LOG_INFO("main", "models: embedding=%d llm=%d (dir=%S)", g_contextInference.IsModelLoaded() ? 1 : 0,
                   g_llmSummarizer.IsAvailable() ? 1 : 0, modelsDir.c_str());

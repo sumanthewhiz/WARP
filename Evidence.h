@@ -52,6 +52,15 @@ struct ArtifactAlias
 {
     std::string pathKey, artifactId, physicalId, basis, evidenceId;
     int64_t fromMs = 0, toMs = 0;
+    int64_t closedReceivedMs = 0;
+};
+
+struct EvidenceRelation
+{
+    std::string id, from, to, kind, source, basis;
+    int64_t startMs = 0, endMs = 0, receivedMs = 0;
+    double quality = 0;
+    std::vector<std::string> support;
 };
 
 namespace Evidence
@@ -61,6 +70,7 @@ namespace Evidence
     std::string NewId(const char* prefix);
     std::string FileSha256(const std::wstring& path);
     std::string Fingerprint(const std::string& value);
+    std::string WorkspaceFor(const std::string& display, const std::string& type);
     const std::string& RuntimeId();
     int64_t NowMs();
     void Prepare(ObservationEvidence& e);
@@ -69,4 +79,5 @@ namespace Evidence
     void Write(WarpJson::Writer& w, const ObservationEvidence& e);
     void Write(WarpJson::Writer& w, const EpisodeRecord& e);
     void Write(WarpJson::Writer& w, const SourceCoverage& c);
+    void Write(WarpJson::Writer& w, const EvidenceRelation& r);
 } // namespace Evidence

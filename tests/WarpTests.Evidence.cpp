@@ -575,7 +575,7 @@ TEST(Evidence, LegacyV3UpgradeKeepsUnknownProvenanceRatherThanFabricatingIt)
     REQUIRE(restored.Open(f.dir.File(L"evidence.db")));
     const auto evidence = restored.ReadEvidence((f.now - 100) * 1000, f.now * 1000);
     REQUIRE(evidence.files.size() == 1);
-    CHECK_EQ(restored.GetStats().schemaVersion, 4);
+    CHECK_EQ(restored.GetStats().schemaVersion, 5);
     CHECK(evidence.files[0].evidence.id.empty());
     CHECK(evidence.partial);
     CHECK(evidence.episodes.empty());

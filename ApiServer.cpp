@@ -126,6 +126,7 @@ std::wstring ApiServer::SessionPipeName(DWORD sessionId)
 
 void ApiServer::Configure(const Deps& deps)
 {
+    { std::lock_guard<std::mutex> lock(m_searchMtx); m_searchFrames.clear(); }
     m_deps = deps;
     m_startedUtc = NowUtc();
     ProcessIdToSessionId(GetCurrentProcessId(), &m_sessionId);
@@ -528,6 +529,7 @@ namespace
         "GetInferenceDeltas", "GetRecentContext", "GetRecentContexts", "TopEntities", "SearchActivity", "GetChanges",
         "QueryTimeline", "GetWorkThreads", "GetRelated", "GetCurrentContext",
         "GetIntervalContext", "GetContextEvidence", "ResolveFileIdentity",
+        "GetSearchContext", "ScoreCandidates",
     };
     const char* const kControlOps[] = { "Purge", "Pause", "Resume" };
 
@@ -688,6 +690,8 @@ std::string ApiServer::Dispatch(const Value& req, const ApiClient& c)
     if (op == "GetWorkThreads")     return GetWorkThreads(req);
     if (op == "GetRelated")         return GetRelated(req);
     if (op == "GetCurrentContext")  return GetCurrentContext(req);
+    if (op == "GetSearchContext")   return GetSearchContext(req);
+    if (op == "ScoreCandidates")    return ScoreCandidates(req);
     if (op == "Purge")              return Purge(req);
     if (op == "Pause")              return Pause(req, false);
     if (op == "Resume")             return Pause(req, true);
@@ -749,6 +753,126 @@ std::string ApiServer::Dispatch(const Value& req, const ApiClient& c)
         return WithApiVersion(m_deps.context->GetRecentContexts(count, category, winSecs, includeVector));
     }
     return Error("unknown_op", "unknown op '" + op + "'");
+}
+
+namespace
+{
+    std::string SearchPrivacyStamp()
+    {
+        std::string values;
+        for (const auto& value : Settings::Instance().Describe())
+            values += WarpJson::WideToUtf8(value.first) + "=" + WarpJson::WideToUtf8(value.second) + "\n";
+        return Evidence::Fingerprint(values);
+    }
+
+    bool AbsoluteSearchPath(const std::string& value)
+    {
+        if (value.empty() || value.size() > 32768 || value.find('\0') != std::string::npos) return false;
+        auto path = WarpJson::Utf8ToWide(value);
+        return (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) ||
+            (path.size() > 2 && path[0] == L'\\' && path[1] == L'\\');
+    }
+}
+
+std::string ApiServer::GetSearchContext(const Value& req)
+{
+    if (!m_deps.context) return Error("unavailable", "context inference is not running");
+    const int64_t now = NowUtc();
+    const auto mode = req.get("mode").asString("current");
+    if ((req.has("mode") && !req.get("mode").isString()) || (mode != "current" && mode != "interval"))
+        return Error("invalid_request", "mode must be current or interval");
+    const bool historical = mode == "interval";
+    const int64_t end = historical ? req.get("end").asInt64(-1) : now;
+    const int64_t start = historical ? req.get("start").asInt64(-1) : now - 900;
+    const int64_t asOf = req.get("as_of").asInt64(now);
+    if ((historical && (!req.get("start").isInteger() || !req.get("end").isInteger())) ||
+        (!historical && (req.has("start") || req.has("end") || req.has("as_of"))) ||
+        (req.has("as_of") && !req.get("as_of").isInteger()) || start < 0 ||
+        end <= start || end - start > 30LL * 86400 || end > asOf || asOf > now)
+        return Error("invalid_request", "Use current, or an interval with 0 <= start < end <= as_of <= now (maximum 30 days).");
+    const auto epoch = m_deps.store->EvidenceEpoch();
+    const auto privacy = SearchPrivacyStamp();
+    auto frame = m_deps.context->GetSearchFrame(start, end, asOf, historical);
+    if (!frame.available) return Error("unavailable", "the evidence snapshot could not be read");
+    if (epoch != m_deps.store->EvidenceEpoch() || privacy != SearchPrivacyStamp())
+        return Error("context_invalidated", "privacy or retained evidence changed; start a new search");
+    const auto id = Evidence::NewId("search");
+    const int64_t expires = NowMs() + 60000;
+    {
+        std::lock_guard<std::mutex> lock(m_searchMtx);
+        for (auto it = m_searchFrames.begin(); it != m_searchFrames.end();)
+            it = it->second.expiresMs < NowMs() || it->second.epoch != epoch ?
+                m_searchFrames.erase(it) : std::next(it);
+        if (m_searchFrames.size() >= 32)
+        {
+            const auto oldest = std::min_element(m_searchFrames.begin(), m_searchFrames.end(),
+                [](const auto& a, const auto& b) { return a.second.expiresMs < b.second.expiresMs; });
+            m_searchFrames.erase(oldest);
+        }
+        m_searchFrames.emplace(id, FrozenSearch{ frame, epoch, expires, privacy });
+    }
+    std::string out; Writer w(out);
+    w.BeginObject().KV("api_version", kApiVersion).KV("ok", true).KV("context_ref", id)
+        .KV("expires_ms", expires).KV("model_on_request_path", false)
+        .Key("context").Raw(ContextIntelligence::Json(frame)).EndObject();
+    return out;
+}
+
+std::string ApiServer::ScoreCandidates(const Value& req)
+{
+    if (!req.get("context_ref").isString() || req.get("context_ref").asString().size() > 128 ||
+        !req.get("query").isString() || req.get("query").asString().empty() || req.get("query").asString().size() > 1024 ||
+        !req.get("candidates").isArray() || req.get("candidates").size() == 0 || req.get("candidates").size() > 256)
+        return Error("invalid_request", "Provide a context_ref, query (1..1024 UTF-8 bytes), and 1..256 candidates.");
+    const auto intent = req.get("intent").asString("general");
+    if ((req.has("intent") && !req.get("intent").isString()) ||
+        (intent != "general" && intent != "download" && intent != "open" && intent != "modify"))
+        return Error("invalid_request", "intent must be general, download, open, or modify");
+    std::vector<ContextIntelligence::Candidate> candidates;
+    std::set<std::string> keys;
+    for (const auto& value : req.get("candidates").items())
+    {
+        if (!value.isObject() || !value.get("key").isString() || !AbsoluteSearchPath(value.get("key").asString()) ||
+            !value.get("base_score").isNumber() || !std::isfinite(value.get("base_score").asDouble()) ||
+            value.get("base_score").asDouble() < 0 || value.get("base_score").asDouble() > 200 ||
+            (value.has("name") && (!value.get("name").isString() || value.get("name").asString().size() > 1024)) ||
+            (value.has("title") && (!value.get("title").isString() || value.get("title").asString().size() > 2048)) ||
+            (value.has("exact") && !value.get("exact").isBool()))
+            return Error("invalid_request", "Each candidate needs an absolute file key and finite base_score in [0,200]; metadata must be bounded strings.");
+        ContextIntelligence::Candidate candidate;
+        candidate.key = EntityKey::FileKey(WarpJson::Utf8ToWide(value.get("key").asString()));
+        if (!keys.insert(candidate.key).second) return Error("invalid_request", "Candidate keys must be unique after normalization.");
+        candidate.name = value.get("name").asString();
+        candidate.title = value.get("title").asString();
+        candidate.baseScore = value.get("base_score").asDouble();
+        candidate.exact = value.get("exact").asBool();
+        candidates.push_back(std::move(candidate));
+    }
+    FrozenSearch frozen;
+    {
+        std::lock_guard<std::mutex> lock(m_searchMtx);
+        const auto it = m_searchFrames.find(req.get("context_ref").asString());
+        if (it == m_searchFrames.end()) return Error("context_expired", "Start a new search with GetSearchContext.");
+        frozen = it->second;
+    }
+    if (frozen.expiresMs < NowMs()) return Error("context_expired", "The frozen context expired; keep baseline results.");
+    if (frozen.epoch != m_deps.store->EvidenceEpoch() || frozen.privacy != SearchPrivacyStamp())
+    {
+        std::lock_guard<std::mutex> lock(m_searchMtx); m_searchFrames.clear();
+        return Error("context_invalidated", "Privacy or retention changed; discard derived features.");
+    }
+    const auto features = ContextIntelligence::Score(frozen.frame, req.get("query").asString(), intent, candidates, NowMs());
+    if (frozen.epoch != m_deps.store->EvidenceEpoch() || frozen.privacy != SearchPrivacyStamp())
+        return Error("context_invalidated", "Privacy or retention changed while scoring.");
+    std::string out; Writer w(out);
+    w.BeginObject().KV("api_version", kApiVersion).KV("ok", true)
+        .KV("context_ref", req.get("context_ref").asString()).KV("rule_version", "phase-c-rank-1")
+        .KV("input_watermark", frozen.frame.watermark).KV("expires_ms", frozen.expiresMs)
+        .KV("partial", frozen.frame.partial).KV("max_score_delta", 8).KV("exact_matches_first", true)
+        .KV("query_and_candidates_persisted", false).Key("candidates").BeginArray();
+    for (const auto& feature : features) ContextIntelligence::Write(w, feature);
+    w.EndArray().EndObject();
+    return out;
 }
 
 std::string ApiServer::RawEvents(const Value& req, const ApiClient&)

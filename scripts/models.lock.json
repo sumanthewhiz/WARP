@@ -11,37 +11,37 @@
     {
       "name": "granite",
       "repo": "onnx-community/granite-embedding-small-english-r2-ONNX",
-      "revision": "main",
+      "revision": "1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8",
       "license": "Apache-2.0",
       "dest": "models/granite",
       "files": [
-        { "path": "onnx/model_quantized.onnx", "dest": "model_quantized.onnx", "sha256": "" },
-        { "path": "onnx/model_quantized.onnx_data", "dest": "model_quantized.onnx_data", "sha256": "" }
+        { "path": "onnx/model_quantized.onnx", "dest": "model_quantized.onnx", "sha256": "a3fad524afc3f060216a8ddbb1ac89c9b6498fba8995b5718bde879076a2e9ba" },
+        { "path": "onnx/model_quantized.onnx_data", "dest": "model_quantized.onnx_data", "sha256": "1f4cf47e4adec7f7ae09db03d071ba8667e07f9a4203142c7efa8d37fe453597" }
       ]
     },
     {
       "name": "granite-tokenizer",
       "repo": "ibm-granite/granite-embedding-small-english-r2",
-      "revision": "main",
+      "revision": "2ab6fa8ea2d674564defd37171ae19079b864b33",
       "license": "Apache-2.0",
       "dest": "models/granite",
       "files": [
-        { "path": "tokenizer.json", "dest": "tokenizer.json", "sha256": "" }
+        { "path": "tokenizer.json", "dest": "tokenizer.json", "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30" }
       ]
     },
     {
       "name": "qwen",
       "repo": "xiaoyao9184/Qwen3-0.6B-onnx-genai",
-      "revision": "main",
+      "revision": "dfaa6540d16eb3e12eeac660ac80cf69cd5e282d",
       "license": "Apache-2.0",
       "dest": "models/qwen",
       "files": [
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/chat_template.jinja", "dest": "chat_template.jinja", "sha256": "" },
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/genai_config.json", "dest": "genai_config.json", "sha256": "" },
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx", "dest": "model.onnx", "sha256": "" },
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx.data", "dest": "model.onnx.data", "sha256": "" },
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer.json", "dest": "tokenizer.json", "sha256": "" },
-        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer_config.json", "dest": "tokenizer_config.json", "sha256": "" }
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/chat_template.jinja", "dest": "chat_template.jinja", "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/genai_config.json", "dest": "genai_config.json", "sha256": "67348085a5b994a6b6d94e56e395e675d8ef4732c3c46ff75de30a541489fd3f" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx", "dest": "model.onnx", "sha256": "b52cfcd91e6ed3caa34c670d4831d96cda3da5eb07ef95bc8ba06547b4f3b86f" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/model.onnx.data", "dest": "model.onnx.data", "sha256": "8539cf4fbc3b5b331fd78ca8cd5b025ce537dfc2f993451f5c474b2f9fb7cd6c" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer.json", "dest": "tokenizer.json", "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506" },
+        { "path": "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/tokenizer_config.json", "dest": "tokenizer_config.json", "sha256": "cdb13a71c5f262ebf0267af34fc287d91311d12d8c8b92e2b44081cd8c12aded" }
       ]
     }
   ]

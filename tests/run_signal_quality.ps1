@@ -3,6 +3,9 @@ param(
     [ValidateSet('x64', 'ARM64')]
     [string]$Platform = 'x64',
     [switch]$NoBuild,
+    [switch]$PhaseC,
+    [switch]$WithSlm,
+    [string]$ModelsDir,
     [string]$Corpus,
     [string]$OutputDir,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -28,9 +31,18 @@ if (-not $NoBuild) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-$arguments = @((Join-Path $PSScriptRoot 'eval\signal_quality.py'), '--native-bin', $exe)
+$evaluator = if ($PhaseC) { 'eval\phase_c_quality.py' } else { 'eval\signal_quality.py' }
+if ($WithSlm -and (-not $PhaseC -or -not $ModelsDir)) { throw '-WithSlm requires -PhaseC and -ModelsDir.' }
+if ($PhaseC -and -not $OutputDir) { $OutputDir = Join-Path $repo 'build\phase-c-quality' }
+if ($PhaseC) {
+    & $exe /filter Search. /timeout 600
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+$arguments = @((Join-Path $PSScriptRoot $evaluator), '--native-bin', $exe)
 if ($Corpus) { $arguments += @('--corpus', $Corpus) }
 if ($OutputDir) { $arguments += @('--output-dir', $OutputDir) }
+if ($ModelsDir) { $arguments += @('--models-dir', $ModelsDir) }
+if ($WithSlm) { $arguments += '--with-slm' }
 if ($EvaluationArgs) { $arguments += $EvaluationArgs }
 & python @arguments
 exit $LASTEXITCODE

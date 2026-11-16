@@ -118,6 +118,8 @@ public:
     // Name reported in the JSON snapshot, e.g.
     // "qwen3-0.6b" or "(not loaded)".
     std::string ModelName() const;
+    std::string InterpretEvidence(const std::string& boundedEvidenceJson) const;
+    std::string EvidenceModelMetadata() const;
 
     // Take the existing structured summary (3 cluster lines for the
     // combined view, or 1-3 per-category lines) plus the activity
@@ -157,4 +159,5 @@ private:
     mutable uint64_t              m_loadRetryTick = 0;   // requires m_genMutex: no load attempt before this tick
     mutable unsigned              m_loadFailures = 0;    // requires m_genMutex: consecutive failed loads
     std::string                   m_modelName;
+    std::string                   m_weightsHash, m_graphHash, m_tokenizerHash, m_configHash;
 };

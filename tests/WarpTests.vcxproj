@@ -33,6 +33,7 @@
     <RootNamespace>WarpTests</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <OrtPackage>$(MSBuildThisFileDirectory)..\..\packages\Microsoft.ML.OnnxRuntime.1.23.0</OrtPackage>
+    <GenAiPackage>$(MSBuildThisFileDirectory)..\..\packages\Microsoft.ML.OnnxRuntimeGenAI.0.14.1</GenAiPackage>
     <OrtArch Condition="'$(Platform)'=='ARM64'">arm64</OrtArch>
     <OrtArch Condition="'$(Platform)'!='ARM64'">x64</OrtArch>
   </PropertyGroup>
@@ -61,13 +62,23 @@
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <PreprocessorDefinitions>WARP_UNIT_TESTS;SQLITE_ENABLE_FTS5;SQLITE_ENABLE_MATH_FUNCTIONS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..;$(OrtPackage)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..;$(OrtPackage)\build\native\include;$(GenAiPackage)\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(OrtPackage)\runtimes\win-$(OrtArch)\native;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>onnxruntime.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="Exists('$(GenAiPackage)\runtimes\win-$(OrtArch)\native\onnxruntime-genai.lib')">
+    <ClCompile>
+      <PreprocessorDefinitions>WARP_HAS_ORT_GENAI;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(GenAiPackage)\runtimes\win-$(OrtArch)\native;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>onnxruntime-genai.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>onnxruntime-genai.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -94,11 +105,13 @@
     <ClCompile Include="WarpTests.Api.cpp" />
     <ClCompile Include="WarpTests.Context.cpp" />
     <ClCompile Include="WarpTests.Evidence.cpp" />
+    <ClCompile Include="WarpTests.Search.cpp" />
     <!-- product code under test -->
     <ClCompile Include="..\ActivityStore.cpp" />
     <ClCompile Include="..\AddressBarReader.cpp" />
     <ClCompile Include="..\ApiServer.cpp" />
     <ClCompile Include="..\ContextInference.cpp" />
+    <ClCompile Include="..\ContextIntelligence.cpp" />
     <ClCompile Include="..\DesktopInfo.cpp" />
     <ClCompile Include="..\DocResolver.cpp" />
     <ClCompile Include="..\EntityKey.cpp" />
@@ -131,5 +144,6 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="CopyTestRuntime" AfterTargets="Build">
     <Copy SourceFiles="$(OrtPackage)\runtimes\win-$(OrtArch)\native\onnxruntime.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(GenAiPackage)\runtimes\win-$(OrtArch)\native\onnxruntime-genai.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(GenAiPackage)\runtimes\win-$(OrtArch)\native\onnxruntime-genai.dll')" />
   </Target>
 </Project>

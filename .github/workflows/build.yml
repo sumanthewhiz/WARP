@@ -2,6 +2,11 @@ name: Build WARP
 
 on:
   workflow_dispatch:
+    inputs:
+      evaluate_slm:
+        description: Compare pinned Qwen with deterministic Phase C evidence
+        type: boolean
+        default: false
   push:
     branches: [ '**' ]
   pull_request:
@@ -60,13 +65,16 @@ jobs:
 
     - name: Download and verify model inputs (pinned, SEC-2)
       shell: pwsh
+      env:
+        WARP_TARGET_BRANCH: ${{ steps.branch.outputs.raw }}
       run: |
         # granite-embedding-small-english-r2 (ModernBERT INT8 ONNX + the upstream tokenizer.json)
         # and the optional Qwen3-0.6B ORT-GenAI bundle. scripts/fetch_models.ps1 downloads from
         # immutable resolve/<commit> URLs and verifies every file (pinned SHA-256 in
         # scripts/models.lock.json, else the hashes Hugging Face publishes). Release branches
         # require full pins. It also writes the refiner's thread cap into genai_config.json (PERF-1).
-        $release = '${{ github.ref_name }}' -in @('main', 'master')
+        $release = $env:WARP_TARGET_BRANCH -in @('main', 'master')
+        Write-Host "Target branch: $env:WARP_TARGET_BRANCH; RequirePinned=$release"
         ./scripts/fetch_models.ps1 -RequirePinned:$release
 
         # Extract the flat vocab.txt + merges.txt + special_tokens.txt the C++
@@ -127,6 +135,26 @@ jobs:
       with:
         name: signal-quality-x64
         path: build/signal-quality/
+        if-no-files-found: warn
+
+    - name: Phase C synthetic search and grounding gates
+      timeout-minutes: 30
+      shell: pwsh
+      env:
+        EVALUATE_SLM: ${{ inputs.evaluate_slm }}
+      run: |
+        $arguments = @('tests\eval\phase_c_quality.py', '--native-bin', 'build\tests\x64\Release\WarpTests.exe',
+                       '--output-dir', 'build\phase-c-quality')
+        if ($env:EVALUATE_SLM -eq 'true') { $arguments += @('--with-slm', '--models-dir', 'models') }
+        python @arguments
+        exit $LASTEXITCODE
+
+    - name: Upload Phase C evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: phase-c-quality-x64
+        path: build/phase-c-quality/
         if-no-files-found: warn
 
     # ENG-3: start the real binary headless against a temp data directory, query the live pipe

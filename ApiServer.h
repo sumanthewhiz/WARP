@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "Json.h"
+#include "ContextIntelligence.h"
+#include <map>
 
 class ActivityStore;
 class EntityStore;
@@ -128,6 +130,8 @@ private:
     std::string GetWorkThreads(const WarpJson::Value& req);
     std::string GetRelated(const WarpJson::Value& req);
     std::string GetCurrentContext(const WarpJson::Value& req);
+    std::string GetSearchContext(const WarpJson::Value& req);
+    std::string ScoreCandidates(const WarpJson::Value& req);
     std::string GetStatus(const ApiClient& c);
     std::string Purge(const WarpJson::Value& req);
     std::string Pause(const WarpJson::Value& req, bool resume);
@@ -154,4 +158,13 @@ private:
     std::atomic<int> m_longPolls{ 0 };
     mutable std::mutex m_statsMtx;
     Stats m_stats;
+    struct FrozenSearch
+    {
+        ContextIntelligence::Frame frame;
+        uint64_t epoch = 0;
+        int64_t expiresMs = 0;
+        std::string privacy;
+    };
+    std::mutex m_searchMtx;
+    std::map<std::string, FrozenSearch> m_searchFrames;
 };

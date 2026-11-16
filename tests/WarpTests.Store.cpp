@@ -77,12 +77,12 @@ namespace
     }
 }
 
-TEST(Store, OpensFreshDatabaseAtSchemaV4)
+TEST(Store, OpensFreshDatabaseAtSchemaV5)
 {
     Fixture f;
     REQUIRE(f.open);
     ActivityStore::Stats s = f.store.GetStats();
-    CHECK_EQ(s.schemaVersion, 4);
+    CHECK_EQ(s.schemaVersion, 5);
     std::string fts;
     CHECK(f.store.GetMeta("fts_available", fts));
     CHECK_EQ(fts, std::string("1"));                  // the test build compiles SQLite with FTS5
@@ -646,7 +646,7 @@ TEST(Store, MigratesALegacyV1Database)
     store.AddSink(&ents);
     store.AddSink(&hist);
     REQUIRE(store.Open(path));
-    CHECK_EQ(store.GetStats().schemaVersion, 4);
+    CHECK_EQ(store.GetStats().schemaVersion, 5);
 
     EntityRecord plan = ents.Lookup({ EntityKey::FileKey(L"C:\\Legacy\\Plan.DOCX") })[0];
     REQUIRE(!plan.entityKey.empty());
@@ -705,15 +705,16 @@ TEST(History, SnapshotsWithTheSameEntitiesShareAThread)
     CHECK_EQ(f.hist.GetThreads(0, 0, 10, true).size(), (size_t)2);
 
     std::vector<RelatedEntity> rel = f.hist.Related(EntityKey::FileKey(a), 10);
-    REQUIRE(!rel.empty());
-    CHECK_EQ(rel[0].entityKey, EntityKey::FileKey(b));
+    CHECK(rel.empty()); // shared snapshot membership is not a supported relation
 
     // Returning to the first task resumes its thread instead of starting a third one.
     const int64_t t4 = f.hist.RecordSnapshot(snap(t + 180, { { a, 300.0 }, { b, 100.0 } }));
     CHECK_EQ(t4, t1);
-    std::vector<double> boost = f.hist.ContextBoost({ EntityKey::FileKey(a), EntityKey::FileKey(x) });
+    std::vector<double> boost = f.hist.ContextBoost({ EntityKey::FileKey(a), EntityKey::FileKey(x) }, t + 180);
     REQUIRE(boost.size() == 2);
     CHECK(boost[0] > boost[1]);
+    const auto stale = f.hist.ContextBoost({ EntityKey::FileKey(a) });
+    CHECK_EQ(stale[0], 0.0);
 }
 
 TEST(History, ProjectKeysAnchorOnRepositoriesAndSites)

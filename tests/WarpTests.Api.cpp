@@ -226,7 +226,7 @@ TEST(Api, StatusThreadsAndLongPoll)
     WarpJson::Value s = f.Call("{\"op\":\"GetStatus\"}");
     CHECK(s["ok"].asBool());
     CHECK(s["store"]["open"].asBool());
-    CHECK_EQ(s["store"]["schema_version"].asInt64(), (int64_t)4);
+    CHECK_EQ(s["store"]["schema_version"].asInt64(), (int64_t)5);
     CHECK(s["settings"].isObject());
     CHECK(f.Call("{\"op\":\"GetWorkThreads\"}")["threads"].isArray());
 

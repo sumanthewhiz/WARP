@@ -1,13 +1,75 @@
-# WARP storage schema v4
+# WARP storage schema v5
 
-The `dev` Phase B update uses **SQLite schema 4**, **API version 2**, and
+The `dev` Phase C update uses **SQLite schema 5**, **API version 2**, and
 **identity format 2**. These version numbers describe different contracts.
-`ActivityStore::Migrate` / `MigrateV3` / `MigrateV4` are authoritative; consumers should normally
+`ActivityStore::Migrate` / `MigrateV3` / `MigrateV4` / `MigrateV5` are authoritative; consumers should normally
 use [API.md](API.md), not write the database directly.
 
 The database remains `%LOCALAPPDATA%\WARP\activity.db`: WAL, one writer,
 transactional raw/derived updates, bounded producer queue, three pooled readers.
 There are no SQL foreign keys; the writer maintains the logical relationships.
+
+## Phase C: supported relations and task hypotheses
+
+Schema v5 retains v4 observations/episodes and adds:
+
+| Structure | Stored contract |
+|---|---|
+| `evidence_relation` | Stable content-derived `id`, directed `from_key`/`to_key`, `kind`, half-open millisecond extent, `received_ms`, uncalibrated `quality`, `source`, and explicit `basis`. |
+| `relation_support` | `(relation_id,support_id)` links to retained observation IDs. Deleting any supporting observation deletes the entire relation through triggers. |
+| `task_support` | Unique supporting `evidence_id`, assigned `thread_id`, `entity_key`, and `last_ms`; prevents rolling windows from crediting the same observation repeatedly. |
+| `work_thread.evidence_version` | 0 for legacy snapshot-bag threads; 1 for newly assigned evidence-based threads. Old threads remain historical records, not automatically trusted current tasks. |
+| `artifact_alias.closed_received_ms` | Knowledge time of a closing boundary. As-of projections do not expose a rename/delete learned later; legacy closed aliases without this provenance are omitted and mark the read partial. |
+| `meta.relations_available_from` | When v5 relation capture became available. Migration does not fabricate a complete historical relation backfill. |
+
+Relations are inserted with their source observations in the writer transaction.
+They include `opened_in` (resolved foreground app/document association, **not**
+a new OPEN command), `download_origin` (reported origin, **not** proof of reading),
+`renamed_from`, provider-mapped `alias_of`, `within_workspace`, and weak
+`foreground_transition` / `co_used_nearby`. File-copy metadata does not become
+a download relation. Replay and withheld/ambiguous resolution cannot create
+strong task evidence. Directory membership is an association, not proof of intent.
+
+Transitions use adjacent active episodes in event-time order, not the receipt
+order or a bag of all entities in 15 minutes. A transition alone never merges
+tasks. Current task selection follows the latest qualified evidence; interval
+contexts retain multiple hypotheses with no current/primary task. Task start/end
+are extents, not a claim of continuous attention; the accompanying episode
+slices retain task switches and returns. New work-thread time is an interval
+union over deduplicated supporting focus observations.
+
+The legacy `edge` bag-co-use data is cleared at migration and is no longer
+populated. `GetRelated` uses retained typed associations rather than inferring
+a strong link from proximity. Overlapping snapshots update member weights
+without repeatedly accumulating the same elapsed activity.
+
+```mermaid
+flowchart LR
+    Observation["Retained observations + episodes"] --> Relations["evidence_relation + relation_support"]
+    Observation --> Canonical["Canonical entity cards / attention / coverage"]
+    Relations --> Canonical
+    Canonical --> Tasks["Multiple task hypotheses; current task separate"]
+    Tasks --> Threads["work_thread + deduplicated task_support"]
+    Canonical --> Model["Optional bounded Qwen interpretation"]
+    Model --> Gate["Strict IDs, support, roles, grouping and abstention"]
+    Tasks --> Frozen["GetSearchContext: expiring frozen reference"]
+    Gate --> Snapshots["Versioned interpretation in context snapshots"]
+    Frozen --> Features["ScoreCandidates: query-conditioned features"]
+    Features --> Search["Consumer exact-match guard + bounded reranking"]
+```
+
+Relations expire with raw evidence. A privacy purge conservatively clears
+derived relations/dedup bookkeeping; raw evidence, aliases, threads and snapshots
+also follow their existing scoped purge rules. Frozen search references are
+invalidated when the purge/clear/retention transaction commits, including
+references created by a reader while that transaction was pending.
+
+Search queries, candidate names/snippets, and candidate feature responses are
+**not persisted**. The bounded reference cache lives in memory for at most 60
+seconds (and may evict earlier). It is not a consumer-side activity mirror.
+Model interpretations live in the existing snapshot JSON with model/tokenizer/
+runtime-config hashes, prompt/rule versions, status and support; observations
+remain authoritative and are never rewritten as model assertions.
 
 ## Phase B: durable evidence
 
@@ -151,7 +213,7 @@ normalization. The separate historical label embedding is not silently exposed
 as that summary vector. Old snapshots without a summary vector remain empty.
 Do not compare vectors with missing or different compatibility metadata.
 
-## Earlier v2-to-v3 changes retained in v4
+## Earlier v2-to-v3 changes retained in v5
 
 | Area | v3 contract |
 |---|---|

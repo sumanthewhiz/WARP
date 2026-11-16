@@ -1,0 +1,22 @@
+{
+  "schema": "warp.phase-c-gates.v1",
+  "declared_before_evaluation": true,
+  "corpus_policy": "Synthetic labels only; disjoint project/session groups for tune and heldout.",
+  "ranking_policy": "phase-c-rank-1",
+  "max_context_delta": 8.0,
+  "minimum_base_score": 20.0,
+  "tuning_note": "Before heldout evaluation, include the documented Windows Search content-match tier (20); fuzzy-only tiers 15/18 stay below the floor. Literal query/metadata agreement remains required.",
+  "minimum_heldout_ndcg10_gain": 0.03,
+  "bootstrap_confidence": 0.95,
+  "bootstrap_samples": 4000,
+  "bootstrap_seed": 73119,
+  "require_positive_gain_lower_bound": true,
+  "maximum_exact_match_regressions": 0,
+  "maximum_unseen_relevant_recall_regressions": 0,
+  "maximum_fallback_order_changes": 0,
+  "maximum_unsupported_accepted_model_claims": 0,
+  "minimum_slm_incremental_ndcg10_gain_to_enable": 0.02,
+  "model_sampling": "One prespecified ambiguous/task-switch/multilingual/adversarial case per project, stratified before heldout evaluation.",
+  "maximum_slm_p95_total_ms_to_enable": 10000,
+  "default_slm_enabled": false
+}

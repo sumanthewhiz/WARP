@@ -257,6 +257,9 @@ public:
         std::vector<AppFocusActivity> focus;
         std::vector<EpisodeRecord> episodes;
         std::vector<SourceCoverage> coverage;
+        std::vector<EvidenceRelation> relations;
+        std::vector<ArtifactAlias> aliases;
+        int64_t relationsAvailableMs = 0;
         int64_t startMs = 0, endMs = 0, asOfMs = 0, watermark = 0, availableStartMs = 0;
         bool available = false, truncated = false, partial = true, privacyRedacted = false;
     };
@@ -317,6 +320,7 @@ public:
     // ---- change feed ----
     int64_t CurrentChangeSeq() const { return m_committedSeq.load(); }
     int64_t ResetSeq() const { return m_resetSeq.load(); }
+    uint64_t EvidenceEpoch() const { return m_evidenceEpoch.load(); }
     bool    WaitForChange(int64_t afterSeq, DWORD timeoutMs);   // true if CurrentChangeSeq() > afterSeq
 
     // Writer-thread only: delete an inference entity, emit a tombstone into the change feed and
@@ -365,9 +369,13 @@ private:
     bool Migrate();
     bool MigrateV3();
     bool MigrateV4();
+    bool MigrateV5();
     bool EvidenceExists(WriterContext& w, const ObservationEvidence& e);
     void PersistEvidence(WriterContext& w, const char* kind, int64_t rowId, int64_t eventMs, const ObservationEvidence& e);
     void PersistEpisode(WriterContext& w, const EpisodeRecord& r, int64_t rowId = 0);
+    void PersistRelation(WriterContext& w, EvidenceRelation r);
+    void RelateFile(WriterContext& w, const FileEventRecord& r);
+    void RelateFocus(WriterContext& w, const FocusEventRecord& r);
     void ResolveArtifact(WriterContext& w, FileEventRecord& r);
     void PruneEvidence(WriterContext& w);
     void PurgeEvidence(WriterContext& w, const PurgeSpec& spec);
@@ -427,6 +435,8 @@ private:
     std::atomic<int64_t>     m_seq{ 0 };
     std::atomic<int64_t>     m_committedSeq{ 0 };
     std::atomic<int64_t>     m_resetSeq{ 0 };
+    std::atomic<uint64_t>    m_evidenceEpoch{ 0 };
+    bool                    m_evidenceDirty = false; // writer-only; published with COMMIT
     std::mutex               m_seqMtx;
     std::condition_variable  m_seqCv;
 

@@ -151,7 +151,7 @@ raw event queries, `QueryInferences`, `GetInferenceDeltas`, `GetRecentContext` a
 | Sizes | 64 KB buffers; larger responses were cut off | requests up to 1 MiB; responses of any size (read until the message is complete); hard row limits with `truncated` flags and cursors |
 | Connections | one request per connection | keep-alive: up to 256 requests per connection; the server closes a kept-alive connection after any response while other clients are waiting, so clients must be ready to reconnect |
 | Server resources | unlimited instances, no deadlines | 8 workers, 64 queued connections (beyond that: a `busy` error), per-connection deadlines, at most 4 concurrent long-polls |
-| Operations | raw events + 4 ops | raw events + 21 ops: entity/search/history/control operations plus Phase B `GetContextEvidence`, `GetIntervalContext` and `ResolveFileIdentity` |
+| Operations | raw events + 4 ops | raw events + 23 ops, including Phase B evidence/history and Phase C `GetSearchContext` / `ScoreCandidates` |
 | Raw events | file, app launch, browsing | adds `app_focus`, `confidence`, `source`, `entity_key`, `limit`, `min_confidence`, `truncated` and paging with `before_id` / `next_before_id` |
 | Inference `version` | per-entity counter | the global `change_seq` (monotonic across all entities); `GetInferenceDeltas` also returns `deleted`, `next_version`, `current_version`, `more` and `reset` |
 
@@ -257,6 +257,107 @@ proof that any current filesystem file is unchanged. For a former path, supply
 the time when that path was observed. Raw historical paths are never rewritten.
 Missing physical IDs use a marked path fallback; unrelated copies/new creates
 are not joined by filename.
+
+### Phase C additions (`dev`, storage schema 5)
+
+The transport remains API v2. Both operations below require **activity scope**.
+WARP supplies evidence-backed features; it does not replace the consumer's file
+or content index. Queries and candidate metadata are transient, not stored.
+
+#### GetSearchContext
+
+```json
+{"op":"GetSearchContext","mode":"current"}
+```
+
+Current mode freezes a 15-minute window ending now. For an explicit historical
+or trailing interval, use `"mode":"interval","start":...,"end":...` and optional
+`"as_of":...`, with the same UTC seconds/30-day bound as `GetContextEvidence`.
+Current mode rejects interval/as-of parameters rather than silently mixing modes.
+
+The response contains `ok`, an opaque `context_ref`, `expires_ms`,
+`model_on_request_path:false`, and `context` (`schema:"warp.task-context.v1"`).
+The context has bounded entity cards, multiple `tasks`, observed episode
+segments, typed `relations`, provenance refs, coverage, interval/as-of bounds,
+input watermark and optional interpretation metadata. Tasks are hypotheses;
+`primary:true` applies only to fresh current context. An extent is not continuous
+attention. Activity weights and feature values are not relevance probabilities.
+
+References last at most 60 seconds; the server keeps at most 32. New activity
+does not change an already frozen reference. Purge, clear, retention or relevant
+configuration changes invalidate it. `context_expired` / `context_invalidated`
+mean discard its features and keep baseline results or start a new search.
+Do not persist reference IDs across app launches.
+
+#### ScoreCandidates
+
+```json
+{
+  "op":"ScoreCandidates",
+  "context_ref":"<reference returned above>",
+  "query":"budget",
+  "intent":"general",
+  "candidates":[
+    {"key":"C:\\Work\\Alpha\\budget.xlsx","name":"budget.xlsx","base_score":100,"exact":false},
+    {"key":"C:\\Work\\Beta\\annual-report.txt","name":"annual-report.txt","title":"Budget allocation excerpt","base_score":20,"exact":false}
+  ]
+}
+```
+
+The consumer retrieves candidates first and supplies a bounded batch:
+
+| Input | Contract |
+|---|---|
+| `query` | Nonempty UTF-8 string, at most 1024 bytes. |
+| `intent` | `general` (default), `download`, `open`, or `modify`; the last means a modification observation, not proven user editing. |
+| `candidates` | 1-256 objects with unique normalized absolute Windows file `key`s. |
+| `base_score` | Finite number in [0,200], on the documented FindMyFile-style match scale: exact/token 100, prefix 75, substring 40, content 20, fuzzy 15/18. It is not a BM25 or embedding probability. |
+| `name`, `title` | Optional transient candidate metadata, at most 1024 / 2048 UTF-8 bytes. `title` may carry a short authorized local-index snippet; it is not sent to Qwen or persisted. |
+| `exact` | Optional boolean. The consumer must independently protect literal filename/path matches when applying the features. |
+
+Each response entry echoes its normalized `key` and exposes `found`,
+`identity` (observed path / artifact alias / unseen / ambiguous reused path),
+`eligible`, `fallback`, `task_fit`, `interval_activity`, `typed_relation`,
+`evidence_quality`, `score_delta`, `reasons`, and supporting observation refs.
+The response also reports the frozen watermark, expiry, partial state,
+`max_score_delta:8`, `exact_matches_first:true`, and
+`query_and_candidates_persisted:false`.
+
+The delta is additive on that known base-score scale and bounded to [0,8].
+Literal query/metadata agreement and a base score of at least 20 are required;
+popularity cannot rescue an unrelated candidate. Unseen files can receive
+directory/workspace association support, but absence of activity is never a
+negative score. Historical scoring uses only requested-window evidence and
+the requested knowledge cutoff, not today's dominant task. Reused-path
+ambiguity, stale (>5 minutes) or absent current context, away/locked presence,
+paused capture, withheld evidence and truncated selection fall back.
+
+Use the policy in `SearchRanking.h`: when any contextual delta is applied,
+exact filename/path matches remain ahead of nonexact matches, then stable-sort
+by base plus bounded delta. Never filter candidates because `found` is false.
+When no delta applies, preserve the baseline order exactly. On transport errors,
+old WARP versions (`unknown_op`), expiry or denial, show baseline results rather
+than hiding them. A consumer using a different relevance scale needs its own
+held-out calibration, not an unexamined `+8`.
+
+#### Task and model interpretation contract
+
+Current/interval snapshots add `task_context`; detailed evidence adds
+`relations`, `aliases`, and `relations_available_from_ms`. Strong relations
+retain support; adjacent foreground transitions and weak co-use alone do not
+join unrelated tasks. Pre-v5 relations are not fabricated by migration.
+
+`ContextModelEnabled` is a separate, **off-by-default** experimental option.
+It uses the same pinned dev Qwen model on the periodic background path, never
+inside these search operations. Its bounded package contains compact entity/
+evidence IDs, durable attention, episode timing, qualified sources, relations,
+coverage and uncertainty. Explicit path/process-ID fields and document contents
+are omitted; captured titles can still contain sensitive metadata. The host rejects unknown
+IDs, unsupported grouping/roles, missing entity/evidence support, invented free-form claims
+and malformed output; abstention leaves deterministic context intact.
+`interpretation` reports status, model metadata, prompt version and accepted
+output. Default search ranking is deterministic; enabling the experiment is
+not a claim of measured incremental relevance gain.
 
 ---
 
@@ -393,7 +494,7 @@ changing them.
 | Scope | Operations | Without the scope |
 |---|---|---|
 | none (any client allowed to connect) | `Ping`, `GetStatus`, `QueryInferences`, `ScoreEntities`, `WaitForChanges` | -- |
-| **activity** (`kActivityOps`, plus raw event queries) | raw event queries (no `op`), `GetInferenceDeltas`, `TopEntities`, `SearchActivity`, `GetChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetRecentContext`, `GetRecentContexts`, `GetCurrentContext`, `GetContextEvidence`, `GetIntervalContext`, `ResolveFileIdentity` | `forbidden` |
+| **activity** (`kActivityOps`, plus raw event queries) | raw event queries (no `op`), `GetInferenceDeltas`, `TopEntities`, `SearchActivity`, `GetChanges`, `QueryTimeline`, `GetWorkThreads`, `GetRelated`, `GetRecentContext`, `GetRecentContexts`, `GetCurrentContext`, `GetContextEvidence`, `GetIntervalContext`, `ResolveFileIdentity`, `GetSearchContext`, `ScoreCandidates` | `forbidden` |
 | **control** (`kControlOps`) | `Purge`, `Pause`, `Resume` | `forbidden` |
 
 Clients without the activity scope can still score entities they already know:
@@ -1596,7 +1697,7 @@ settings. No parameters, no scope; answers even when the activity store is not o
   "paused_until": 0,
   "consent_acknowledged": true,
   "store": {
-    "open": true, "schema_version": 4,
+    "open": true, "schema_version": 5,
     "integrity": "ok", "db_bytes": 73400320, "wal_bytes": 4194304, "queue_depth": 0,
     "enqueued": 182311, "dropped": 0, "written": 182311, "batches": 9120, "write_errors": 0,
     "last_commit_utc": 1760003995, "change_seq": 58251, "reset_seq": 0,
@@ -1636,7 +1737,7 @@ as above):
 
 ```json
 {
-  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 4 },
+  "store": { "open": true, "path": "C:\\Users\\Alice\\AppData\\Local\\WARP\\activity.db", "schema_version": 5 },
   "capture": { "files": { "session": "WARP-KernelFile-1", "last_error": "" },
                "launches": { "last_event_ms": 1760003001000, "last_error": "" } },
   "presence": { "state": "active", "on_battery": false, "media_playing": false, "mic_in_use": false,
@@ -2745,7 +2846,9 @@ of failing.
 
 The API is the supported interface; the database schema may change between versions. For
 read-only analysis, the database (`%LOCALAPPDATA%\WARP\activity.db`,
-`PRAGMA user_version` = 2) contains the tables below. Every activity table also carries
+`PRAGMA user_version` = 5) contains the core tables below, plus the durable
+evidence/alias/relation structures documented in [SCHEMA.md](SCHEMA.md).
+Every activity table also carries
 the event-context columns `source_pid`, `source_exe`, `foreground_pid`, `foreground_exe`,
 `ms_since_input`, `parent_pid`, `parent_exe`, `created_window_ms` and `confidence`
 (REAL, default 1.0).
@@ -2762,9 +2865,9 @@ the event-context columns `source_pid`, `source_exe`, `foreground_pid`, `foregro
 | `meta` | Key / value state | `key`, `value` (e.g. `reset_seq`, `change_seq_hw`, `tombstone_floor_seq`, `purged_ranges`, `fts_available`, `schema_v2_migrated_at`) |
 | `presence_interval` | Presence history | `id`, `start_ts`, `end_ts`, `state` |
 | `context_snapshot` | Persisted context snapshots | `id`, `ts`, `window_secs`, `json`, `thread_id`, `embedding`, `model` |
-| `edge` | Entity co-occurrence | `a`, `b`, `weight`, `last_ts` |
+| `edge` | Legacy bag co-use; cleared in v5, no longer populated | `a`, `b`, `weight`, `last_ts` |
 | `work_session` | Work sessions | `id`, `start_ts`, `end_ts`, `active_secs`, `passive_secs` |
-| `work_thread` | Work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid`, `change_seq` |
+| `work_thread` | Work threads | `id`, `label`, `first_ts`, `last_ts`, `active_secs`, `project_key`, `centroid`, `change_seq`, `evidence_version` |
 | `thread_member` | Members of a thread | `thread_id`, `entity_key`, `weight`, `last_ts` |
 | `thread_span` | Activity periods of a thread | `thread_id`, `start_ts`, `end_ts`, `active_secs` |
 | `clipboard_activity` | Clipboard metadata (never content; off by default) | `id`, `timestamp`, `event_ms`, `owner_exe`, `formats` |

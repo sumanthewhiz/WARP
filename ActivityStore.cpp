@@ -336,6 +336,8 @@ bool ActivityStore::CheckIntegrityOrQuarantine()
 bool ActivityStore::Open(const std::wstring& dbPath)
 {
     if (m_open.load()) return true;
+    ++m_evidenceEpoch;
+    m_evidenceDirty = false;
     m_path = dbPath;
     m_stopping = false;
 
@@ -350,7 +352,7 @@ bool ActivityStore::Open(const std::wstring& dbPath)
     }
     if (!CheckIntegrityOrQuarantine())
         return false;
-    if (!Migrate() || !MigrateV4())
+    if (!Migrate() || !MigrateV4() || !MigrateV5())
     {
         // Keep the old file for diagnosis but never leave the always-on agent without a store.
         WARP_LOG_ERROR("store", "schema migration failed; quarantining database and starting fresh");
@@ -364,7 +366,7 @@ bool ActivityStore::Open(const std::wstring& dbPath)
             std::wstring to = m_path + stamp + sfx;
             MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
-        if (!OpenConnection(&m_wdb, true) || !Migrate() || !MigrateV4())
+        if (!OpenConnection(&m_wdb, true) || !Migrate() || !MigrateV4() || !MigrateV5())
         {
             WARP_LOG_ERROR("store", "fresh database could not be initialized; store not opened");
             if (m_wdb) { sqlite3_close(m_wdb); m_wdb = nullptr; }
@@ -419,6 +421,7 @@ void ActivityStore::Close()
         return;
     }
     m_stopDeadlineMs = StoreUtil::NowMs() + 5000;
+    ++m_evidenceEpoch;
     m_stopping = true;
     m_qCv.notify_all();
     if (m_writer.joinable()) m_writer.join();
@@ -1098,6 +1101,7 @@ void ActivityStore::RunBatch(std::vector<Job>& batch)
             WARP_LOG_ERROR("store", "COMMIT failed: %s", sqlite3_errmsg(m_wdb));
             Exec(m_wdb, "ROLLBACK;");
             m_seq = seqAtTxnStart;
+            m_evidenceDirty = false;
             // A clear-all in the failed batch may already have moved the in-memory reset marker.
             m_resetSeq = QueryInt(m_wdb, "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'reset_seq';", 0);
             // ... and a purge / clear its purge floors.
@@ -1108,6 +1112,7 @@ void ActivityStore::RunBatch(std::vector<Job>& batch)
         }
         else
         {
+            if (m_evidenceDirty) { ++m_evidenceEpoch; m_evidenceDirty = false; }
             if (m_floorsDirty) { m_floorsCommitted = m_floors; m_floorsDirty = false; }
             publishSeq();
             std::lock_guard<std::mutex> lk(m_statsMtx);
@@ -1134,6 +1139,7 @@ void ActivityStore::RunBatch(std::vector<Job>& batch)
             commit();
             bool ok = runJob(j);
             ok ? ++okJobs : ++failedJobs;
+            if (m_evidenceDirty) { ++m_evidenceEpoch; m_evidenceDirty = false; }
             publishSeq();
             if (j.done) { try { j.done->set_value(ok); } catch (...) {} }
             continue;
@@ -1152,6 +1158,7 @@ void ActivityStore::RunBatch(std::vector<Job>& batch)
         }
         // Per-job savepoint: a failing job is rolled back alone instead of poisoning the batch.
         Exec(m_wdb, "SAVEPOINT job;");
+        const bool evidenceDirtyBefore = m_evidenceDirty;
         bool ok = runJob(j);
         if (ok)
         {
@@ -1162,6 +1169,7 @@ void ActivityStore::RunBatch(std::vector<Job>& batch)
         {
             Exec(m_wdb, "ROLLBACK TO job;");
             Exec(m_wdb, "RELEASE job;");
+            m_evidenceDirty = evidenceDirtyBefore;
             for (IWriterSink* s : m_sinks) s->OnRollback(m_ctx);   // caches may hold the undone changes
             ++failedJobs;
         }
@@ -1500,6 +1508,7 @@ bool ActivityStore::RecordFile(FileEventRecord r)
         copy.eventMs = ms;
         ResolveArtifact(w, copy);
         PersistEvidence(w, "file", rowId, ms, copy.ctx.evidence);
+        RelateFile(w, copy);
         for (IWriterSink* s : m_sinks) s->OnFileEvent(w, copy);
     });
 }
@@ -1683,6 +1692,7 @@ bool ActivityStore::RecordFocus(FocusEventRecord r)
             FocusEventRecord copy = f;
             copy.endMs = endMs;
             copy.startMs = startMs;
+            RelateFocus(w, copy);
             for (IWriterSink* s : m_sinks) s->OnFocusEvent(w, copy);
         };
 
@@ -2236,11 +2246,13 @@ bool ActivityStore::ScheduleMaintenance()
 
 void ActivityStore::DoClearAll(WriterContext& w)
 {
+    m_evidenceDirty = true;
     static const char* const kTables[] = {
         "file_activity", "app_launch_activity", "browsing_activity", "app_focus_activity", "inference",
         "entity_day", "tombstone", "presence_interval", "context_snapshot", "edge", "work_session",
         "work_thread", "thread_member", "thread_span", "clipboard_activity", "print_activity", "session_attention", "entity_alias",
         "observation", "activity_episode", "source_coverage", "artifact_alias", "privacy_scope",
+        "evidence_relation", "relation_support", "task_support",
     };
     for (const char* t : kTables)
     {
