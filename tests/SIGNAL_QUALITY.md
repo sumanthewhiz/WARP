@@ -288,6 +288,12 @@ task-switch, unsupported-accepted-claim, API and candidate-set invariants all
 had zero failures. Final native regressions passed on ARM64 and x64 (124 each);
 the product built for ARM64, x64 and x86.
 
+Consumer integration subsequently added a real, isolated 150 KB pipe-request
+regression. It reproduced loss of immediate `ERROR_MORE_DATA` chunks and now
+verifies every byte is retained before JSON dispatch. The fixed ARM64 native
+suite passes all 125 tests; this transport correction does not change the
+recorded ranking features.
+
 The actual pinned Qwen subset ran 16 cases (12 held-out): six accepted
 abstentions, no accepted task hypotheses, and no incremental ranking gain.
 The deterministic paired subset already scored 1.0, so that subset has a

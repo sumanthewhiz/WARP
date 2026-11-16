@@ -94,6 +94,7 @@ public:
     static std::wstring   SessionPipeName(DWORD sessionId);
 
 private:
+    friend struct ApiServerPipeTest;
     struct Listener
     {
         std::wstring name;

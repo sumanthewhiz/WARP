@@ -69,6 +69,13 @@ pinned**, not upgraded. The [synthetic Phase C evaluator](tests/SIGNAL_QUALITY.m
 compares no-context, legacy engagement, deterministic context and a prespecified
 real-Qwen subset; it does not claim measured real-user relevance.
 
+**Reference search consumer:** [FindMyFile `dev`](https://github.com/sumanthewhiz/find-my-file/tree/dev)
+uses these APIs asynchronously for current/30-minute/2-hour/24-hour context,
+with visible bounded deltas, exact-match protection and baseline fallback.
+Its synthetic-only `FindMyFileContextDemo.exe` replays actual WARP features
+without reading personal files or connecting to an installed agent. The
+consumer evaluator reproduces the same 272 labeled-case ordering.
+
 WARP runs fully offline — no cloud calls, no telemetry. `WARP!.exe --install`
 copies it to `%ProgramFiles%\WARP` and registers a per-user logon scheduled task
 that starts it elevated and headless at every sign-in; the user controls it from

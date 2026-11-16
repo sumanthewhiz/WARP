@@ -408,6 +408,11 @@ bool ApiServer::ReadMessage(HANDLE pipe, HANDLE evt, std::string& out, DWORD tim
             ok = GetOverlappedResult(pipe, &ov, &n, FALSE);
             err = ok ? ERROR_SUCCESS : GetLastError();
         }
+        else if (!ok && err == ERROR_MORE_DATA)
+        {
+            ok = GetOverlappedResult(pipe, &ov, &n, FALSE);
+            err = ok ? ERROR_SUCCESS : GetLastError();
+        }
         if (n > 0)
         {
             if (out.size() + n > kMaxRequestBytes)

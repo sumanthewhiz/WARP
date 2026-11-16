@@ -12,6 +12,12 @@
 
 #include <thread>
 
+struct ApiServerPipeTest
+{
+    static bool Read(ApiServer& server, HANDLE pipe, HANDLE event, std::string& value, bool& tooLarge)
+    { return server.ReadMessage(pipe, event, value, 1000, tooLarge); }
+};
+
 namespace
 {
     struct ApiFixture
@@ -90,6 +96,41 @@ TEST(Api, RejectsMalformedRequestsWithStructuredErrors)
     CHECK(ping["ok"].asBool());
     CHECK(ping["pong"].asBool());
     CHECK_EQ(ping["version"].asString(), std::string("test"));
+}
+
+TEST(Api, ImmediateMultipartPipeRequestRetainsEveryByte)
+{
+    struct Handle
+    {
+        HANDLE value;
+        ~Handle() { if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
+    const auto name = L"\\\\.\\pipe\\WarpTests-Multipart-" + std::to_wstring(GetCurrentProcessId()) +
+        L"-" + std::to_wstring(GetTickCount64());
+    Handle server{CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        1, 262144, 262144, 0, nullptr)};
+    REQUIRE(server.value != INVALID_HANDLE_VALUE);
+    Handle client{CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr)};
+    REQUIRE(client.value != INVALID_HANDLE_VALUE);
+    Handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    REQUIRE(event.value != nullptr);
+    OVERLAPPED connect{}; connect.hEvent = event.value;
+    const bool connected = ConnectNamedPipe(server.value, &connect) != FALSE;
+    REQUIRE(connected || GetLastError() == ERROR_PIPE_CONNECTED);
+    const std::string sent = "{\"op\":\"Ping\",\"padding\":\"" + std::string(150000, 'x') + "\"}";
+    DWORD written = 0;
+    REQUIRE(WriteFile(client.value, sent.data(), (DWORD)sent.size(), &written, nullptr) != FALSE);
+    REQUIRE(written == sent.size());
+    ApiServer api;
+    std::string received; bool tooLarge = false;
+    REQUIRE(ApiServerPipeTest::Read(api, server.value, event.value, received, tooLarge));
+    CHECK(!tooLarge);
+    CHECK_EQ(received.size(), sent.size());
+    CHECK(received == sent);
+    const auto response = WarpJson::Parse(api.Handle(received, ApiClient::InProcess()));
+    REQUIRE(response.ok);
+    CHECK(response.value["pong"].asBool());
 }
 
 TEST(Api, QueryInferencesEchoesCallerKeysVerbatim)
