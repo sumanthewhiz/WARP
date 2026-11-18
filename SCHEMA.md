@@ -29,6 +29,9 @@ a new OPEN command), `download_origin` (reported origin, **not** proof of readin
 `foreground_transition` / `co_used_nearby`. File-copy metadata does not become
 a download relation. Replay and withheld/ambiguous resolution cannot create
 strong task evidence. Directory membership is an association, not proof of intent.
+New `within_workspace` file relations are recorded only for explicit
+recent/MRU/shell OPENs, DOWNLOADs or actor-qualified changes, avoiding redundant
+relation writes for unsupported ETW OPEN volume. Raw observations are unaffected.
 
 Transitions use adjacent active episodes in event-time order, not the receipt
 order or a bag of all entities in 15 minutes. A transition alone never merges

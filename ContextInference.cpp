@@ -3203,11 +3203,17 @@ ContextIntelligence::Frame ContextInference::GetSearchFrame(int64_t startUtc, in
                                                             int64_t asOfUtc, bool historical)
 {
     if (!m_store || !m_store->IsOpen()) return {};
-    std::lock_guard<std::mutex> compose(m_composeMtx);
     const uint64_t epoch = m_epoch.load();
-    auto snapshot = ComposeSnapshot(endUtc - startUtc, false, endUtc, asOfUtc * 1000 + 999, historical, false, true);
+    const auto evidence = m_store->ReadEvidence(startUtc*1000, endUtc*1000, asOfUtc*1000+999,
+        historical ? 20000 : 2048, true);
+    std::string presence;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_presence && !historical) presence = m_presence();
+    }
+    auto frame = ContextIntelligence::BuildSearch(evidence, historical, presence);
     if (m_epoch.load() != epoch) return {};
-    return std::move(snapshot.taskContext);
+    return frame;
 }
 
 // Acceptable window lengths (seconds).  The UI dropdown surfaces

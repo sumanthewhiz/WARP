@@ -480,7 +480,9 @@ void ActivityStore::RelateFile(WriterContext& w, const FileEventRecord& r)
     if (!e.cloudUrl.empty())
         add(EntityKey::UrlKey(EntityKey::FromUtf8(e.cloudUrl)), "alias_of", "provider_path_mapping", .7);
     const auto workspace = Evidence::WorkspaceFor(StoreUtil::W2U(r.path), "file");
-    if (!workspace.empty())
+    const bool qualifiedOpen = r.action == L"OPEN" && (r.source == L"recent" || r.source == L"mru" || r.source == L"shell");
+    const bool qualifiedChange = (r.action == L"CREATE" || r.action == L"MODIFY") && e.actorQuality >= .5;
+    if (!workspace.empty() && (qualifiedOpen || qualifiedChange || r.action == L"DOWNLOAD"))
         add(workspace, "within_workspace", "directory_membership_not_proven_task", .6);
 }
 
@@ -988,9 +990,10 @@ void ActivityStore::PurgeEvidence(WriterContext& w, const PurgeSpec& spec)
     }
 }
 
-ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t endMs, int64_t asOfMs, int limitPerType)
+ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t endMs, int64_t asOfMs, int limitPerType, bool searchOnly)
 {
     EvidenceSet result;
+    result.searchOnly = searchOnly;
     result.startMs = startMs;
     result.endMs = endMs;
     result.asOfMs = asOfMs > 0 ? asOfMs : Evidence::NowMs();
@@ -1010,13 +1013,14 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
         result.availableStartMs =
             (std::max)(Scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='evidence_available_from'"),
                        Evidence::NowMs() - int64_t(m_rawRetentionDays.load()) * 86400000);
-        result.files = QueryFiles(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0, 0, db, result.asOfMs);
+        result.files = QueryFiles(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0,
+            searchOnly ? .5 : 0, db, result.asOfMs, searchOnly);
 #ifdef WARP_UNIT_TESTS
         if (m_evidenceReadBarrier)
             m_evidenceReadBarrier();
 #endif
-        result.launches =
-            QueryLaunches(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0, 0, db, result.asOfMs);
+        if (!searchOnly)
+            result.launches = QueryLaunches(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0, 0, db, result.asOfMs);
         result.browsing =
             QueryBrowsing(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0, 0, db, result.asOfMs);
         result.focus = QueryFocus(startMs / 1000, (endMs + 999) / 1000, limitPerType + 1, 0, 0, db, result.asOfMs);
@@ -1042,36 +1046,29 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
             std::remove_if(result.focus.begin(), result.focus.end(),
                            [&](const auto& row) { return row.endMs <= startMs || row.startMs >= endMs; }),
             result.focus.end());
-        Statement relations(db,
-            "SELECT id,from_key,to_key,kind,start_ms,end_ms,received_ms,quality,source,basis FROM evidence_relation "
-            "WHERE end_ms>?1 AND start_ms<?2 AND received_ms<=?3 ORDER BY start_ms,id LIMIT ?4");
-        sqlite3_bind_int64(relations, 1, startMs); sqlite3_bind_int64(relations, 2, endMs);
-        sqlite3_bind_int64(relations, 3, result.asOfMs); sqlite3_bind_int(relations, 4, limitPerType + 1);
-        while (sqlite3_step(relations) == SQLITE_ROW)
-        {
-            if ((int)result.relations.size() == limitPerType) { result.truncated = true; break; }
-            EvidenceRelation r;
-            r.id = Text(relations, 0); r.from = Text(relations, 1); r.to = Text(relations, 2);
-            r.kind = Text(relations, 3); r.startMs = (std::max)(startMs, sqlite3_column_int64(relations, 4));
-            r.endMs = (std::min)(endMs, sqlite3_column_int64(relations, 5));
-            r.receivedMs = sqlite3_column_int64(relations, 6); r.quality = sqlite3_column_double(relations, 7);
-            r.source = Text(relations, 8); r.basis = Text(relations, 9);
-            Statement supports(db, "SELECT support_id FROM relation_support WHERE relation_id=?1 ORDER BY support_id");
-            Text(supports, 1, r.id);
-            while (sqlite3_step(supports) == SQLITE_ROW) r.support.push_back(Text(supports, 0));
-            result.relations.push_back(std::move(r));
-        }
+        auto jsonSet = [](const std::set<std::string>& values) {
+            std::string json; WarpJson::Writer writer(json);
+            writer.BeginArray();
+            for (const auto& value : values) writer.String(value);
+            writer.EndArray();
+            return json;
+        };
         if (!result.truncated)
         {
+            std::set<std::string> paths, artifacts;
+            for (const auto& file : result.files)
+            {
+                paths.insert(file.entityKey);
+                if (!file.evidence.artifactId.empty()) artifacts.insert(file.evidence.artifactId);
+            }
+            for (const auto& focus : result.focus)
+                if (focus.docType == "file" && !focus.docKey.empty()) paths.insert(focus.docKey);
             Statement aliases(db,
                 "SELECT a.path_key,a.from_ms,a.to_ms,a.artifact_id,a.physical_id,a.basis,a.evidence_id,a.closed_received_ms FROM artifact_alias a "
                 "JOIN observation o ON o.id=a.evidence_id WHERE o.received_ms<=?3 AND a.from_ms<=?3 AND "
-                "(a.artifact_id IN (SELECT json_extract(payload,'$.artifact_id') FROM observation WHERE kind='file' "
-                "AND event_ms>=?1 AND event_ms<?2 AND received_ms<=?3 LIMIT ?4) OR a.path_key IN "
-                "(SELECT entity_key FROM file_activity WHERE timestamp>=?1/1000 AND timestamp<(?2+999)/1000 "
-                "AND event_ms>=?1 AND event_ms<?2 LIMIT ?4)) "
+                "(a.artifact_id IN (SELECT value FROM json_each(?1)) OR a.path_key IN (SELECT value FROM json_each(?2))) "
                 "ORDER BY a.path_key,a.from_ms LIMIT ?4");
-            sqlite3_bind_int64(aliases, 1, startMs); sqlite3_bind_int64(aliases, 2, endMs);
+            Text(aliases, 1, jsonSet(artifacts)); Text(aliases, 2, jsonSet(paths));
             sqlite3_bind_int64(aliases, 3, result.asOfMs); sqlite3_bind_int(aliases, 4, limitPerType + 1);
             while (sqlite3_step(aliases) == SQLITE_ROW)
             {
@@ -1135,6 +1132,38 @@ ActivityStore::EvidenceSet ActivityStore::ReadEvidence(int64_t startMs, int64_t 
             e.windowInstance = e.evidence.windowInstance;
             e.processInstance = e.evidence.processInstance;
             result.episodes.push_back(std::move(e));
+        }
+        std::set<std::string> selectedSupport;
+        if (searchOnly)
+        {
+            auto add = [&](const auto& rows) {
+                for (const auto& row : rows) if (!row.evidence.id.empty()) selectedSupport.insert(row.evidence.id);
+            };
+            add(result.files); add(result.focus); add(result.browsing); add(result.episodes);
+        }
+        const std::string relationSql =
+            "SELECT r.id,r.from_key,r.to_key,r.kind,r.start_ms,r.end_ms,r.received_ms,r.quality,r.source,r.basis FROM evidence_relation r " +
+            std::string(searchOnly ?
+                "JOIN (SELECT DISTINCT relation_id FROM relation_support WHERE support_id IN "
+                "(SELECT value FROM json_each(?5))) selected ON selected.relation_id=r.id " : "") +
+            "WHERE r.end_ms>?1 AND r.start_ms<?2 AND r.received_ms<=?3 ORDER BY r.start_ms,r.id LIMIT ?4";
+        Statement relations(db, relationSql.c_str());
+        sqlite3_bind_int64(relations, 1, startMs); sqlite3_bind_int64(relations, 2, endMs);
+        sqlite3_bind_int64(relations, 3, result.asOfMs); sqlite3_bind_int(relations, 4, limitPerType + 1);
+        if (searchOnly) Text(relations, 5, jsonSet(selectedSupport));
+        while (sqlite3_step(relations) == SQLITE_ROW)
+        {
+            if ((int)result.relations.size() == limitPerType) { result.truncated = true; break; }
+            EvidenceRelation r;
+            r.id = Text(relations, 0); r.from = Text(relations, 1); r.to = Text(relations, 2);
+            r.kind = Text(relations, 3); r.startMs = (std::max)(startMs, sqlite3_column_int64(relations, 4));
+            r.endMs = (std::min)(endMs, sqlite3_column_int64(relations, 5));
+            r.receivedMs = sqlite3_column_int64(relations, 6); r.quality = sqlite3_column_double(relations, 7);
+            r.source = Text(relations, 8); r.basis = Text(relations, 9);
+            Statement supports(db, "SELECT support_id FROM relation_support WHERE relation_id=?1 ORDER BY support_id");
+            Text(supports, 1, r.id);
+            while (sqlite3_step(supports) == SQLITE_ROW) r.support.push_back(Text(supports, 0));
+            result.relations.push_back(std::move(r));
         }
         Statement coverage(
             db, "SELECT source,instance,start_ms,end_ms,state,reason,dropped,received_ms FROM source_coverage "
@@ -1225,6 +1254,7 @@ std::string ActivityStore::EvidenceJson(const EvidenceSet& e, int limitPerType)
         .KV("projection_truncated", projectionTruncated)
         .KV("rule_version", Evidence::RuleVersion)
         .KV("projection", limit ? "bounded_evidence" : "metadata_only")
+        .KV("input_selection", e.searchOnly ? "search_support" : "all_sources")
         .Key("coverage_summary")
         .BeginArray();
     for (const char* source : {"files", "launch", "browser", "focus", "presence", "storage"})

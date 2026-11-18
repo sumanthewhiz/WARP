@@ -261,9 +261,9 @@ public:
         std::vector<ArtifactAlias> aliases;
         int64_t relationsAvailableMs = 0;
         int64_t startMs = 0, endMs = 0, asOfMs = 0, watermark = 0, availableStartMs = 0;
-        bool available = false, truncated = false, partial = true, privacyRedacted = false;
+        bool available = false, truncated = false, partial = true, privacyRedacted = false, searchOnly = false;
     };
-    EvidenceSet ReadEvidence(int64_t startMs, int64_t endMs, int64_t asOfMs = 0, int limitPerType = 20000);
+    EvidenceSet ReadEvidence(int64_t startMs, int64_t endMs, int64_t asOfMs = 0, int limitPerType = 20000, bool searchOnly = false);
     static std::string EvidenceJson(const EvidenceSet& evidence, int limitPerType = 256);
     std::vector<ArtifactAlias> ResolveFileIdentity(const std::string& key, int64_t atMs, int limit = 100);
 
@@ -291,7 +291,7 @@ public:
     ReadLease AcquireReader(DWORD timeoutMs = 10000);
 
     // limit <= 0 => unlimited (in-process callers); beforeId > 0 => rows with id < beforeId (paging)
-    std::vector<FileActivity>      QueryFiles(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
+    std::vector<FileActivity>      QueryFiles(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX, bool searchOnly = false);
     std::vector<AppLaunchActivity> QueryLaunches(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
     std::vector<BrowsingActivity>  QueryBrowsing(int64_t startUtc, int64_t endUtc, int limit = 0, int64_t beforeId = 0, double minConfidence = 0.0, sqlite3* snapshot = nullptr, int64_t asOfMs = INT64_MAX);
     // Focus sessions OVERLAPPING [startUtc, endUtc] (by start/end), newest first.

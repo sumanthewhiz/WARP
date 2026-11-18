@@ -283,6 +283,24 @@ input watermark and optional interpretation metadata. Tasks are hypotheses;
 `primary:true` applies only to fresh current context. An extent is not continuous
 attention. Activity weights and feature values are not relevance probabilities.
 
+Search uses a dedicated durable-evidence read, not summary generation, historical
+engagement scoring or the summary's 24-entity display list. Unsupported ETW OPENs
+are excluded **before** the row budget: only explicit recent/MRU/shell OPENs,
+DOWNLOADs and actor-qualified CREATE/MODIFY records can supply file activity.
+Resolved focus and page checkpoints remain separate evidence sources. Related
+rows/aliases are read through retained observation IDs and canonical keys.
+Raw events remain available through their existing APIs; this does not relabel
+unsupported I/O as user activity.
+
+The read is bounded to 2,048 rows per relevant type in current mode and 20,000
+in interval mode. Exhausting an actual evidence read still sets `truncated:true`
+and fails closed. The supported card projection retains at most 64 entities,
+prioritizing qualified and most-recent evidence, plus 128 relations and 64 episode
+segments. `selection_truncated:true` identifies this smaller projection and sets
+`partial:true`, but does not erase the positive support retained for its members.
+Omitted entities receive no fabricated activity; latest qualified current-task
+selection is preserved. These bounds are not evidence of complete capture.
+
 References last at most 60 seconds; the server keeps at most 32. New activity
 does not change an already frozen reference. Purge, clear, retention or relevant
 configuration changes invalidate it. `context_expired` / `context_invalidated`
@@ -330,7 +348,8 @@ directory/workspace association support, but absence of activity is never a
 negative score. Historical scoring uses only requested-window evidence and
 the requested knowledge cutoff, not today's dominant task. Reused-path
 ambiguity, stale (>5 minutes) or absent current context, away/locked presence,
-paused capture, withheld evidence and truncated selection fall back.
+paused capture, withheld evidence and truncated evidence reads fall back.
+An intentionally bounded card/episode projection alone is not a global veto.
 
 Use the policy in `SearchRanking.h`: when any contextual delta is applied,
 exact filename/path matches remain ahead of nonexact matches, then stable-sort

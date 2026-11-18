@@ -1871,23 +1871,30 @@ namespace
     }
 }
 
-std::vector<FileActivity> ActivityStore::QueryFiles(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs)
+std::vector<FileActivity> ActivityStore::QueryFiles(int64_t startUtc, int64_t endUtc, int limit, int64_t beforeId, double minConfidence, sqlite3* snapshot, int64_t asOfMs, bool searchOnly)
 {
     std::vector<FileActivity> out;
     ReadLease rl = snapshot ? ReadLease() : AcquireReader();
     sqlite3* db = snapshot ? snapshot : rl.get();
     if (!db) return out;
-    const char* sql =
+    const std::string sql =
         "SELECT id, timestamp, COALESCE(event_ms, timestamp * 1000), action, path, old_path, COALESCE(source, 'etw'), source_exe, entity_key, "
         "COALESCE(confidence, 1.0), COALESCE(is_dir, 0), origin_url, "
         "(SELECT payload FROM observation WHERE kind='file' AND row_id=file_activity.id) FROM file_activity "
-        "WHERE timestamp >= ?1 AND timestamp <= ?2 AND COALESCE(confidence, 1.0) >= ?4 "
+        "WHERE timestamp >= ?1 AND timestamp <= ?2 AND COALESCE(confidence, 1.0) >= ?4 " +
+        std::string(searchOnly ?
+            "AND COALESCE(is_dir,0)=0 AND ((action='OPEN' AND source IN ('recent','mru','shell')) OR action='DOWNLOAD' "
+            "OR (action IN ('CREATE','MODIFY') AND EXISTS(SELECT 1 FROM observation p WHERE p.kind='file' "
+            "AND p.row_id=file_activity.id AND json_extract(p.payload,'$.actor_quality')>=0.5))) "
+            "AND EXISTS(SELECT 1 FROM observation p WHERE p.kind='file' AND p.row_id=file_activity.id "
+            "AND json_extract(p.payload,'$.replayed')=0 AND json_extract(p.payload,'$.redaction')='none' "
+            "AND json_extract(p.payload,'$.timestamp_kind')!='recency_observation') " : "") +
         "AND NOT EXISTS(SELECT 1 FROM observation WHERE kind='file' AND row_id=file_activity.id AND received_ms>?6) "
         "AND (?3 = 0 OR timestamp < (SELECT timestamp FROM file_activity WHERE id = ?3) "
         "     OR (timestamp = (SELECT timestamp FROM file_activity WHERE id = ?3) AND id < ?3)) "
         "ORDER BY timestamp DESC, id DESC LIMIT ?5;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK)
     { if (snapshot) throw std::runtime_error(sqlite3_errmsg(db)); return out; }
     BindRange(st, startUtc, endUtc, beforeId, minConfidence, limit);
     sqlite3_bind_int64(st, 6, asOfMs);

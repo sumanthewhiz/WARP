@@ -288,6 +288,13 @@ task-switch, unsupported-accepted-claim, API and candidate-set invariants all
 had zero failures. Final native regressions passed on ARM64 and x64 (124 each);
 the product built for ARM64, x64 and x86.
 
+The populated-store regression adds 20,500 unsupported ETW OPEN rows alongside
+one explicit OPEN, plus an 81-qualified-entity projection case. Search must
+retain the supported workspace boost without running the full summary pipeline.
+A separate small raw-budget test still requires global fallback when relevant
+evidence itself is omitted. Page-checkpoint-only exposure remains usable without
+inventing active attention or requiring a navigation in the query window.
+
 Consumer integration subsequently added a real, isolated 150 KB pipe-request
 regression. It reproduced loss of immediate `ERROR_MORE_DATA` chunks and now
 verifies every byte is retained before JSON dispatch. The fixed ARM64 native

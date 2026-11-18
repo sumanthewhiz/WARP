@@ -76,6 +76,12 @@ Its synthetic-only `FindMyFileContextDemo.exe` replays actual WARP features
 without reading personal files or connecting to an installed agent. The
 consumer evaluator reproduces the same 272 labeled-case ordering.
 
+Search frames have a dedicated evidence read: unqualified ETW OPEN volume is
+filtered before the row budget, and no summary/model or historical-engagement
+scoring runs on that path. Up to 64 qualified/recent cards are retained.
+`selection_truncated` describes that bounded projection; only a genuinely
+incomplete evidence read (`truncated`) forces global baseline fallback.
+
 WARP runs fully offline — no cloud calls, no telemetry. `WARP!.exe --install`
 copies it to `%ProgramFiles%\WARP` and registers a per-user logon scheduled task
 that starts it elevated and headless at every sign-in; the user controls it from

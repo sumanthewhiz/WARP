@@ -33,6 +33,7 @@ namespace ContextIntelligence
     {
         int64_t startMs = 0, endMs = 0, asOfMs = 0, watermark = 0, latestMs = 0;
         bool available = false, historical = false, partial = true, truncated = false, redacted = false;
+        bool selectionTruncated = false;
         std::string presence, coverageJson, modelStatus = "disabled", modelJson, modelMetadata;
         std::vector<Card> cards;
         std::vector<Task> tasks;
@@ -60,6 +61,7 @@ namespace ContextIntelligence
     };
 
     Frame Build(const ContextSnapshot& snapshot, const ActivityStore::EvidenceSet& evidence);
+    Frame BuildSearch(const ActivityStore::EvidenceSet& evidence, bool historical, const std::string& presence);
     std::string Json(const Frame& frame);
     std::string ModelInput(const Frame& frame);
     Interpretation Validate(const Frame& frame, const std::string& output);

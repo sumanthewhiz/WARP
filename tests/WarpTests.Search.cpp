@@ -352,6 +352,87 @@ TEST(Search, ModelAttentionDoesNotBorrowUncommittedSnapshotTime)
     CHECK(std::find(frame.cards[0].actions.begin(), frame.cards[0].actions.end(), "modify") == frame.cards[0].actions.end());
 }
 
+TEST(Search, UnattributedOpenVolumeCannotStarveQualifiedSearchEvidence)
+{
+    SearchFixture f;
+    f.Open(L"C:\\WarpSynthetic\\Alpha\\brief.docx", "qualified-open");
+    f.Flush();
+    REQUIRE(f.store.RunSync([&](WriterContext& w) {
+        const auto sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<20500) "
+            "INSERT INTO file_activity(timestamp,event_ms,action,path,entity_key,source,confidence,is_dir) "
+            "SELECT " + std::to_string(f.now - 1) + "," + std::to_string((f.now - 1)*1000) +
+            ",'OPEN','C:\\WarpSynthetic\\Noise\\file-'||x||'.txt',"
+            "'c:\\warpsynthetic\\noise\\file-'||x||'.txt','etw',1,0 FROM n";
+        if (sqlite3_exec(w.db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error(sqlite3_errmsg(w.db));
+    }));
+    const auto frame = f.Frame();
+    REQUIRE(frame.available);
+    CHECK(!frame.truncated);
+    REQUIRE(frame.tasks.size() == 1);
+    CHECK_EQ(frame.tasks[0].workspace, std::string("folder:c:\\warpsynthetic\\alpha"));
+    ContextIntelligence::Candidate c{"c:\\warpsynthetic\\alpha\\budget.xlsx", "budget.xlsx", "", 100, false};
+    const auto scored = ContextIntelligence::Score(frame, "budget", "general", {c}, f.now*1000);
+    REQUIRE(scored.size() == 1);
+    CHECK(scored[0].delta > 0);
+}
+
+TEST(Search, BoundedCardProjectionDoesNotDisableSupportedRanking)
+{
+    SearchFixture f;
+    for (int i = 0; i < 80; ++i)
+        f.Open(L"C:\\WarpSynthetic\\Other" + std::to_wstring(i) + L"\\notes.txt", "open-" + std::to_string(i));
+    FileEventRecord r; r.path = L"C:\\WarpSynthetic\\Alpha\\brief.docx";
+    r.action = L"OPEN"; r.source = L"recent"; r.eventMs = (f.now - 1)*1000;
+    r.ctx.evidence.id = "latest-qualified"; r.ctx.evidence.receivedMs = r.eventMs;
+    REQUIRE(f.store.RecordFile(r));
+    const auto frame = f.Frame();
+    CHECK(!frame.truncated);
+    CHECK(frame.partial);
+    CHECK(frame.cards.size() <= 64);
+    REQUIRE(!frame.tasks.empty());
+    CHECK_EQ(frame.tasks[0].workspace, std::string("folder:c:\\warpsynthetic\\alpha"));
+    ContextIntelligence::Candidate c{"c:\\warpsynthetic\\alpha\\budget.xlsx", "budget.xlsx", "", 100, false};
+    const auto scored = ContextIntelligence::Score(frame, "budget", "general", {c}, f.now*1000);
+    CHECK(scored[0].delta > 0);
+}
+
+TEST(Search, ARealEvidenceLimitStillFailsClosed)
+{
+    SearchFixture f;
+    for (int i = 0; i < 4; ++i)
+        f.Open(L"C:\\WarpSynthetic\\Alpha\\note-" + std::to_wstring(i) + L".txt", "qualified-" + std::to_string(i));
+    f.Flush();
+    const auto evidence = f.store.ReadEvidence((f.now-900)*1000, f.now*1000, wt::NowMs(), 2, true);
+    REQUIRE(evidence.truncated);
+    const auto frame = ContextIntelligence::BuildSearch(evidence, false, "active");
+    ContextIntelligence::Candidate c{"c:\\warpsynthetic\\alpha\\budget.xlsx", "budget.xlsx", "", 100, false};
+    const auto scored = ContextIntelligence::Score(frame, "budget", "general", {c}, f.now*1000);
+    CHECK_EQ(scored[0].delta, 0.0);
+    CHECK_EQ(scored[0].fallback, std::string("truncated"));
+}
+
+TEST(Search, PassivePageCheckpointsRemainEligibleWithoutANavigationInTheWindow)
+{
+    SearchFixture f;
+    EpisodeRecord page;
+    page.id = "stable-page"; page.kind = "page"; page.revision = 1;
+    page.startMs = (f.now-100)*1000; page.endMs = (f.now-1)*1000;
+    page.entityKey = EntityKey::UrlKey(L"https://github.com/example/project/issues");
+    page.display = L"https://github.com/example/project/issues"; page.title = L"Project issues";
+    page.exposureMs = page.endMs-page.startMs; page.activeMs = -1; page.passiveMs = -1;
+    page.unknownMs = page.exposureMs;
+    page.evidence.id = "page-observation"; page.evidence.episodeId = page.id; page.evidence.revision = 1;
+    page.evidence.receivedMs = page.endMs; page.evidence.observedMs = page.endMs;
+    REQUIRE(f.store.RecordPageEpisode(page));
+    const auto frame = f.Frame();
+    REQUIRE(frame.cards.size() == 1);
+    CHECK(frame.cards[0].eligible);
+    CHECK_EQ(frame.cards[0].activeMs, int64_t(0));
+    REQUIRE(frame.tasks.size() == 1);
+    CHECK_EQ(frame.tasks[0].workspace, std::string("repository:https://github.com/example/project"));
+}
+
 TEST(Search, OneArtifactInTwoAppsIsOneEvidenceCardAndOneTask)
 {
     SearchFixture f;

@@ -2,6 +2,7 @@
 #include "ContextIntelligence.h"
 #include "ContextInference.h"
 #include "EntityKey.h"
+#include "EntityStore.h"
 #include "Json.h"
 #include "Settings.h"
 #include "Attention.h"
@@ -102,7 +103,7 @@ namespace ContextIntelligence
         frame.redacted = evidence.privacyRedacted; frame.presence = snapshot.presence;
         frame.coverageJson = ActivityStore::EvidenceJson(evidence, 0);
         frame.aliases = evidence.aliases;
-        if (frame.aliases.size() > 256) { frame.aliases.resize(256); frame.truncated = true; }
+        if (frame.aliases.size() > 4096) { frame.aliases.resize(4096); frame.truncated = true; }
         struct Support
         {
             ObservationEvidence observation;
@@ -238,6 +239,16 @@ namespace ContextIntelligence
                 // Duration is re-derived once from all retained episodes for this key below.
             }
         }
+        if (frame.cards.size() > 64)
+        {
+            std::sort(frame.cards.begin(), frame.cards.end(), [](const Card& a, const Card& b) {
+                if (a.eligible != b.eligible) return a.eligible;
+                if (a.lastMs != b.lastMs) return a.lastMs > b.lastMs;
+                return a.key < b.key;
+            });
+            frame.cards.resize(64);
+            frame.selectionTruncated = frame.partial = true;
+        }
         std::sort(frame.cards.begin(), frame.cards.end(), [](const Card& a, const Card& b) { return a.key < b.key; });
         std::map<std::string, size_t> byKey;
         std::set<std::string> knownSupport;
@@ -283,7 +294,7 @@ namespace ContextIntelligence
                         qualified.quality = (std::min)(qualified.quality, support.second.eligible ? support.second.quality : .2);
                 frame.relations.push_back(std::move(qualified));
             }
-            if (frame.relations.size() == 128) { frame.truncated = true; break; }
+            if (frame.relations.size() == 128) { frame.selectionTruncated = frame.partial = true; break; }
         }
         for (const auto& episode : evidence.episodes)
         {
@@ -303,7 +314,7 @@ namespace ContextIntelligence
                 prior->unknownMs += episode.unknownMs;
             }
             else if (frame.episodes.size() < 64) frame.episodes.push_back(episode);
-            else frame.truncated = true;
+            else frame.selectionTruncated = frame.partial = true;
         }
 
         std::vector<size_t> groups(frame.cards.size());
@@ -349,7 +360,38 @@ namespace ContextIntelligence
             frame.endMs - frame.latestMs <= FreshnessMs &&
             (frame.presence.empty() || frame.presence == "active" || frame.presence == "passive"))
             frame.tasks.front().primary = true;
+        frame.partial = frame.partial || frame.truncated;
         return frame;
+    }
+
+    Frame BuildSearch(const ActivityStore::EvidenceSet& evidence, bool historical, const std::string& presence)
+    {
+        ContextSnapshot snapshot;
+        snapshot.historical = historical; snapshot.presence = presence;
+        std::map<std::string, ContextSnapshot::EntityItem> entities;
+        auto add = [&](const std::string& key, const std::string& type, const std::wstring& display,
+                       const std::string& resolution, const std::string& ref) {
+            if (key.empty()) return;
+            auto& item = entities[key];
+            item.entityKey = key; item.entityType = type; item.display = EntityKey::ToUtf8(display);
+            if (type == "file") item.title = EntityKey::ToUtf8(EntityKey::BaseName(display));
+            if (item.resolution.empty() || resolution.find("ambiguous") != std::string::npos) item.resolution = resolution;
+            item.evidenceRefs.push_back(ref);
+        };
+        for (const auto& file : evidence.files)
+            if (!file.isDir && !EntityStore::IsTransientFileName(file.path))
+                add(file.entityKey, "file", file.path, "observed_path", "file:" + std::to_string(file.id));
+        for (const auto& focus : evidence.focus)
+            if (!focus.docKey.empty())
+                add(focus.docKey, focus.docType == "file" ? "file" : "url", focus.docDisplay,
+                    focus.docResolution, "focus:" + std::to_string(focus.id));
+        for (const auto& page : evidence.browsing)
+            add(page.entityKey, "url", page.url, page.evidence.resolution, "browse:" + std::to_string(page.id));
+        for (const auto& episode : evidence.episodes)
+            if (episode.kind == "page")
+                add(episode.entityKey, "url", episode.display, episode.resolution, "page:" + episode.id);
+        for (auto& pair : entities) snapshot.entities.push_back(std::move(pair.second));
+        return Build(snapshot, evidence);
     }
 
     std::string Json(const Frame& frame)
@@ -360,6 +402,7 @@ namespace ContextIntelligence
             .KV("input_watermark", frame.watermark).KV("available", frame.available)
             .KV("mode", frame.historical ? "interval" : "current").KV("latest_evidence_ms", frame.latestMs)
             .KV("partial", frame.partial).KV("truncated", frame.truncated).KV("privacy_redacted", frame.redacted)
+            .KV("selection_truncated", frame.selectionTruncated)
             .KV("presence", frame.presence).Key("coverage").Raw(frame.coverageJson.empty() ? "{}" : frame.coverageJson);
         w.Key("entities").BeginArray();
         for (const auto& card : frame.cards)
