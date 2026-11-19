@@ -295,6 +295,11 @@ A separate small raw-budget test still requires global fallback when relevant
 evidence itself is omitted. Page-checkpoint-only exposure remains usable without
 inventing active attention or requiring a navigation in the query window.
 
+The Markdown-prefix regression opens a synthetic Desktop guide containing
+"Evals", switches to an unrelated task, and searches `eval`. The direct observed
+file receives only the weaker recent-activity boost; unrelated and stale files
+remain unboosted. This does not broaden same-directory association.
+
 Consumer integration subsequently added a real, isolated 150 KB pipe-request
 regression. It reproduced loss of immediate `ERROR_MORE_DATA` chunks and now
 verifies every byte is retained before JSON dispatch. The fixed ARM64 native

@@ -351,6 +351,14 @@ ambiguity, stale (>5 minutes) or absent current context, away/locked presence,
 paused capture, withheld evidence and truncated evidence reads fall back.
 An intentionally bounded card/episode projection alone is not a global veto.
 
+Current mode also recognizes a directly observed matching file within its
+15-minute window, even when a different task has become primary. This supplies only
+the activity component (**+1.6**, `recent_file_observation`); `task_fit` stays
+zero and no same-folder inference is extended from that secondary task. The
+stronger primary-task score retains its five-minute freshness requirement. This covers opening a file and
+then switching to search without treating all files in Desktop as one project.
+The same identity, query, freshness, presence and privacy gates still apply.
+
 Use the policy in `SearchRanking.h`: when any contextual delta is applied,
 exact filename/path matches remain ahead of nonexact matches, then stable-sort
 by base plus bounded delta. Never filter candidates because `found` is false.

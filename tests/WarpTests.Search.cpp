@@ -316,6 +316,39 @@ TEST(Search, QueryMismatchAndUnattributedReplayNeverEarnContext)
     CHECK(replay.Frame().tasks.empty());
 }
 
+TEST(Search, ARecentlyOpenedMarkdownFileSurvivesAnUnrelatedPrimaryTask)
+{
+    SearchFixture f;
+    const std::wstring path = L"C:\\WarpSynthetic\\Desktop\\File Search Evals With and Without a Local Search Broker - Step-by-Step Guide.md";
+    f.Open(path, "explicit-markdown-open");
+    f.Focus(L"C:\\WarpSynthetic\\Unrelated\\notes.docx", -10, -1, "other-primary");
+    const auto frame = f.Frame();
+    REQUIRE(!frame.tasks.empty());
+    CHECK(frame.tasks[0].entities[0] != EntityKey::FileKey(path));
+    ContextIntelligence::Candidate c{EntityKey::FileKey(path), EntityKey::ToUtf8(EntityKey::BaseName(path)), "", 75, false};
+    auto scores = ContextIntelligence::Score(frame, "eval", "general", {c}, f.now*1000);
+    REQUIRE(scores.size() == 1);
+    CHECK(scores[0].found);
+    CHECK(scores[0].delta > 0 && scores[0].delta < 4.2);
+    CHECK_EQ(scores[0].taskFit, 0.0);
+    CHECK(std::find(scores[0].reasons.begin(), scores[0].reasons.end(), "recent_file_observation") != scores[0].reasons.end());
+    c.name = "unrelated.txt"; c.key = "c:\\warpsynthetic\\desktop\\unrelated.txt";
+    scores = ContextIntelligence::Score(frame, "eval", "general", {c}, f.now*1000);
+    CHECK_EQ(scores[0].delta, 0.0);
+    c.name = EntityKey::ToUtf8(EntityKey::BaseName(path)); c.key = EntityKey::FileKey(path);
+    auto expiredFile = frame;
+    for (auto& card : expiredFile.cards) if (card.key == c.key) card.lastMs = (f.now-901)*1000;
+    scores = ContextIntelligence::Score(expiredFile, "eval", "general", {c}, f.now*1000);
+    CHECK_EQ(scores[0].delta, 0.0);
+    scores = ContextIntelligence::Score(frame, "eval", "general", {c}, (f.now+301)*1000);
+    CHECK(scores[0].delta > 0 && scores[0].delta < 4.2);
+    auto locked = frame; locked.presence = "locked";
+    scores = ContextIntelligence::Score(locked, "eval", "general", {c}, (f.now+301)*1000);
+    CHECK_EQ(scores[0].delta, 0.0);
+    scores = ContextIntelligence::Score(frame, "eval", "general", {c}, (f.now+901)*1000);
+    CHECK_EQ(scores[0].delta, 0.0);
+}
+
 TEST(Search, ContentCandidatesCanBenefitWithoutPriorFileActivity)
 {
     SearchFixture f;

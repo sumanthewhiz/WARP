@@ -658,11 +658,11 @@ namespace ContextIntelligence
         else if (frame.redacted) fallback = "privacy_redacted";
         else if (frame.truncated) fallback = "truncated";
         else if (frame.tasks.empty()) fallback = "no_qualified_evidence";
-        else if (!frame.historical && (frame.latestMs <= 0 || nowMs - frame.latestMs > FreshnessMs))
-            fallback = "stale";
         else if (!frame.historical && !frame.presence.empty() && frame.presence != "active" && frame.presence != "passive")
             fallback = "not_present";
         else if (Settings::Instance().IsPaused(nowMs / 1000)) fallback = "paused";
+        else if (!frame.historical && (frame.latestMs <= 0 || nowMs - frame.latestMs > FreshnessMs))
+            fallback = "stale";
         for (const auto& candidate : candidates)
         {
             CandidateFeatures f; f.key = candidate.key; f.fallback = fallback;
@@ -685,6 +685,10 @@ namespace ContextIntelligence
                 f.found = true; f.quality = card->quality;
                 if (f.identity == "unseen") f.identity = "observed_path";
             }
+            const bool recentFile = !frame.historical && card && card->type == "file" && card->eligible &&
+                card->lastMs >= frame.startMs && card->lastMs <= frame.endMs && nowMs >= card->lastMs &&
+                nowMs-card->lastMs <= (std::min)(int64_t(900000), frame.endMs-frame.startMs);
+            if (f.fallback == "stale" && recentFile) f.fallback.clear();
             if (!f.fallback.empty()) { out.push_back(std::move(f)); continue; }
             if (Settings::Instance().IsExcludedPath(EntityKey::FromUtf8(candidate.key)) ||
                 Settings::Instance().IsExcludedTitle(EntityKey::FromUtf8(candidate.title + " " + candidate.name)))
@@ -697,7 +701,7 @@ namespace ContextIntelligence
             const auto workspace = Evidence::WorkspaceFor(candidate.key, "file");
             for (const auto& task : frame.tasks)
             {
-                if (!frame.historical && !task.primary) continue;
+                if (!frame.historical && (!task.primary || nowMs-frame.latestMs > FreshnessMs)) continue;
                 const auto key = card ? card->key : candidate.key;
                 const bool member = std::find(task.entities.begin(), task.entities.end(), key) != task.entities.end();
                 const bool sameWorkspace = !workspace.empty() && workspace == task.workspace;
@@ -708,6 +712,12 @@ namespace ContextIntelligence
                     "same_directory_or_repository_association");
                 f.support.insert(f.support.end(), task.support.begin(), task.support.end());
                 if (member && card) f.activity = 1.0;
+            }
+            if (recentFile && f.taskFit == 0)
+            {
+                f.activity = 1;
+                f.reasons.push_back("recent_file_observation");
+                f.support.insert(f.support.end(), card->support.begin(), card->support.end());
             }
             for (const auto& relation : frame.relations)
                 if (Strong(relation) && (relation.from == candidate.key || relation.to == candidate.key))
@@ -728,7 +738,7 @@ namespace ContextIntelligence
             }
             Unique(f.reasons); Unique(f.support);
             if (f.support.size() > 16) f.support.resize(16);
-            f.eligible = f.taskFit > 0 && !f.support.empty();
+            f.eligible = (f.taskFit > 0 || f.activity > 0) && !f.support.empty() && f.fallback.empty();
             f.delta = f.eligible ? 8.0 * (std::min)(1.0, .7 * f.taskFit + .2 * f.activity + .1 * f.relation) : 0;
             out.push_back(std::move(f));
         }
