@@ -665,7 +665,7 @@ namespace ContextIntelligence
             fallback = "stale";
         for (const auto& candidate : candidates)
         {
-            CandidateFeatures f; f.key = candidate.key; f.fallback = fallback;
+            CandidateFeatures f; f.key = candidate.key; f.fallback = fallback; f.candidateId = candidate.candidateId;
             const Card* card = cards.count(candidate.key) ? cards[candidate.key] : nullptr;
             const ArtifactAlias* identity = nullptr;
             for (const auto& alias : frame.aliases)
@@ -747,7 +747,9 @@ namespace ContextIntelligence
 
     void Write(Writer& w, const CandidateFeatures& f)
     {
-        w.BeginObject().KV("key", f.key).KV("found", f.found).KV("identity", f.identity)
+        w.BeginObject();
+        if (!f.candidateId.empty()) w.KV("candidate_id", f.candidateId);
+        w.KV("key", f.key).KV("found", f.found).KV("identity", f.identity)
             .KV("eligible", f.eligible).KV("fallback", f.fallback).KV("task_fit", f.taskFit)
             .KV("interval_activity", f.activity).KV("typed_relation", f.relation)
             .KV("evidence_quality", f.quality).KV("score_delta", f.delta)

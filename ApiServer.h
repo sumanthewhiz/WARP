@@ -137,7 +137,8 @@ private:
     std::string Purge(const WarpJson::Value& req);
     std::string Pause(const WarpJson::Value& req, bool resume);
 
-    static std::string Error(const char* code, const std::string& message);
+    static std::string Error(const char* code, const std::string& message,
+                             const WarpJson::Value& details = WarpJson::Value());
     static std::string WithApiVersion(const std::string& jsonObject);
 
     Deps m_deps;

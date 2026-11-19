@@ -604,12 +604,14 @@ namespace
     }
 }
 
-std::string ApiServer::Error(const char* code, const std::string& message)
+std::string ApiServer::Error(const char* code, const std::string& message, const Value& details)
 {
     std::string out;
     Writer w(out);
     w.BeginObject().KV("api_version", (int64_t)kApiVersion).KV("ok", false);
-    w.Key("error").BeginObject().KV("code", code).KV("message", message).EndObject();
+    w.Key("error").BeginObject().KV("code", code).KV("message", message);
+    if (!details.isNull()) w.Key("details").Value(details);
+    w.EndObject();
     w.EndObject();
     return out;
 }
@@ -819,6 +821,7 @@ std::string ApiServer::GetSearchContext(const Value& req)
     std::string out; Writer w(out);
     w.BeginObject().KV("api_version", kApiVersion).KV("ok", true).KV("context_ref", id)
         .KV("expires_ms", expires).KV("model_on_request_path", false)
+        .Key("capabilities").BeginObject().KV("candidate_ids", true).EndObject()
         .Key("context").Raw(ContextIntelligence::Json(frame)).EndObject();
     return out;
 }
@@ -833,20 +836,58 @@ std::string ApiServer::ScoreCandidates(const Value& req)
     if ((req.has("intent") && !req.get("intent").isString()) ||
         (intent != "general" && intent != "download" && intent != "open" && intent != "modify"))
         return Error("invalid_request", "intent must be general, download, open, or modify");
+    const auto& correlation = req.get("correlation");
+    if (req.has("correlation") && (!correlation.isString() ||
+        (correlation.asString() != "canonical_key" && correlation.asString() != "candidate_id")))
+        return Error("invalid_request", "correlation must be canonical_key (default) or candidate_id.");
+    const bool withIds = correlation.asString() == "candidate_id";
+    const auto& rows = req.get("candidates").items();
+    auto invalid = [&](size_t index, const char* field, const char* reason, const char* message, int64_t duplicate = -1) {
+        auto details = Value::Object();
+        details.set("candidate_index", Value::Int((int64_t)index));
+        details.set("field", Value::String(field));
+        details.set("reason", Value::String(reason));
+        if (duplicate >= 0) details.set("duplicate_of", Value::Int(duplicate));
+        return Error("invalid_request", message, details);
+    };
     std::vector<ContextIntelligence::Candidate> candidates;
-    std::set<std::string> keys;
-    for (const auto& value : req.get("candidates").items())
+    std::map<std::string, size_t> identities;
+    for (const auto& value : rows)
     {
-        if (!value.isObject() || !value.get("key").isString() || !AbsoluteSearchPath(value.get("key").asString()) ||
-            !value.get("base_score").isNumber() || !std::isfinite(value.get("base_score").asDouble()) ||
-            value.get("base_score").asDouble() < 0 || value.get("base_score").asDouble() > 200 ||
-            (value.has("name") && (!value.get("name").isString() || value.get("name").asString().size() > 1024)) ||
-            (value.has("title") && (!value.get("title").isString() || value.get("title").asString().size() > 2048)) ||
-            (value.has("exact") && !value.get("exact").isBool()))
-            return Error("invalid_request", "Each candidate needs an absolute file key and finite base_score in [0,200]; metadata must be bounded strings.");
+        const auto index = candidates.size();
+        if (!value.isObject())
+            return invalid(index, "candidate", "invalid_type", "Each candidate must be an object.");
+        if (!value.get("key").isString() || !AbsoluteSearchPath(value.get("key").asString()))
+            return invalid(index, "key", "invalid_path", "Each candidate key must be an absolute Windows file path.");
+        if (!value.get("base_score").isNumber() || !std::isfinite(value.get("base_score").asDouble()) ||
+            value.get("base_score").asDouble() < 0 || value.get("base_score").asDouble() > 200)
+            return invalid(index, "base_score", "invalid_base_score", "base_score must be finite and in [0,200].");
+        if (value.has("name") && (!value.get("name").isString() || value.get("name").asString().size() > 1024))
+            return invalid(index, "name", "invalid_metadata", "name must be a string of at most 1024 UTF-8 bytes.");
+        if (value.has("title") && (!value.get("title").isString() || value.get("title").asString().size() > 2048))
+            return invalid(index, "title", "invalid_metadata", "title must be a string of at most 2048 UTF-8 bytes.");
+        if (value.has("exact") && !value.get("exact").isBool())
+            return invalid(index, "exact", "invalid_type", "exact must be a boolean.");
         ContextIntelligence::Candidate candidate;
+        if (withIds)
+        {
+            const auto& id = value.get("candidate_id");
+            const auto fields = std::count_if(value.members().begin(), value.members().end(),
+                [](const auto& member) { return member.first == "candidate_id"; });
+            if (fields != 1 || !id.isString() || id.asString().empty() || id.asString().size() > 128 ||
+                id.asString().find('\0') != std::string::npos)
+                return invalid(index, "candidate_id", "invalid_candidate_id",
+                    "ID correlation requires one nonempty candidate_id string (at most 128 UTF-8 bytes, no NUL) on every candidate.");
+            candidate.candidateId = id.asString();
+        }
         candidate.key = EntityKey::FileKey(WarpJson::Utf8ToWide(value.get("key").asString()));
-        if (!keys.insert(candidate.key).second) return Error("invalid_request", "Candidate keys must be unique after normalization.");
+        const auto inserted = identities.emplace(withIds ? candidate.candidateId : candidate.key, index);
+        if (!inserted.second)
+            return invalid(index, withIds ? "candidate_id" : "key",
+                withIds ? "duplicate_candidate_id" : "duplicate_canonical_key",
+                withIds ? "candidate_id values must be unique within the request." :
+                    "Candidate keys must be unique after normalization; use correlation=candidate_id with unique IDs to correlate aliases.",
+                (int64_t)inserted.first->second);
         candidate.name = value.get("name").asString();
         candidate.title = value.get("title").asString();
         candidate.baseScore = value.get("base_score").asDouble();

@@ -205,6 +205,133 @@ TEST(Search, FrozenReferencesRejectPrivacyChangesAndQueriesAreEphemeral)
     CHECK_EQ(invalidated["error"]["code"].asString(), std::string("context_invalidated"));
 }
 
+TEST(Search, CandidateIdsCorrelateAliasesWithoutClientNormalization)
+{
+    SearchFixture f;
+    f.Focus(L"C:\\WarpSynthetic\\Alpha\\budget.xlsx", -120, -1, "budget-focus"); f.Flush();
+    const auto frozen = f.Call(SearchRequest());
+    REQUIRE(frozen["ok"].asBool());
+    CHECK(frozen["capabilities"]["candidate_ids"].asBool());
+    auto request = ScoreRequest(frozen["context_ref"].asString());
+    request.set("correlation", Value::String("candidate_id"));
+    auto strong = request["candidates"][0];
+    strong.set("candidate_id", Value::String("row-A"));
+    strong.set("key", Value::String("C:/WarpSynthetic/Alpha/./budget.xlsx"));
+    auto weak = strong;
+    weak.set("candidate_id", Value::String("row-a"));
+    weak.set("key", Value::String("C:\\WarpSynthetic\\Alpha\\child\\..\\budget.xlsx"));
+    weak.set("base_score", Value::Int(15));
+    auto unseen = strong;
+    unseen.set("candidate_id", Value::String(u8"result-\u03b1"));
+    unseen.set("key", Value::String("C:\\WarpSynthetic\\Unrelated\\budget.xlsx"));
+    auto rows = Value::Array(); rows.push(strong); rows.push(weak); rows.push(unseen);
+    request.set("candidates", rows);
+    const auto before = f.store.CurrentChangeSeq();
+    ApiClient external; external.exePath = L"C:\\WarpSynthetic\\IndependentConsumer.exe";
+    const auto response = Parse(f.api.Handle(WarpJson::Serialize(request), external));
+    REQUIRE(response["ok"].asBool());
+    CHECK_EQ(response["candidates"].size(), size_t(3));
+    std::map<std::string, Value> byId;
+    for (const auto& row : response["candidates"].items())
+        CHECK(byId.emplace(row["candidate_id"].asString(), row).second);
+    REQUIRE(byId.size() == 3);
+    CHECK_EQ(byId["row-A"]["key"].asString(), byId["row-a"]["key"].asString());
+    CHECK(byId["row-A"]["score_delta"].asDouble() > 0);
+    CHECK_EQ(byId["row-a"]["score_delta"].asDouble(), 0.0);
+    CHECK_EQ(byId["row-a"]["fallback"].asString(), std::string("query_mismatch"));
+    CHECK(!byId[u8"result-\u03b1"]["found"].asBool());
+    CHECK_EQ(before, f.store.CurrentChangeSeq());
+    CHECK(!response["query_and_candidates_persisted"].asBool(true));
+}
+
+TEST(Search, CandidateIdsValidateAtomicallyAndPreserveLegacyRules)
+{
+    SearchFixture f;
+    const auto frozen = f.Call(SearchRequest());
+    REQUIRE(frozen["ok"].asBool());
+    auto request = ScoreRequest(frozen["context_ref"].asString());
+    const auto legacy = f.Call(request);
+    REQUIRE(legacy["ok"].asBool());
+    CHECK(!legacy["candidates"][0].has("candidate_id"));
+    auto oldMetadata = request["candidates"][0];
+    oldMetadata.set("candidate_id", Value::Int(42));
+    auto oldRows = Value::Array(); oldRows.push(oldMetadata);
+    auto oldRequest = request; oldRequest.set("candidates", oldRows);
+    const auto oldResponse = f.Call(oldRequest);
+    REQUIRE(oldResponse["ok"].asBool());
+    CHECK(!oldResponse["candidates"][0].has("candidate_id"));
+    auto first = request["candidates"][0], second = first;
+    second.set("key", Value::String("C:/WarpSynthetic/Alpha/./budget.xlsx"));
+    auto rows = Value::Array(); rows.push(first); rows.push(second);
+    request.set("candidates", rows);
+    const auto duplicate = f.Call(request);
+    CHECK_EQ(duplicate["error"]["code"].asString(), std::string("invalid_request"));
+    CHECK_EQ(duplicate["error"]["details"]["reason"].asString(), std::string("duplicate_canonical_key"));
+    CHECK_EQ(duplicate["error"]["details"]["candidate_index"].asInt64(-1), int64_t(1));
+    CHECK_EQ(duplicate["error"]["details"]["duplicate_of"].asInt64(-1), int64_t(0));
+    CHECK(!duplicate.has("candidates"));
+
+    request.set("correlation", Value::String("candidate_id"));
+    first.set("candidate_id", Value::String("row-0"));
+    for (const auto& bad : {Value::Null(), Value::Int(1), Value::String(""),
+                           Value::String(std::string(129, 'x')), Value::String(std::string("x\0y", 3))})
+    {
+        second.set("candidate_id", bad);
+        rows = Value::Array(); rows.push(first); rows.push(second); request.set("candidates", rows);
+        const auto invalid = f.Call(request);
+        CHECK_EQ(invalid["error"]["code"].asString(), std::string("invalid_request"));
+        CHECK_EQ(invalid["error"]["details"]["reason"].asString(), std::string("invalid_candidate_id"));
+        CHECK_EQ(invalid["error"]["details"]["candidate_index"].asInt64(-1), int64_t(1));
+        CHECK(!invalid.has("candidates"));
+    }
+    second = ScoreRequest(frozen["context_ref"].asString())["candidates"][0];
+    rows = Value::Array(); rows.push(first); rows.push(second); request.set("candidates", rows);
+    const auto mixed = f.Call(request);
+    CHECK_EQ(mixed["error"]["details"]["reason"].asString(), std::string("invalid_candidate_id"));
+    second.set("candidate_id", Value::String("row-0"));
+    rows = Value::Array(); rows.push(first); rows.push(second); request.set("candidates", rows);
+    const auto repeatedId = f.Call(request);
+    CHECK_EQ(repeatedId["error"]["details"]["reason"].asString(), std::string("duplicate_candidate_id"));
+    CHECK_EQ(repeatedId["error"]["details"]["duplicate_of"].asInt64(-1), int64_t(0));
+    auto ambiguous = Parse(R"({"key":"C:\\WarpSynthetic\\Alpha\\budget.xlsx","base_score":100,
+        "candidate_id":"first","candidate_id":"second"})");
+    rows = Value::Array(); rows.push(ambiguous); request.set("candidates", rows);
+    const auto duplicateField = f.Call(request);
+    CHECK_EQ(duplicateField["error"]["details"]["reason"].asString(), std::string("invalid_candidate_id"));
+    first.set("candidate_id", Value::String(std::string(128, 'a')));
+    rows = Value::Array(); rows.push(first); request.set("candidates", rows);
+    const auto longest = f.Call(request);
+    REQUIRE(longest["ok"].asBool());
+    CHECK_EQ(longest["candidates"][0]["candidate_id"].asString(), std::string(128, 'a'));
+    request.set("correlation", Value::String("unknown"));
+    const auto unsupported = f.Call(request);
+    CHECK_EQ(unsupported["error"]["code"].asString(), std::string("invalid_request"));
+}
+
+TEST(Search, CandidateIdsSurviveAbstentionButNotInvalidation)
+{
+    SearchFixture f;
+    const auto frozen = f.Call(SearchRequest());
+    REQUIRE(frozen["ok"].asBool());
+    auto request = ScoreRequest(frozen["context_ref"].asString());
+    request.set("correlation", Value::String("candidate_id"));
+    auto row = request["candidates"][0];
+    row.set("candidate_id", Value::String("opaque-row"));
+    auto rows = Value::Array(); rows.push(row); request.set("candidates", rows);
+    const auto result = f.Call(request);
+    REQUIRE(result["ok"].asBool());
+    CHECK_EQ(result["candidates"][0]["candidate_id"].asString(), std::string("opaque-row"));
+    CHECK_EQ(result["candidates"][0]["score_delta"].asDouble(), 0.0);
+    CHECK_EQ(result["candidates"][0]["fallback"].asString(), std::string("no_qualified_evidence"));
+    ApiClient denied; denied.activityScope = false;
+    const auto forbidden = Parse(f.api.Handle(WarpJson::Serialize(request), denied));
+    CHECK_EQ(forbidden["error"]["code"].asString(), std::string("forbidden"));
+    ActivityStore::PurgeSpec purge; purge.pathPrefix = L"C:\\WarpSynthetic\\Alpha";
+    int64_t removed = 0; REQUIRE(f.store.Purge(purge, removed));
+    const auto invalidated = f.Call(request);
+    CHECK_EQ(invalidated["error"]["code"].asString(), std::string("context_invalidated"));
+}
+
 TEST(Search, ModelReferencesAndRolesMustBeSupported)
 {
     SearchFixture f;

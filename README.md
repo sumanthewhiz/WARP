@@ -41,6 +41,12 @@ backward compatible with v1 requests) on `\\.\pipe\WarpFileActivityAPI-<SessionI
 human-readable reasons, activity-name/title search, a cursor-based change feed, a timeline,
 work threads, related items and the current context. See [API.md](API.md).
 
+**Platform-first integration:** FindMyFile is one showcase consumer, not a
+special-case dependency. Identity, correlation, validation and evidence
+semantics belong in WARP's public contract so other applications can connect
+without copying private implementation rules. Improvements must preserve
+existing clients and be exercised independently of the showcase.
+
 **Phase A on `dev`:** measured zero stays zero; focus/presence overlap is an
 interval union; passive media is not active document time. Web identities retain
 case, AUMIDs survive context joins, ambiguous filename matches abstain, sparse
@@ -75,6 +81,12 @@ with visible bounded deltas, exact-match protection and baseline fallback.
 Its synthetic-only `FindMyFileContextDemo.exe` replays actual WARP features
 without reading personal files or connecting to an installed agent. The
 consumer evaluator reproduces the same 272 labeled-case ordering.
+New consumers can negotiate opaque `candidate_id` correlation through
+`GetSearchContext.capabilities.candidate_ids`. WARP then accepts multiple
+spellings of the same file and returns one assessment per input ID, while
+retaining canonical file keys for identity. Legacy key-only requests remain
+compatible. Indexed validation diagnostics identify malformed/duplicate rows
+without exposing their paths. See the [consumer integration pattern](API.md#integration-pattern-for-any-consumer).
 
 Search frames have a dedicated evidence read: unqualified ETW OPEN volume is
 filtered before the row budget, and no summary/model or historical-engagement

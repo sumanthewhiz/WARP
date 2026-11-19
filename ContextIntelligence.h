@@ -46,6 +46,7 @@ namespace ContextIntelligence
         std::string key, name, title;
         double baseScore = 0;
         bool exact = false;
+        std::string candidateId;
     };
     struct CandidateFeatures
     {
@@ -53,6 +54,7 @@ namespace ContextIntelligence
         bool found = false, eligible = false;
         double taskFit = 0, activity = 0, relation = 0, quality = 0, delta = 0;
         std::vector<std::string> reasons, support;
+        std::string candidateId;
     };
     struct Interpretation
     {

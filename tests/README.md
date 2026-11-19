@@ -18,6 +18,13 @@ synthetic search corpus, frozen candidates, grouping/grounding invariants,
 held-out project resampling and exact/unseen/fallback guards are documented in
 [SIGNAL_QUALITY.md](SIGNAL_QUALITY.md#phase-c-synthetic-search-and-model-evaluation).
 
+Platform-consumer regressions in `WarpTests.Search.cpp` cover capability
+negotiation, opaque IDs across canonical path aliases, independent per-row
+relevance checks, ID validation/error positions, legacy key-only compatibility,
+abstention, access scopes and privacy invalidation. The live Python suite
+exercises the same contract as an independent standard-user client, without
+FindMyFile code or client-side path normalization.
+
 ## Quick start
 
 ```powershell

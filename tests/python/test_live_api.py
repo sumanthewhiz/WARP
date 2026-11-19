@@ -131,6 +131,25 @@ def test_phase_c_candidate_contract_and_baseline_fallback(pipe_ready):
                              "candidates": [{"key": r"C:\WarpSynthetic\budget.xlsx", "base_score": 100}]})
     assert invalid["error"]["code"] == "context_expired"
 
+def test_phase_c_opaque_ids_work_for_an_independent_standard_user_client(pipe_ready):
+    frozen = warp_pipe.call({"op": "GetSearchContext"}, as_standard_user=True)
+    assert frozen["ok"] and frozen["capabilities"]["candidate_ids"]
+    response = warp_pipe.call({
+        "op": "ScoreCandidates", "context_ref": frozen["context_ref"], "query": "budget",
+        "correlation": "candidate_id",
+        "candidates": [
+            {"candidate_id": "result-A", "key": r"C:\WarpSynthetic\Other\budget.xlsx", "base_score": 100},
+            {"candidate_id": "result-B", "key": r"C:\WarpSynthetic\Other\.\budget.xlsx", "base_score": 15},
+        ],
+    }, as_standard_user=True)
+    assert response["ok"], response
+    by_id = {row["candidate_id"]: row for row in response["candidates"]}
+    assert len(response["candidates"]) == len(by_id) == 2
+    assert set(by_id) == {"result-A", "result-B"}
+    assert by_id["result-A"]["key"] == by_id["result-B"]["key"]
+    assert by_id["result-B"]["score_delta"] == 0
+    assert not response["query_and_candidates_persisted"]
+
 
 def _documents_dir() -> pathlib.Path:
     d = pathlib.Path(os.environ.get("USERPROFILE", str(pathlib.Path.home()))) / "Documents"

@@ -277,6 +277,8 @@ Current mode rejects interval/as-of parameters rather than silently mixing modes
 
 The response contains `ok`, an opaque `context_ref`, `expires_ms`,
 `model_on_request_path:false`, and `context` (`schema:"warp.task-context.v1"`).
+New builds also advertise `capabilities.candidate_ids:true`. Check this before
+using the ID-based correlation mode below; older builds omit the capability.
 The context has bounded entity cards, multiple `tasks`, observed episode
 segments, typed `relations`, provenance refs, coverage, interval/as-of bounds,
 input watermark and optional interpretation metadata. Tasks are hypotheses;
@@ -313,11 +315,12 @@ Do not persist reference IDs across app launches.
 {
   "op":"ScoreCandidates",
   "context_ref":"<reference returned above>",
+  "correlation":"candidate_id",
   "query":"budget",
   "intent":"general",
   "candidates":[
-    {"key":"C:\\Work\\Alpha\\budget.xlsx","name":"budget.xlsx","base_score":100,"exact":false},
-    {"key":"C:\\Work\\Beta\\annual-report.txt","name":"annual-report.txt","title":"Budget allocation excerpt","base_score":20,"exact":false}
+    {"candidate_id":"result-1","key":"C:\\Work\\Alpha\\budget.xlsx","name":"budget.xlsx","base_score":100,"exact":false},
+    {"candidate_id":"result-2","key":"C:\\Work\\Beta\\annual-report.txt","name":"annual-report.txt","title":"Budget allocation excerpt","base_score":20,"exact":false}
   ]
 }
 ```
@@ -328,12 +331,35 @@ The consumer retrieves candidates first and supplies a bounded batch:
 |---|---|
 | `query` | Nonempty UTF-8 string, at most 1024 bytes. |
 | `intent` | `general` (default), `download`, `open`, or `modify`; the last means a modification observation, not proven user editing. |
-| `candidates` | 1-256 objects with unique normalized absolute Windows file `key`s. |
+| `candidates` | 1-256 objects with absolute Windows file `key`s. |
+| `correlation` | `canonical_key` (default/legacy) or `candidate_id` (recommended when advertised). ID correlation is explicit opt-in, not inferred from extra metadata. |
+| `candidate_id` | Required on **every** candidate in ID mode: one nonempty, case-sensitive opaque string, at most 128 UTF-8 bytes and no NUL. IDs must be unique within the request. |
 | `base_score` | Finite number in [0,200], on the documented FindMyFile-style match scale: exact/token 100, prefix 75, substring 40, content 20, fuzzy 15/18. It is not a BM25 or embedding probability. |
 | `name`, `title` | Optional transient candidate metadata, at most 1024 / 2048 UTF-8 bytes. `title` may carry a short authorized local-index snippet; it is not sent to Qwen or persisted. |
 | `exact` | Optional boolean. The consumer must independently protect literal filename/path matches when applying the features. |
 
-Each response entry echoes its normalized `key` and exposes `found`,
+**Separate result identity from file identity.** With `"correlation":"candidate_id"`, WARP
+normalizes paths itself and echoes each `candidate_id` verbatim. Different
+spellings of the same file (case, separators, dot segments, stream suffixes,
+or local 8.3/long-name aliases) may coexist in one batch. They return the same
+canonical `key` but separate IDs and assessments, using each row's own metadata
+and relevance tier. Join results by ID, not path or array position; verify that
+every submitted ID is returned exactly once. Apps do not need to copy WARP's
+filesystem-dependent normalization algorithm or make a separate identity
+round-trip. IDs are transient and are not written to the activity store.
+When merging batches, keep IDs unique across the full logical search and bind
+responses to that query's generation; server uniqueness checks are per request.
+
+In default `canonical_key` mode, the existing contract is unchanged: keys must
+be unique **after WARP normalization**, and responses contain no `candidate_id`.
+Unused candidate-ID metadata stays ignored in this mode for compatibility.
+Legacy clients
+can obtain canonical keys from `ScoreEntities` / `ResolveFileIdentity` or
+normalize and deduplicate their input before scoring. Do not assume simple
+lowercasing is sufficient. Sending IDs to a build that does not advertise them
+does not opt that old build into the new contract.
+
+Each response entry includes its normalized `key` and exposes `found`,
 `identity` (observed path / artifact alias / unseen / ambiguous reused path),
 `eligible`, `fallback`, `task_fit`, `interval_activity`, `typed_relation`,
 `evidence_quality`, `score_delta`, `reasons`, and supporting observation refs.
@@ -366,6 +392,47 @@ When no delta applies, preserve the baseline order exactly. On transport errors,
 old WARP versions (`unknown_op`), expiry or denial, show baseline results rather
 than hiding them. A consumer using a different relevance scale needs its own
 held-out calibration, not an unexamined `+8`.
+
+Candidate validation failures remain atomic `invalid_request` responses, with
+no partial scores. `error.details` identifies the zero-based `candidate_index`,
+`field`, and machine-readable `reason`; duplicates also include the earlier
+`duplicate_of` index. Reasons include `duplicate_canonical_key`,
+`duplicate_candidate_id`, `invalid_candidate_id`, `invalid_path`,
+`invalid_base_score`, `invalid_metadata`, and `invalid_type`. No input paths or
+IDs are copied into these diagnostics. Fix the input rather than retrying the
+same rejected request.
+
+#### Integration pattern for any consumer
+
+FindMyFile is a showcase, not a platform dependency or the definition of a
+correct consumer. A search app, file picker, launcher, or other client should:
+
+1. Retrieve its own candidates; neither `summary_files` nor a summary's ordering
+   is a search result set or proof of a current observation.
+2. Select the intended current/interval context and display its bounds. Current
+   covers 15 minutes; the primary-task freshness gate is five minutes. A wider
+   or older display summary need not imply a positive current-context score.
+3. Use opaque IDs when advertised, batch at most 256 rows, and reuse one frozen
+   reference across a logical search. Reuse across refinements only within the
+   application's freshness policy and the reference expiry; new observations
+   do not mutate a frozen reference.
+4. Cancel obsolete UI requests, enforce end-to-end write/read deadlines and
+   response-size bounds, and validate reference, expiry, IDs, score bounds and
+   evidence before applying a complete result. Pipe-connection timeout alone
+   is not an end-to-end deadline. Tolerate unknown additive response fields,
+   while strictly validating those used. Reference examples are not a full SDK.
+5. On expiry/invalidation discard derived features and acquire a fresh reference
+   if still needed. On timeout, denial or malformed data keep baseline results.
+   Distinguish an assessed zero from an unavailable assessment; neither removes
+   a candidate.
+6. Calibrate integration with the consumer's own relevance scale and held-out
+   cases. The feature components are available for other ranking designs;
+   the example additive delta is not a universal probability or score scale.
+
+No model runs on the search request path, but cold historical reads still have
+storage and evidence-processing cost. A consumer's five-second budget is a
+client policy, not a WARP latency guarantee; keep retrieval/UI work asynchronous
+and account for context acquisition **and all batches** in the request budget.
 
 #### Task and model interpretation contract
 
